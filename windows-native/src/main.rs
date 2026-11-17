@@ -839,6 +839,37 @@ fn fetch_remote_manifest(url: &str, token: &str) -> Result<version::RemoteVersio
     }
 }
 
+fn format_release_notes_for_ui(raw: &str) -> String {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("### 构建与交付说明") && !out.is_empty() {
+            break;
+        }
+        if trimmed.starts_with("## 半整点提醒") || trimmed.starts_with("### 本次更新内容") {
+            continue;
+        }
+        let clean = trimmed
+            .trim_start_matches('#')
+            .trim()
+            .replace('`', "")
+            .replace("**", "");
+        if let Some(rest) = clean.strip_prefix("- ") {
+            out.push(format!("• {rest}"));
+        } else {
+            out.push(clean);
+        }
+    }
+    if out.is_empty() {
+        "包含稳定性优化与功能改进，建议更新体验。".to_string()
+    } else {
+        out.join("\n")
+    }
+}
+
 /// 启动后台定期版本检查线程：空闲时零 CPU 休眠，定期对比服务端版本号并在发现新版本时提示用户下载
 fn start_update_check_worker(
     initial_enabled: bool,
@@ -898,11 +929,7 @@ fn start_update_check_worker(
                 if let Ok(mut st_msg) = ctx_clone.status_text.lock() {
                     *st_msg = found_msg;
                 }
-                let notes = if manifest.notes.trim().is_empty() {
-                    "包含稳定性优化与功能改进，建议前往下载更新。".to_string()
-                } else {
-                    manifest.notes.clone()
-                };
+                let notes = format_release_notes_for_ui(&manifest.notes);
                 if let Ok(mut n) = ctx_clone.release_notes.lock() {
                     *n = notes;
                 }
@@ -970,6 +997,11 @@ fn start_update_check_worker(
                     };
 
                     if should_popup {
+                        if let Some(aw) = aw_w.upgrade() {
+                            if aw.window().is_visible() {
+                                let _ = aw.hide();
+                            }
+                        }
                         if let Some(uw) = uw_w.upgrade() {
                             uw.set_current_version(version::display_version().into());
                             uw.set_remote_version(display_remote.into());
@@ -977,13 +1009,9 @@ fn start_update_check_worker(
                                 uw.set_download_progress(0);
                                 uw.set_download_status_text("".into());
                             }
-                            let notes = if manifest.notes.trim().is_empty() {
-                                "包含稳定性优化与功能改进，建议前往下载更新。".to_string()
-                            } else {
-                                manifest.notes.clone()
-                            };
-                            center_and_show_window(&uw, 452.0, 360.0);
+                            let notes = format_release_notes_for_ui(&manifest.notes);
                             uw.set_release_notes(notes.into());
+                            center_and_show_window(&uw, 480.0, 430.0);
                         }
                     }
                 }
@@ -1538,7 +1566,7 @@ fn download_and_apply_auto_update(
         && (url.is_empty() || (!url.starts_with("https://") && !url.starts_with("http://")))
     {
         update_w.set_download_status_text("下载地址无效，请检查服务端更新清单。".into());
-        center_and_show_window(update_w, 452.0, 360.0);
+        center_and_show_window(update_w, 480.0, 430.0);
         return;
     }
 
@@ -1547,7 +1575,7 @@ fn download_and_apply_auto_update(
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        center_and_show_window(update_w, 452.0, 360.0);
+        center_and_show_window(update_w, 480.0, 430.0);
         return;
     }
 
@@ -1566,7 +1594,7 @@ fn download_and_apply_auto_update(
     }
 
     let uw_weak = update_w.as_weak();
-    center_and_show_window(update_w, 452.0, 360.0);
+    center_and_show_window(update_w, 480.0, 430.0);
     let ctx_clone = ctx.clone();
     let u_tx_clone = update_tx.clone();
     let perf_tx_clone = perf_stop_tx.clone();
@@ -2910,6 +2938,7 @@ fn main() {
     }
     {
         let ctx_clone = update_ctx.clone();
+        let aw_weak = about_win.as_weak();
         let uw_weak = update_win.as_weak();
         let u_tx = update_tx.clone();
         let perf_tx = perf_stop_tx.clone();
@@ -2917,6 +2946,9 @@ fn main() {
         let audio_clone = audio.clone();
         let guard_rc = Rc::clone(&single_instance_guard);
         about_win.on_download_update(move || {
+            if let Some(aw) = aw_weak.upgrade() {
+                let _ = aw.hide();
+            }
             if let Some(uw) = uw_weak.upgrade() {
                 download_and_apply_auto_update(
                     &ctx_clone,

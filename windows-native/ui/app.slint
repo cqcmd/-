@@ -1821,10 +1821,10 @@ export component UpdateWindow inherits Window {
     title: "发现新版本";
     icon: @image-url("../assets/app_icon_512.png");
     default-font-family: "Microsoft YaHei UI";
-    preferred-width: 452px;
-    preferred-height: 360px;
-    min-width: 430px;
-    min-height: 340px;
+    preferred-width: 480px;
+    preferred-height: 430px;
+    min-width: 440px;
+    min-height: 380px;
     no-frame: true;
     background: transparent;
 
@@ -1897,23 +1897,33 @@ export component UpdateWindow inherits Window {
 
                 Rectangle {
                     vertical-stretch: 1;
+                    min-height: 120px;
+                    clip: true;
                     border-radius: 6px;
                     border-width: 1px;
                     border-color: ThemeStore.palette.border-hairline;
                     background: ThemeStore.palette.surface;
                     VerticalLayout {
                         padding: 12px;
-                        spacing: 4px;
+                        spacing: 6px;
                         Text {
                             text: "更新说明：";
                             color: ThemeStore.palette.text-muted;
                             font-size: 12px;
+                            font-weight: 600;
                         }
-                        Text {
-                            text: root.release-notes;
-                            color: ThemeStore.palette.text-secondary;
-                            font-size: 12px;
-                            wrap: word-wrap;
+                        ScrollView {
+                            vertical-stretch: 1;
+                            content-width: self.width - 14px;
+                            VerticalLayout {
+                                padding-right: 6px;
+                                Text {
+                                    text: root.release-notes;
+                                    color: ThemeStore.palette.text-secondary;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+                            }
                         }
                     }
                 }
@@ -1954,15 +1964,15 @@ export component UpdateWindow inherits Window {
                     }
                     Rectangle { horizontal-stretch: 1; }
                     SecondaryButton {
-                        width: 92px;
+                        width: 90px;
                         enabled: !root.is-downloading;
                         label: "稍后提醒";
                         clicked => { root.later-clicked(); }
                     }
                     PrimaryButton {
-                        width: 124px;
+                        width: 128px;
                         enabled: !root.is-downloading;
-                        label: root.is-downloading ? "正在下载..." : "自动更新";
+                        label: root.is-downloading ? "正在下载..." : "立即自动更新";
                         clicked => { root.auto-update-clicked(); }
                     }
                 }
