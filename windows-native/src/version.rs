@@ -354,21 +354,32 @@ mod tests {
             parsed.download_url,
             "https://drive.usercontent.google.com/download?id=1AbCdEfGhIjKlMnOp&export=download&confirm=t"
         );
-        assert!(is_newer_than_current(&parsed.version).unwrap());
+        let parsed_ver = ThreePartDateVersion::parse(&parsed.version).unwrap();
+        let baseline_ver = ThreePartDateVersion::parse("2.0.0+20261113").unwrap();
+        assert!(parsed_ver > baseline_ver);
 
-        let github_json = r#"{
-            "tag_name": "v2.0.9",
+        let mut next_ver = ThreePartDateVersion::parse(APP_PKG_VERSION).unwrap();
+        next_ver.bump_patch("20991231");
+        let next_ver_str = next_ver.to_semver_string();
+        assert!(is_newer_than_current(&next_ver_str).unwrap());
+        assert!(!is_newer_than_current(APP_PKG_VERSION).unwrap());
+
+        let gh_tag = format!("v{next_ver_str}");
+        let github_json = format!(
+            r#"{{
+            "tag_name": "{gh_tag}",
             "body": "GitHub Release notes",
-            "html_url": "https://github.com/zwai/half-hour-chime/releases/tag/v2.0.9",
+            "html_url": "https://github.com/zwai/half-hour-chime/releases/tag/{gh_tag}",
             "assets": [
-                {
+                {{
                     "name": "HalfHourChime.exe",
-                    "browser_download_url": "https://github.com/zwai/half-hour-chime/releases/download/v2.0.9/HalfHourChime.exe"
-                }
+                    "browser_download_url": "https://github.com/zwai/half-hour-chime/releases/download/{gh_tag}/HalfHourChime.exe"
+                }}
             ]
-        }"#;
-        let gh = parse_remote_manifest_body(github_json).unwrap();
-        assert_eq!(gh.version, "v2.0.9");
+        }}"#
+        );
+        let gh = parse_remote_manifest_body(&github_json).unwrap();
+        assert_eq!(gh.version, gh_tag);
         assert!(gh.download_url.ends_with("/HalfHourChime.exe"));
         assert!(is_newer_than_current(&gh.version).unwrap());
     }
