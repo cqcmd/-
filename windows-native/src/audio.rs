@@ -1063,7 +1063,9 @@ fn synthesize_edge_tts_mp3_once(
 
     let (mut socket, _resp) = match tungstenite::client_tls(request, stream) {
         Ok(pair) => pair,
-        Err(tungstenite::Error::Http(resp)) if allow_clock_skew_retry => {
+        Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(resp)))
+            if allow_clock_skew_retry =>
+        {
             if let Some(date_hdr) = resp.headers().get("Date").and_then(|v| v.to_str().ok()) {
                 if let Ok(server_dt) = DateTime::parse_from_rfc2822(date_hdr) {
                     let local_raw = SystemTime::now()

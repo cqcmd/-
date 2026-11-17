@@ -34,6 +34,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 20
 
       - name: Install stable Rust toolchain (MSVC)
         uses: dtolnay/rust-toolchain@stable
@@ -53,6 +55,67 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Resolve auto-increment version (3-part + YYYYMMDD, carry at 10)
+        id: ver
+        shell: pwsh
+        run: |
+          $today = [DateTimeOffset]::UtcNow.ToOffset([TimeSpan]::FromHours(8)).ToString("yyyyMMdd")
+
+          $ErrorActionPreference = "Continue"
+          git fetch --tags --quiet 2>$null
+          $existingTags = @(git tag -l "v*" 2>$null)
+          $ErrorActionPreference = "Stop"
+
+          $bestMaj = 2; $bestMin = 0; $bestPat = 0
+          $bestScore = -1
+          $prevTag = ""
+          foreach ($item in $existingTags) {
+            $t = "$item".Trim()
+            if ($t -match '^v?(\d+)\.(\d+)\.(\d+)') {
+              $m1 = [int]$Matches[1]; $m2 = [int]$Matches[2]; $m3 = [int]$Matches[3]
+              $score = $m1 * 10000 + $m2 * 100 + $m3
+              if ($score -gt $bestScore) {
+                $bestScore = $score
+                $bestMaj = $m1; $bestMin = $m2; $bestPat = $m3
+                $prevTag = $t
+              }
+            }
+          }
+
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -match '^v?(\d+)\.(\d+)\.(\d+)(?:[+-](\d{8}))?$') {
+            $maj = [int]$Matches[1]
+            $min = [int]$Matches[2]
+            $pat = [int]$Matches[3]
+            $d = if ($Matches[4]) { $Matches[4] } else { $today }
+            $nextVer = "$maj.$min.$pat+$d"
+          } else {
+            $fileVer = (Get-Content "windows-native/build_version.txt" -Raw).Trim()
+            if ($fileVer -match '^v?(\d+)\.(\d+)\.(\d+)') {
+              $m1 = [int]$Matches[1]; $m2 = [int]$Matches[2]; $m3 = [int]$Matches[3]
+              $score = $m1 * 10000 + $m2 * 100 + $m3
+              if ($score -gt $bestScore) {
+                $bestMaj = $m1; $bestMin = $m2; $bestPat = $m3
+              }
+            }
+
+            $bestPat += 1
+            if ($bestPat -ge 10) {
+              $bestPat = 0
+              $bestMin += 1
+              if ($bestMin -ge 10) {
+                $bestMin = 0
+                $bestMaj += 1
+              }
+            }
+            $nextVer = "$bestMaj.$bestMin.$bestPat+$today"
+          }
+
+          [System.IO.File]::WriteAllText((Join-Path $PWD "windows-native/build_version.txt"), "$nextVer`n", (New-Object System.Text.UTF8Encoding($false)))
+          "APP_BUILD_VERSION_OVERRIDE=$nextVer" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "prev_tag=$prevTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "next_ver=$nextVer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Resolved build version: $nextVer (previous tag: $prevTag)"
+
       - name: Run Rust unit tests
         working-directory: windows-native
         run: cargo test --bin HalfHourChime --target x86_64-pc-windows-msvc
@@ -61,30 +124,67 @@ jobs:
         working-directory: windows-native
         run: cargo build --release --target x86_64-pc-windows-msvc
 
-      - name: Stage HalfHourChime.exe and version.json
+      - name: Stage HalfHourChime.exe, version.json and release notes
         id: meta
         shell: pwsh
+        env:
+          INPUT_RELEASE_NOTES: ${{ inputs.release_notes }}
         run: |
           $ErrorActionPreference = "Stop"
-          $ver = (Get-Content "windows-native/build_version.txt" -Raw).Trim()
+          $ver = "${{ steps.ver.outputs.next_ver }}".Trim()
+          if ([string]::IsNullOrWhiteSpace($ver)) {
+            $ver = (Get-Content "windows-native/build_version.txt" -Raw).Trim()
+          }
           $tagVer = $ver.Replace("+", "-")
           $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "v$tagVer" }
           New-Item -ItemType Directory -Force -Path "windows-native/dist" | Out-Null
           Copy-Item "windows-native/target/x86_64-pc-windows-msvc/release/HalfHourChime.exe" "windows-native/dist/HalfHourChime.exe" -Force
 
-          $notes = "${{ inputs.release_notes }}"
-          if ([string]::IsNullOrWhiteSpace($notes)) {
-            $notes = "通过 GitHub Actions 自动编译发布的单文件版本 ($ver)。"
+          $prevTag = "${{ steps.ver.outputs.prev_tag }}".Trim()
+          $commitLines = @()
+          $ErrorActionPreference = "Continue"
+          if ($prevTag) {
+            $commitLines = @(git log "$prevTag..HEAD" --no-merges --pretty=format:"- %s (%h)" 2>$null)
           }
+          if ($commitLines.Count -eq 0) {
+            $commitLines = @(git log -n 6 --no-merges --pretty=format:"- %s (%h)" 2>$null)
+          }
+          $ErrorActionPreference = "Stop"
+          $changelogMd = if ($commitLines.Count -gt 0) { $commitLines -join "`n" } else { "- 自动构建与常规维护更新" }
+
+          $inputNotes = "$env:INPUT_RELEASE_NOTES".Trim()
+          $manifestNotes = if (-not [string]::IsNullOrWhiteSpace($inputNotes) -and $inputNotes -ne "通过 GitHub Actions 自动编译并发布的 Windows 单文件版本。") {
+            $inputNotes
+          } elseif ($commitLines.Count -gt 0) {
+            ($commitLines | Select-Object -First 4) -join "；"
+          } else {
+            "通过 GitHub Actions 自动编译发布的单文件版本 ($ver)。"
+          }
+
           $downloadUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/releases/download/$tag/HalfHourChime.exe"
           $manifest = [ordered]@{
             version      = $ver
             download_url = $downloadUrl
             package_type = "portable"
-            notes        = $notes
+            notes        = $manifestNotes
           } | ConvertTo-Json -Depth 4
           $manifestPath = Join-Path $PWD "windows-native/dist/version.json"
           [System.IO.File]::WriteAllText($manifestPath, $manifest, (New-Object System.Text.UTF8Encoding($false)))
+
+          $releaseBody = @"
+## 半整点提醒 Windows 原生单文件版 (``v$ver``)
+
+### 本次更新内容
+$changelogMd
+
+### 构建与交付说明
+- **版本号规则**：三段式 + 日期（每段满 10 进位），本次版本 ``$ver``（PE 文件版本同步更新）
+- **编译平台**：Windows x86_64（MSVC 静态链接，零外部运行库依赖）
+- **交付文件**：``HalfHourChime.exe``（双击即用）与 ``version.json``
+- **自动更新接口地址**：``https://github.com/$env:GITHUB_REPOSITORY/releases/latest``
+"@
+          $notesPath = Join-Path $PWD "windows-native/dist/release_notes.md"
+          [System.IO.File]::WriteAllText($notesPath, $releaseBody, (New-Object System.Text.UTF8Encoding($false)))
 
           "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -105,13 +205,7 @@ jobs:
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: "半整点提醒 v${{ steps.meta.outputs.version }}"
-          body: |
-            ## 半整点提醒 Windows 原生单文件版 (`v${{ steps.meta.outputs.version }}`)
-
-            - **编译平台**：Windows x86_64 (MSVC 静态链接，零外部运行库依赖)
-            - **交付文件**：`HalfHourChime.exe`（双击即用，自带 `version.json` 供内置自动更新检查）
-            - **自动更新配置示例**：在程序「设置 → 后台定期检查版本更新 → 更新接口地址」填入：
-              `https://github.com/${{ github.repository }}/releases/latest`
+          body_path: windows-native/dist/release_notes.md
           files: |
             windows-native/dist/HalfHourChime.exe
             windows-native/dist/version.json
