@@ -88,7 +88,7 @@ mod perf_guard {
     use super::win_sys;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     /// 内存常驻告警与强制回收阈值：50 MiB
@@ -1440,7 +1440,7 @@ fn trigger_ntp_sync(
     let settings_weak_tx = settings_w.as_weak();
 
     win_sys::log_info("ntp", &format!("starting NTP sync server={server}"));
-    std::thread::Builder::new()
+    let _ = std::thread::Builder::new()
         .name("ntp-sync-worker".to_string())
         .spawn(move || {
             let result = ntp::sync_system_time_with_elevation(&server);
