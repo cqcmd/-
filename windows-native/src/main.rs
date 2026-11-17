@@ -138,7 +138,6 @@ mod perf_guard {
         use windows::Win32::System::Performance::{
             PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
             PdhGetFormattedCounterValue, PdhOpenQueryW, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE,
-            PDH_HCOUNTER, PDH_HQUERY,
         };
         use windows::Win32::System::ProcessStatus::{
             EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
@@ -158,17 +157,17 @@ mod perf_guard {
 
         /// Windows PDH（Performance Data Helper）性能计数器查询会话
         struct PdhSession {
-            query: PDH_HQUERY,
-            sys_cpu_counter: PDH_HCOUNTER,
-            proc_cpu_counter: PDH_HCOUNTER,
-            proc_private_ws_counter: PDH_HCOUNTER,
+            query: isize,
+            sys_cpu_counter: isize,
+            proc_cpu_counter: isize,
+            proc_private_ws_counter: isize,
             logical_cpus: f64,
         }
 
         impl PdhSession {
             fn open(logical_cpus: f64) -> Option<Self> {
                 unsafe {
-                    let mut query: PDH_HQUERY = Default::default();
+                    let mut query: isize = 0;
                     if PdhOpenQueryW(None, 0, &mut query) != 0 {
                         return None;
                     }
@@ -182,7 +181,7 @@ mod perf_guard {
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| "HalfHourChime".to_string());
 
-                    let mut sys_cpu_counter: PDH_HCOUNTER = Default::default();
+                    let mut sys_cpu_counter: isize = 0;
                     let status_sys = PdhAddEnglishCounterW(
                         query,
                         w!(r"\Processor(_Total)\% Processor Time"),
@@ -197,7 +196,7 @@ mod perf_guard {
                     let proc_cpu_path = to_wide_null(&format!(
                         r"\Process({exe_stem})\% Processor Time"
                     ));
-                    let mut proc_cpu_counter: PDH_HCOUNTER = Default::default();
+                    let mut proc_cpu_counter: isize = 0;
                     let status_proc_cpu = PdhAddEnglishCounterW(
                         query,
                         PCWSTR(proc_cpu_path.as_ptr()),
@@ -208,7 +207,7 @@ mod perf_guard {
                     let proc_ws_path = to_wide_null(&format!(
                         r"\Process({exe_stem})\Working Set - Private"
                     ));
-                    let mut proc_private_ws_counter: PDH_HCOUNTER = Default::default();
+                    let mut proc_private_ws_counter: isize = 0;
                     let status_proc_ws = PdhAddEnglishCounterW(
                         query,
                         PCWSTR(proc_ws_path.as_ptr()),
@@ -1788,18 +1787,11 @@ fn main() {
     }
 
     // 8. 注册单实例跨进程唤醒监听（FR-24 / AC-09）
+    let ipc_wake_pending = Arc::new(AtomicBool::new(false));
     {
-        let mw_weak = main_win.as_weak();
-        let st_rc = Rc::clone(&state);
+        let wake_flag = Arc::clone(&ipc_wake_pending);
         win_sys::start_ipc_wake_listener(move || {
-            let mw_weak_inner = mw_weak.clone();
-            let st_inner = Rc::clone(&st_rc);
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(mw) = mw_weak_inner.upgrade() {
-                    refresh_main_window_ui(&mw, &st_inner.borrow());
-                    center_and_show_window(&mw, 460.0, 376.0);
-                }
-            });
+            wake_flag.store(true, Ordering::SeqCst);
         });
     }
 
@@ -2495,6 +2487,7 @@ fn main() {
         let mw_weak = main_win.as_weak();
         let sw_weak = settings_win.as_weak();
         let audio_clone = audio.clone();
+        let ipc_wake_for_tick = Arc::clone(&ipc_wake_pending);
         tick_timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
             let now = Local::now();
             let mut st = st_rc.borrow_mut();
@@ -2587,9 +2580,13 @@ fn main() {
                 }
             }
 
+            let wake_now = ipc_wake_for_tick.swap(false, Ordering::SeqCst);
             if let Some(mw) = mw_weak.upgrade() {
-                // 仅当主状态窗口可见时刷新界面文本，最小化常驻托盘期间跳过字符串分配，保持零堆内存增长
-                if mw.window().is_visible() {
+                if wake_now {
+                    refresh_main_window_ui(&mw, &st);
+                    center_and_show_window(&mw, 460.0, 376.0);
+                } else if mw.window().is_visible() {
+                    // 仅当主状态窗口可见时刷新界面文本，最小化常驻托盘期间跳过字符串分配，保持零堆内存增长
                     refresh_main_window_ui(&mw, &st);
                 }
             }

@@ -1254,7 +1254,7 @@ pub fn apply_rounded_window_corners(
                 let diameter = (radius_px.max(6) * 2).max(12);
                 let rgn = CreateRoundRectRgn(0, 0, width_px + 1, height_px + 1, diameter, diameter);
                 if !rgn.is_invalid() {
-                    let _ = SetWindowRgn(hwnd, Some(rgn), true);
+                    let _ = SetWindowRgn(hwnd, rgn, true);
                 }
             }
         }
