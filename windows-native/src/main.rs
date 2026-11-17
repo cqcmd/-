@@ -2369,23 +2369,16 @@ fn main() {
     }
 
     // 12. 绑定系统托盘双击与右键菜单事件（FR-15 / FR-16 / FR-17）
+    let tray_open_pending = Arc::new(AtomicBool::new(false));
     {
-        let mw_weak = main_win.as_weak();
-        let st_rc = Rc::clone(&state);
+        let open_flag = Arc::clone(&tray_open_pending);
         TrayIconEvent::set_event_handler(Some(move |event| {
             if let TrayIconEvent::DoubleClick {
                 button: MouseButton::Left,
                 ..
             } = event
             {
-                let mw_weak_inner = mw_weak.clone();
-                let st_inner = Rc::clone(&st_rc);
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(mw) = mw_weak_inner.upgrade() {
-                        refresh_main_window_ui(&mw, &st_inner.borrow());
-                        center_and_show_window(&mw, 460.0, 376.0);
-                    }
-                });
+                open_flag.store(true, Ordering::SeqCst);
             }
         }));
     }
@@ -2398,8 +2391,9 @@ fn main() {
         let audio_clone = audio.clone();
         let u_tx = update_tx.clone();
         let perf_tx = perf_stop_tx.clone();
+        let tray_open_flag = Arc::clone(&tray_open_pending);
 
-        // 通过 Slint 事件循环安全调度托盘菜单指令
+        // 通过 Slint 事件循环安全调度托盘菜单与双击指令
         let (menu_tx, menu_rx) = std::sync::mpsc::channel::<tray_icon::menu::MenuId>();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let _ = menu_tx.send(event.id);
@@ -2407,6 +2401,12 @@ fn main() {
 
         let menu_timer = Timer::default();
         menu_timer.start(TimerMode::Repeated, Duration::from_millis(120), move || {
+            if tray_open_flag.swap(false, Ordering::SeqCst) {
+                if let Some(mw) = mw_weak.upgrade() {
+                    refresh_main_window_ui(&mw, &st_rc_main_thread.borrow());
+                    center_and_show_window(&mw, 460.0, 376.0);
+                }
+            }
             while let Ok(id) = menu_rx.try_recv() {
                 if id == tray_clone.ids.test_chime {
                     let st = st_rc_main_thread.borrow();
