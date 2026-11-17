@@ -23,13 +23,16 @@ use slint::{ComponentHandle, Timer, TimerMode};
 use std::cell::{Cell, RefCell};
 use std::io::{Read, Write};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tray_icon::menu::MenuEvent;
 use tray_icon::{MouseButton, TrayIconEvent};
-use web_console::{WebAction, WebConsoleController, WebSnapshot, DEFAULT_WEB_CONSOLE_PORT, DEFAULT_WEB_CONSOLE_URL};
+use web_console::{
+    WebAction, WebConfigPatch, WebConfigView, WebConsoleController, WebSnapshot,
+    DEFAULT_WEB_CONSOLE_PORT, DEFAULT_WEB_CONSOLE_URL,
+};
 use win_sys::TrayController;
 
 slint::include_modules!();
@@ -42,17 +45,21 @@ struct AppState {
     is_syncing: bool,
     ntp_status_code: i32, // 0: 未校时 | 1: 校时中 | 2: 成功 | 3: 失败
     ntp_status_text: String,
+    holiday_feed_status: String,
+    tts_preview_status: String,
 }
 
 /// 后台定期版本检查消息指令
 enum UpdateWorkerMsg {
     CheckNow {
         url: String,
+        token: String,
         manual: bool,
     },
     Reconfigure {
         enabled: bool,
         url: String,
+        token: String,
         interval_hours: u16,
     },
     Shutdown,
@@ -61,9 +68,18 @@ enum UpdateWorkerMsg {
 #[derive(Clone, Default)]
 struct UpdateContext {
     download_url: Arc<Mutex<String>>,
+    api_download_url: Arc<Mutex<String>>,
+    github_token: Arc<Mutex<String>>,
     package_type: Arc<Mutex<String>>,
     last_prompted_version: Arc<Mutex<String>>,
+    is_checking: Arc<AtomicBool>,
+    has_update: Arc<AtomicBool>,
+    remote_version: Arc<Mutex<String>>,
+    status_text: Arc<Mutex<String>>,
+    release_notes: Arc<Mutex<String>>,
     is_downloading: Arc<AtomicBool>,
+    download_progress: Arc<AtomicI32>,
+    download_status_text: Arc<Mutex<String>>,
 }
 
 /// Windows 原生性能计数器监控与内存强制回收模块（保障网吧低配长期值守稳定运行）
@@ -86,7 +102,7 @@ mod perf_guard {
     /// 强制回收冷却间隔，避免高压环境下反复抖动工作集
     pub const GC_COOLDOWN: Duration = Duration::from_secs(120);
 
-    #[derive(Debug, Clone, Copy, PartialEq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
     pub struct PerfSample {
         pub working_set_bytes: u64,
         pub private_bytes: u64,
@@ -490,12 +506,39 @@ mod perf_guard {
             win_sys::flush_logs();
             (0, 0, 0)
         }
+
+        pub fn query_process_memory_bytes() -> (u64, u64) {
+            (0, 0)
+        }
+    }
+
+    pub fn query_memory_mb_now() -> (f64, f64) {
+        let (ws, priv_b) = imp::query_process_memory_bytes();
+        (format_mb(ws), format_mb(priv_b))
+    }
+
+    pub fn trim_memory_now(audio: &AudioEngine) -> String {
+        let (before, after, _) = imp::force_windows_memory_reclaim(audio);
+        win_sys::log_info(
+            "perf",
+            &format!(
+                "manual memory trim requested via web console: {:.2}MB -> {:.2}MB",
+                format_mb(before),
+                format_mb(after)
+            ),
+        );
+        format!(
+            "已执行内存释放：{:.1} MB → {:.1} MB",
+            format_mb(before),
+            format_mb(after)
+        )
     }
 
     /// 启动后台资源与性能计数器监控线程，并在超限（内存 > 50MB）时执行强制内存回收
     pub fn start_performance_monitor(
         audio: AudioEngine,
         cpu_throttled: Arc<AtomicBool>,
+        latest_sample: Arc<Mutex<PerfSample>>,
     ) -> Sender<()> {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
@@ -513,12 +556,10 @@ mod perf_guard {
                 let mut prev_overloaded = false;
 
                 loop {
-                    match stop_rx.recv_timeout(PERF_SAMPLE_INTERVAL) {
-                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                        Err(RecvTimeoutError::Timeout) => {}
-                    }
-
                     let sample = collector.sample();
+                    if let Ok(mut guard) = latest_sample.lock() {
+                        *guard = sample;
+                    }
                     let overloaded = is_cpu_overloaded(&sample);
                     cpu_throttled.store(overloaded, Ordering::Relaxed);
 
@@ -591,6 +632,13 @@ mod perf_guard {
                             );
                         }
                     }
+                    if let Ok(mut guard) = latest_sample.lock() {
+                        *guard = sample;
+                    }
+                    match stop_rx.recv_timeout(PERF_SAMPLE_INTERVAL) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
                 }
             });
 
@@ -598,10 +646,11 @@ mod perf_guard {
     }
 }
 
-fn build_ureq_agent(connect_secs: u64, read_secs: u64) -> ureq::Agent {
+fn build_ureq_agent_with_redirects(connect_secs: u64, read_secs: u64, redirects: u32) -> ureq::Agent {
     let mut builder = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(connect_secs))
-        .timeout_read(Duration::from_secs(read_secs));
+        .timeout_read(Duration::from_secs(read_secs))
+        .redirects(redirects);
 
     if let Ok(connector) = native_tls::TlsConnector::new() {
         builder = builder.tls_connector(Arc::new(connector));
@@ -620,6 +669,10 @@ fn build_ureq_agent(connect_secs: u64, read_secs: u64) -> ureq::Agent {
     }
 
     builder.build()
+}
+
+fn build_ureq_agent(connect_secs: u64, read_secs: u64) -> ureq::Agent {
+    build_ureq_agent_with_redirects(connect_secs, read_secs, 5)
 }
 
 fn resolve_local_or_unc_path(raw: &str) -> Option<std::path::PathBuf> {
@@ -642,12 +695,84 @@ fn resolve_local_or_unc_path(raw: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// 轻量级 HTTP/HTTPS/本地共享读取服务端版本清单（支持标准 version.json、GitHub Releases、Google Drive 链接与局域网路径）
-fn fetch_remote_manifest(url: &str) -> Result<version::RemoteVersionManifest, String> {
+enum HttpTextErr {
+    Status(u16, String),
+    Other(String),
+}
+
+fn http_get_text(agent: &ureq::Agent, url: &str, token: &str) -> Result<String, HttpTextErr> {
+    let mut req = agent
+        .get(url)
+        .set(
+            "User-Agent",
+            &format!("HalfHourChime/{}", version::APP_PKG_VERSION),
+        )
+        .set("Accept", "application/vnd.github+json, application/json");
+
+    let clean_token = token.trim();
+    if !clean_token.is_empty() && url.contains("api.github.com") {
+        req = req.set("Authorization", &format!("Bearer {clean_token}"));
+    }
+
+    let resp = req.call().map_err(|e| match e {
+        ureq::Error::Status(code, _r) => HttpTextErr::Status(code, format!("{url}: status code {code}")),
+        other => HttpTextErr::Other(format!("连接更新服务器失败：{other}")),
+    })?;
+
+    let mut body = String::new();
+    resp.into_reader()
+        .take(256 * 1024)
+        .read_to_string(&mut body)
+        .map_err(|e| HttpTextErr::Other(format!("读取更新清单失败：{e}")))?;
+    Ok(body)
+}
+
+fn fetch_public_github_release_via_redirect(
+    agent: &ureq::Agent,
+    owner: &str,
+    repo: &str,
+) -> Option<Result<version::RemoteVersionManifest, String>> {
+    let web_latest = format!("https://github.com/{owner}/{repo}/releases/latest");
+    let resp = agent
+        .get(&web_latest)
+        .set(
+            "User-Agent",
+            &format!("HalfHourChime/{}", version::APP_PKG_VERSION),
+        )
+        .call()
+        .ok()?;
+
+    let final_url = resp.get_url().to_string();
+    let tag_part = final_url.split("/releases/tag/").nth(1)?;
+    let tag = tag_part.split(['?', '#']).next()?.trim();
+    if tag.is_empty() {
+        return None;
+    }
+
+    let version_json_url =
+        format!("https://github.com/{owner}/{repo}/releases/download/{tag}/version.json");
+    match http_get_text(agent, &version_json_url, "") {
+        Ok(body) => Some(version::parse_remote_manifest_body(&body)),
+        Err(_) => {
+            let exe_url =
+                format!("https://github.com/{owner}/{repo}/releases/download/{tag}/HalfHourChime.exe");
+            Some(Ok(version::RemoteVersionManifest {
+                version: tag.to_string(),
+                download_url: exe_url,
+                api_download_url: String::new(),
+                notes: "已通过 GitHub Releases 页面检测到新版本，点击“自动更新”即可下载升级。".to_string(),
+                package_type: "portable".to_string(),
+            }))
+        }
+    }
+}
+
+/// 轻量级 HTTP/HTTPS/本地共享读取服务端版本清单（支持公开与 Token 鉴权私有 GitHub Releases、version.json、Google Drive 及局域网路径）
+fn fetch_remote_manifest(url: &str, token: &str) -> Result<version::RemoteVersionManifest, String> {
     let trimmed = url.trim();
     if trimmed.is_empty() || trimmed.contains("updates.zwai.local") {
         return Err(
-            "尚未配置更新源地址：请在「设置 → 更新与自启」填入 version.json 直链、GitHub Releases 地址、Google Drive 分享链接或局域网共享路径"
+            "尚未配置更新源地址：请在「本地 Web 控制台 → 版本与更新」填入更新地址或 GitHub Releases 地址"
                 .to_string(),
         );
     }
@@ -664,31 +789,62 @@ fn fetch_remote_manifest(url: &str) -> Result<version::RemoteVersionManifest, St
     }
 
     let resolved_url = version::normalize_update_check_url(trimmed);
-    let agent = build_ureq_agent(5, 8);
+    let agent = build_ureq_agent(6, 10);
 
-    let resp = agent
-        .get(&resolved_url)
-        .set(
-            "User-Agent",
-            &format!("HalfHourChime/{}", version::APP_PKG_VERSION),
-        )
-        .set("Accept", "application/vnd.github+json, application/json")
-        .call()
-        .map_err(|e| format!("连接更新服务器失败：{e}"))?;
-
-    let mut body = String::new();
-    resp.into_reader()
-        .take(256 * 1024)
-        .read_to_string(&mut body)
-        .map_err(|e| format!("读取更新清单失败：{e}"))?;
-
-    version::parse_remote_manifest_body(&body)
+    match http_get_text(&agent, &resolved_url, token) {
+        Ok(body) => version::parse_remote_manifest_body(&body),
+        Err(HttpTextErr::Status(code, detail)) => {
+            if let Some((owner, repo)) = version::extract_github_owner_repo(trimmed) {
+                if code == 404 {
+                    let list_url = format!(
+                        "https://api.github.com/repos/{owner}/{repo}/releases?per_page=1"
+                    );
+                    if let Ok(list_body) = http_get_text(&agent, &list_url, token) {
+                        if let Ok(m) = version::parse_remote_manifest_body(&list_body) {
+                            return Ok(m);
+                        }
+                    }
+                    if token.trim().is_empty() {
+                        if let Some(res) = fetch_public_github_release_via_redirect(&agent, &owner, &repo) {
+                            return res;
+                        }
+                        return Err(
+                            "连接更新服务器返回 404：仓库可能是私有（Private）或尚未公开发布正式 Release。请在 GitHub 将仓库改为 Public（公开），或在「本地 Web 控制台 → 版本与更新」填入只读 GitHub Token。"
+                                .to_string(),
+                        );
+                    }
+                    return Err(
+                        "连接更新服务器返回 404：未找到可访问的 Release，或当前 GitHub Token 缺少该仓库的只读权限（Contents: Read）。"
+                            .to_string(),
+                    );
+                }
+                if code == 401 {
+                    return Err(
+                        "GitHub 访问令牌无效或已过期（401），请在「本地 Web 控制台 → 版本与更新」中重新配置。"
+                            .to_string(),
+                    );
+                }
+                if code == 403 && token.trim().is_empty() {
+                    if let Some(res) = fetch_public_github_release_via_redirect(&agent, &owner, &repo) {
+                        return res;
+                    }
+                    return Err(
+                        "GitHub API 访问受限（403 请求频率限制），请稍后重试或在本地 Web 控制台配置只读 Token。"
+                            .to_string(),
+                    );
+                }
+            }
+            Err(format!("连接更新服务器失败：{detail}"))
+        }
+        Err(HttpTextErr::Other(msg)) => Err(msg),
+    }
 }
 
 /// 启动后台定期版本检查线程：空闲时零 CPU 休眠，定期对比服务端版本号并在发现新版本时提示用户下载
 fn start_update_check_worker(
     initial_enabled: bool,
     initial_url: String,
+    initial_token: String,
     initial_interval_hours: u16,
     main_w: &MainWindow,
     about_w: &AboutWindow,
@@ -701,8 +857,12 @@ fn start_update_check_worker(
     let aw_weak = about_w.as_weak();
     let uw_weak = update_w.as_weak();
 
-    let run_check = move |url: &str, manual: bool| {
-        let result = fetch_remote_manifest(url).and_then(|manifest| {
+    let run_check = move |url: &str, token: &str, manual: bool| {
+        ctx.is_checking.store(true, Ordering::SeqCst);
+        if let Ok(mut st_msg) = ctx.status_text.lock() {
+            *st_msg = "正在连接更新服务器检查版本...".to_string();
+        }
+        let result = fetch_remote_manifest(url, token).and_then(|manifest| {
             let newer = version::is_newer_than_current(&manifest.version)?;
             Ok((newer, manifest))
         });
@@ -711,6 +871,57 @@ fn start_update_check_worker(
         let aw_w = aw_weak.clone();
         let uw_w = uw_weak.clone();
         let ctx_clone = ctx.clone();
+
+        ctx_clone.is_checking.store(false, Ordering::SeqCst);
+        match &result {
+            Ok((true, manifest)) => {
+                let display_remote = if manifest.version.starts_with('v')
+                    || manifest.version.starts_with('V')
+                {
+                    manifest.version.clone()
+                } else {
+                    format!("v{}", manifest.version)
+                };
+                if let Ok(mut guard) = ctx_clone.download_url.lock() {
+                    *guard = manifest.download_url.clone();
+                }
+                if let Ok(mut api_guard) = ctx_clone.api_download_url.lock() {
+                    *api_guard = manifest.api_download_url.clone();
+                }
+                if let Ok(mut pkg_guard) = ctx_clone.package_type.lock() {
+                    *pkg_guard = manifest.package_type.clone();
+                }
+                ctx_clone.has_update.store(true, Ordering::SeqCst);
+                if let Ok(mut rv) = ctx_clone.remote_version.lock() {
+                    *rv = display_remote.clone();
+                }
+                let found_msg = format!("发现新版本 {display_remote}，可点击“自动更新”一键升级");
+                if let Ok(mut st_msg) = ctx_clone.status_text.lock() {
+                    *st_msg = found_msg;
+                }
+                let notes = if manifest.notes.trim().is_empty() {
+                    "包含稳定性优化与功能改进，建议前往下载更新。".to_string()
+                } else {
+                    manifest.notes.clone()
+                };
+                if let Ok(mut n) = ctx_clone.release_notes.lock() {
+                    *n = notes;
+                }
+            }
+            Ok((false, _)) => {
+                ctx_clone.has_update.store(false, Ordering::SeqCst);
+                if let Ok(mut st_msg) = ctx_clone.status_text.lock() {
+                    *st_msg = format!("当前已是最新版本（{}）", version::display_version());
+                }
+            }
+            Err(err) => {
+                if manual {
+                    if let Ok(mut st_msg) = ctx_clone.status_text.lock() {
+                        *st_msg = err.clone();
+                    }
+                }
+            }
+        }
 
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(aw) = aw_w.upgrade() {
@@ -733,13 +944,6 @@ fn start_update_check_worker(
                     } else {
                         format!("v{}", manifest.version)
                     };
-
-                    if let Ok(mut guard) = ctx_clone.download_url.lock() {
-                        *guard = manifest.download_url.clone();
-                    }
-                    if let Ok(mut pkg_guard) = ctx_clone.package_type.lock() {
-                        *pkg_guard = manifest.package_type.clone();
-                    }
 
                     if let Some(mw) = mw_w.upgrade() {
                         mw.set_has_update(true);
@@ -813,6 +1017,7 @@ fn start_update_check_worker(
         .spawn(move || {
             let mut enabled = initial_enabled;
             let mut url = initial_url;
+            let mut token = initial_token;
             let mut interval = Duration::from_secs(initial_interval_hours.max(1) as u64 * 3600);
 
             // 启动后延迟 5 秒执行首次静默对比，避免影响程序冷启动速度
@@ -820,17 +1025,20 @@ fn start_update_check_worker(
                 Ok(UpdateWorkerMsg::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
                 Ok(UpdateWorkerMsg::CheckNow {
                     url: manual_url,
+                    token: manual_token,
                     manual,
                 }) => {
-                    run_check(&manual_url, manual);
+                    run_check(&manual_url, &manual_token, manual);
                 }
                 Ok(UpdateWorkerMsg::Reconfigure {
                     enabled: en,
                     url: u,
+                    token: tok,
                     interval_hours: ih,
                 }) => {
                     enabled = en;
                     url = u;
+                    token = tok;
                     interval = Duration::from_secs(ih.max(1) as u64 * 3600);
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -838,7 +1046,7 @@ fn start_update_check_worker(
                         if cpu_throttled.load(Ordering::Relaxed) {
                             win_sys::log_debug("update", "deferring initial auto-check due to high CPU load");
                         } else {
-                            run_check(&url, false);
+                            run_check(&url, &token, false);
                         }
                     }
                 }
@@ -850,17 +1058,20 @@ fn start_update_check_worker(
                     Ok(UpdateWorkerMsg::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                     Ok(UpdateWorkerMsg::CheckNow {
                         url: manual_url,
+                        token: manual_token,
                         manual,
                     }) => {
-                        run_check(&manual_url, manual);
+                        run_check(&manual_url, &manual_token, manual);
                     }
                     Ok(UpdateWorkerMsg::Reconfigure {
                         enabled: en,
                         url: u,
+                        token: tok,
                         interval_hours: ih,
                     }) => {
                         enabled = en;
                         url = u;
+                        token = tok;
                         interval = Duration::from_secs(ih.max(1) as u64 * 3600);
                     }
                     Err(RecvTimeoutError::Timeout) => {
@@ -868,7 +1079,7 @@ fn start_update_check_worker(
                             if cpu_throttled.load(Ordering::Relaxed) {
                                 win_sys::log_debug("update", "deferring periodic auto-check due to high CPU load");
                             } else {
-                                run_check(&url, false);
+                                run_check(&url, &token, false);
                             }
                         }
                     }
@@ -1270,6 +1481,7 @@ fn trigger_manual_update_check(
     update_tx: &Sender<UpdateWorkerMsg>,
     about_w: &AboutWindow,
     url: String,
+    token: String,
 ) {
     let target = if url.trim().is_empty() {
         version::DEFAULT_GITHUB_RELEASE_URL.to_string()
@@ -1280,6 +1492,7 @@ fn trigger_manual_update_check(
     about_w.set_update_status_text("正在检查服务端版本...".into());
     let _ = update_tx.send(UpdateWorkerMsg::CheckNow {
         url: target,
+        token,
         manual: true,
     });
 }
@@ -1306,6 +1519,16 @@ fn download_and_apply_auto_update(
 ) {
     let raw_url = ctx
         .download_url
+        .lock()
+        .map(|g| g.trim().to_string())
+        .unwrap_or_default();
+    let api_asset_url = ctx
+        .api_download_url
+        .lock()
+        .map(|g| g.trim().to_string())
+        .unwrap_or_default();
+    let gh_token = ctx
+        .github_token
         .lock()
         .map(|g| g.trim().to_string())
         .unwrap_or_default();
@@ -1337,6 +1560,10 @@ fn download_and_apply_auto_update(
     update_w.set_is_downloading(true);
     update_w.set_download_progress(0);
     update_w.set_download_status_text("正在连接更新源并准备下载安装包...".into());
+    ctx.download_progress.store(0, Ordering::SeqCst);
+    if let Ok(mut s) = ctx.download_status_text.lock() {
+        *s = "正在连接更新源并准备下载安装包...".to_string();
+    }
 
     let uw_weak = update_w.as_weak();
     center_and_show_window(update_w, 452.0, 360.0);
@@ -1399,14 +1626,45 @@ fn download_and_apply_auto_update(
                 } else {
                     let agent = build_ureq_agent(6, 60);
 
-                    let resp = agent
-                        .get(&url)
-                        .set(
-                            "User-Agent",
-                            &format!("HalfHourChime/{}", version::APP_PKG_VERSION),
-                        )
-                        .call()
-                        .map_err(|e| format!("下载更新包失败：{e}"))?;
+                    let resp = if !gh_token.is_empty() && !api_asset_url.is_empty() {
+                        let no_redir = build_ureq_agent_with_redirects(6, 60, 0);
+                        let api_resp = no_redir
+                            .get(&api_asset_url)
+                            .set(
+                                "User-Agent",
+                                &format!("HalfHourChime/{}", version::APP_PKG_VERSION),
+                            )
+                            .set("Accept", "application/octet-stream")
+                            .set("Authorization", &format!("Bearer {gh_token}"))
+                            .call()
+                            .map_err(|e| format!("请求私有仓库安装包地址失败：{e}"))?;
+
+                        if (300..400).contains(&api_resp.status()) {
+                            let signed_url = api_resp
+                                .header("Location")
+                                .ok_or_else(|| "GitHub 资产重定向缺少 Location 头".to_string())?
+                                .to_string();
+                            agent
+                                .get(&signed_url)
+                                .set(
+                                    "User-Agent",
+                                    &format!("HalfHourChime/{}", version::APP_PKG_VERSION),
+                                )
+                                .call()
+                                .map_err(|e| format!("下载更新包失败：{e}"))?
+                        } else {
+                            api_resp
+                        }
+                    } else {
+                        agent
+                            .get(&url)
+                            .set(
+                                "User-Agent",
+                                &format!("HalfHourChime/{}", version::APP_PKG_VERSION),
+                            )
+                            .call()
+                            .map_err(|e| format!("下载更新包失败：{e}"))?
+                    };
 
                     let total_bytes: Option<u64> = resp
                         .header("Content-Length")
@@ -1453,13 +1711,16 @@ fn download_and_apply_auto_update(
                             let pct = ((downloaded * 100) / total).min(100) as i32;
                             if pct >= last_reported_pct + 2 || pct == 100 {
                                 last_reported_pct = pct;
+                                let status_str = format!("正在下载更新包（{pct}%）...");
+                                ctx_clone.download_progress.store(pct, Ordering::SeqCst);
+                                if let Ok(mut ds) = ctx_clone.download_status_text.lock() {
+                                    *ds = status_str.clone();
+                                }
                                 let uw_w = uw_weak.clone();
                                 let _ = slint::invoke_from_event_loop(move || {
                                     if let Some(uw) = uw_w.upgrade() {
                                         uw.set_download_progress(pct);
-                                        uw.set_download_status_text(
-                                            format!("正在下载更新包（{pct}%）...").into(),
-                                        );
+                                        uw.set_download_status_text(status_str.into());
                                     }
                                 });
                             }
@@ -1468,14 +1729,16 @@ fn download_and_apply_auto_update(
                             if quarter_mb > last_reported_mb {
                                 last_reported_mb = quarter_mb;
                                 let mb = downloaded as f64 / (1024.0 * 1024.0);
+                                let status_str = format!("正在下载更新包（已下载 {mb:.2} MB）...");
+                                ctx_clone.download_progress.store(50, Ordering::SeqCst);
+                                if let Ok(mut ds) = ctx_clone.download_status_text.lock() {
+                                    *ds = status_str.clone();
+                                }
                                 let uw_w = uw_weak.clone();
                                 let _ = slint::invoke_from_event_loop(move || {
                                     if let Some(uw) = uw_w.upgrade() {
                                         uw.set_download_progress(50);
-                                        uw.set_download_status_text(
-                                            format!("正在下载更新包（已下载 {mb:.2} MB）...")
-                                                .into(),
-                                        );
+                                        uw.set_download_status_text(status_str.into());
                                     }
                                 });
                             }
@@ -1544,6 +1807,9 @@ fn download_and_apply_auto_update(
                 Err(err) => {
                     win_sys::log_error("updater", &format!("auto-update download failed: {err}"));
                     ctx_clone.is_downloading.store(false, Ordering::SeqCst);
+                    if let Ok(mut ds) = ctx_clone.download_status_text.lock() {
+                        *ds = err.clone();
+                    }
                     let uw_w = uw_weak.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(uw) = uw_w.upgrade() {
@@ -1555,6 +1821,167 @@ fn download_and_apply_auto_update(
                 }
             }
         });
+}
+
+fn config_to_web_view(cfg: &AppConfig) -> WebConfigView {
+    WebConfigView {
+        chime_minutes_str: cfg.format_chime_minutes(),
+        chime_repeat_count: cfg.chime_repeat_count,
+        chime_play_sound: cfg.chime_play_sound,
+        chime_tts_enabled: cfg.chime_tts_enabled,
+        chime_tts_template: cfg.chime_tts_template.clone(),
+        holiday_enabled: cfg.holiday_enabled,
+        holiday_greeting_template: cfg.holiday_greeting_template.clone(),
+        holiday_custom_rules: cfg.holiday_custom_rules.clone(),
+        holiday_data_source_url: cfg.holiday_data_source_url.clone(),
+        holiday_custom_audio_path: cfg.holiday_custom_audio_path.clone(),
+        quiet_enabled: cfg.quiet_enabled,
+        quiet_start_hour: cfg.quiet_start_hour,
+        quiet_start_minute: cfg.quiet_start_minute,
+        quiet_end_hour: cfg.quiet_end_hour,
+        quiet_end_minute: cfg.quiet_end_minute,
+        meal_enabled: cfg.meal_enabled,
+        meal_hour: cfg.meal_hour,
+        meal_minute: cfg.meal_minute,
+        meal_repeat_count: cfg.meal_repeat_count,
+        meal_play_chime_before_custom: cfg.meal_play_chime_before_custom,
+        meal_custom_audio_path: cfg.meal_custom_audio_path.clone(),
+        meal_tts_enabled: cfg.meal_tts_enabled,
+        meal_tts_text: cfg.meal_tts_text.clone(),
+        tts_engine_index: cfg.tts_engine.to_index(),
+        edge_voice_index: edge_voice_to_index(&cfg.edge_tts_voice),
+        tts_rate: cfg.tts_rate,
+        volume: cfg.volume,
+        ntp_server: cfg.ntp_server.clone(),
+        auto_start: cfg.auto_start,
+        theme_index: cfg.theme.to_index(),
+        update_check_url: cfg.update_check_url.clone(),
+        update_check_interval_hours: cfg.update_check_interval_hours,
+        has_github_token: !cfg.update_github_token.trim().is_empty(),
+    }
+}
+
+fn apply_web_config_patch(base: &AppConfig, patch: WebConfigPatch) -> Result<AppConfig, String> {
+    let mut next = base.clone();
+    if let Some(ref mins) = patch.chime_minutes_str {
+        next.chime_minutes = AppConfig::parse_chime_minutes(mins)?;
+    }
+    if let Some(v) = patch.chime_repeat_count {
+        next.chime_repeat_count = v;
+    }
+    if let Some(v) = patch.chime_play_sound {
+        next.chime_play_sound = v;
+    }
+    if let Some(v) = patch.chime_tts_enabled {
+        next.chime_tts_enabled = v;
+    }
+    if let Some(v) = patch.chime_tts_template {
+        next.chime_tts_template = v;
+    }
+    if let Some(v) = patch.holiday_enabled {
+        next.holiday_enabled = v;
+    }
+    if let Some(v) = patch.holiday_greeting_template {
+        next.holiday_greeting_template = v;
+    }
+    if let Some(v) = patch.holiday_custom_rules {
+        next.holiday_custom_rules = v;
+    }
+    if let Some(v) = patch.holiday_data_source_url {
+        next.holiday_data_source_url = v;
+    }
+    if let Some(v) = patch.holiday_custom_audio_path {
+        next.holiday_custom_audio_path = v;
+    }
+    if let Some(v) = patch.quiet_enabled {
+        next.quiet_enabled = v;
+    }
+    if let Some(v) = patch.quiet_start_hour {
+        next.quiet_start_hour = v;
+    }
+    if let Some(v) = patch.quiet_start_minute {
+        next.quiet_start_minute = v;
+    }
+    if let Some(v) = patch.quiet_end_hour {
+        next.quiet_end_hour = v;
+    }
+    if let Some(v) = patch.quiet_end_minute {
+        next.quiet_end_minute = v;
+    }
+    if let Some(v) = patch.meal_enabled {
+        next.meal_enabled = v;
+    }
+    if let Some(v) = patch.meal_hour {
+        next.meal_hour = v;
+    }
+    if let Some(v) = patch.meal_minute {
+        next.meal_minute = v;
+    }
+    if let Some(v) = patch.meal_repeat_count {
+        next.meal_repeat_count = v;
+    }
+    if let Some(v) = patch.meal_play_chime_before_custom {
+        next.meal_play_chime_before_custom = v;
+    }
+    if let Some(v) = patch.meal_custom_audio_path {
+        next.meal_custom_audio_path = v;
+    }
+    if let Some(v) = patch.meal_tts_enabled {
+        next.meal_tts_enabled = v;
+    }
+    if let Some(v) = patch.meal_tts_text {
+        next.meal_tts_text = v;
+    }
+    if let Some(v) = patch.tts_engine_index {
+        next.tts_engine = TtsEngine::from_index(v);
+    }
+    if let Some(v) = patch.edge_voice_index {
+        next.edge_tts_voice = edge_voice_from_index(v).to_string();
+    }
+    if let Some(v) = patch.tts_rate {
+        next.tts_rate = v;
+    }
+    if let Some(v) = patch.volume {
+        next.volume = v.min(100);
+    }
+    if let Some(v) = patch.ntp_server {
+        next.ntp_server = v;
+    }
+    if let Some(v) = patch.auto_start {
+        next.auto_start = v;
+    }
+    if let Some(v) = patch.theme_index {
+        next.theme = ThemeMode::from_index(v);
+    }
+    if let Some(v) = patch.update_check_url {
+        next.update_check_url = v;
+    }
+    if let Some(v) = patch.update_check_interval_hours {
+        next.update_check_interval_hours = v;
+    }
+    if patch.clear_github_token == Some(true) {
+        next.update_github_token.clear();
+    } else if let Some(tok) = patch.update_github_token {
+        if !tok.trim().is_empty() {
+            next.update_github_token = tok;
+        }
+    }
+    next.validate()?;
+    Ok(next)
+}
+
+fn format_uptime(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let rem_secs = secs % 60;
+    if hours > 0 {
+        format!("{hours}小时{mins}分")
+    } else if mins > 0 {
+        format!("{mins}分{rem_secs:02}秒")
+    } else {
+        format!("{rem_secs}秒")
+    }
 }
 
 fn main() {
@@ -1627,7 +2054,9 @@ fn main() {
     } else {
         cfg.update_check_url.clone()
     };
+    let initial_update_token = cfg.update_github_token.clone();
     let initial_update_interval = cfg.update_check_interval_hours;
+    let app_started_at = Instant::now();
 
     let state = Rc::new(RefCell::new(AppState {
         config_store,
@@ -1637,6 +2066,8 @@ fn main() {
         is_syncing: false,
         ntp_status_code: 0,
         ntp_status_text: initial_ntp_text,
+        holiday_feed_status: "使用内置公历/农历节日表".to_string(),
+        tts_preview_status: String::new(),
     }));
 
     refresh_main_window_ui(&main_win, &state.borrow());
@@ -1654,14 +2085,23 @@ fn main() {
 
     // 5.5 启动后台性能计数器监控与定期网络版本检查工作线程
     let cpu_throttled = Arc::new(AtomicBool::new(false));
+    let latest_perf = Arc::new(Mutex::new(perf_guard::PerfSample::default()));
     let perf_stop_tx = perf_guard::start_performance_monitor(
         audio.clone(),
         Arc::clone(&cpu_throttled),
+        Arc::clone(&latest_perf),
     );
     let update_ctx = UpdateContext::default();
+    if let Ok(mut tok_guard) = update_ctx.github_token.lock() {
+        *tok_guard = initial_update_token.clone();
+    }
+    if let Ok(mut st_msg) = update_ctx.status_text.lock() {
+        *st_msg = "已启用 GitHub Releases 自动更新检查".to_string();
+    }
     let update_tx = start_update_check_worker(
         initial_update_enabled,
         initial_update_url,
+        initial_update_token,
         initial_update_interval,
         &main_win,
         &about_win,
@@ -1673,6 +2113,9 @@ fn main() {
     // 5.6 初始化可选本地 Web 控制台（端口 3000，默认关闭，仅当用户启用时监听 127.0.0.1:3000）
     let (web_action_tx, web_action_rx) = mpsc::channel::<WebAction>();
     let web_console = Rc::new(RefCell::new(WebConsoleController::new(web_action_tx)));
+    web_console
+        .borrow()
+        .update_config_view(config_to_web_view(&state.borrow().config));
     if state.borrow().config.web_console_enabled {
         if let Err(err) = web_console.borrow_mut().start(DEFAULT_WEB_CONSOLE_PORT) {
             win_sys::log_warn("web", &format!("failed to auto-start web console: {err}"));
@@ -2289,6 +2732,7 @@ fn main() {
                 preserved_mute_mode,
                 prev_holiday_url,
                 preserved_update_url,
+                preserved_update_token,
                 preserved_update_interval,
             ) = {
                 let st = st_rc.borrow();
@@ -2301,6 +2745,7 @@ fn main() {
                     st.config.mute_mode,
                     st.config.holiday_data_source_url.clone(),
                     u_url,
+                    st.config.update_github_token.clone(),
                     st.config.update_check_interval_hours.clamp(1, 168),
                 )
             };
@@ -2339,6 +2784,7 @@ fn main() {
                 update_check_enabled: true,
                 update_check_url: preserved_update_url,
                 update_check_interval_hours: preserved_update_interval,
+                update_github_token: preserved_update_token,
                 web_console_enabled: sw.get_web_console_enabled(),
             };
 
@@ -2372,6 +2818,9 @@ fn main() {
                 st.scheduler.reset_slots();
                 refresh_main_window_ui(&mw, &st);
             }
+            wc_rc
+                .borrow()
+                .update_config_view(config_to_web_view(&candidate));
 
             if candidate.holiday_data_source_url != prev_holiday_url {
                 spawn_holiday_feed_refresh(
@@ -2385,6 +2834,7 @@ fn main() {
             let _ = u_tx.send(UpdateWorkerMsg::Reconfigure {
                 enabled: candidate.update_check_enabled,
                 url: candidate.update_check_url.clone(),
+                token: candidate.update_github_token.clone(),
                 interval_hours: candidate.update_check_interval_hours,
             });
 
@@ -2411,8 +2861,13 @@ fn main() {
         let u_tx = update_tx.clone();
         about_win.on_check_update_now(move || {
             if let Some(aw) = aw_weak.upgrade() {
-                let url = st_rc.borrow().config.update_check_url.clone();
-                trigger_manual_update_check(&u_tx, &aw, url);
+                let st = st_rc.borrow();
+                trigger_manual_update_check(
+                    &u_tx,
+                    &aw,
+                    st.config.update_check_url.clone(),
+                    st.config.update_github_token.clone(),
+                );
             }
         });
     }
@@ -2571,8 +3026,13 @@ fn main() {
                     let _ = win_sys::open_logs_folder();
                 } else if id == tray_clone.ids.check_update {
                     if let Some(aw) = aw_weak.upgrade() {
-                        let url = st_rc_main_thread.borrow().config.update_check_url.clone();
-                        trigger_manual_update_check(&u_tx, &aw, url);
+                        let st = st_rc_main_thread.borrow();
+                        trigger_manual_update_check(
+                            &u_tx,
+                            &aw,
+                            st.config.update_check_url.clone(),
+                            st.config.update_github_token.clone(),
+                        );
                         center_and_show_window(&aw, 452.0, 372.0);
                     }
                 } else if id == tray_clone.ids.about {
@@ -2596,11 +3056,20 @@ fn main() {
         let st_rc = Rc::clone(&state);
         let mw_weak = main_win.as_weak();
         let sw_weak = settings_win.as_weak();
+        let aw_weak = about_win.as_weak();
+        let uw_weak = update_win.as_weak();
         let audio_clone = audio.clone();
         let tray_for_tick = Arc::clone(&tray);
         let ipc_wake_for_tick = Arc::clone(&ipc_wake_pending);
         let preview_gen_tick = Rc::clone(&last_voice_preview_gen);
         let wc_tick = Rc::clone(&web_console);
+        let perf_sample_tick = Arc::clone(&latest_perf);
+        let update_ctx_tick = update_ctx.clone();
+        let u_tx_tick = update_tx.clone();
+        let h_tx_tick = holiday_tx.clone();
+        let perf_stop_tick = perf_stop_tx.clone();
+        let guard_tick = Rc::clone(&single_instance_guard);
+
         tick_timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
             let now = Local::now();
 
@@ -2622,6 +3091,67 @@ fn main() {
                             st.config.tts_rate,
                         );
                     }
+                    WebAction::TestVoice {
+                        tts_engine_index,
+                        edge_voice_index,
+                        tts_rate,
+                    } => {
+                        let was_playing = audio_clone.is_playing_gen(preview_gen_tick.get());
+                        let _ = was_playing;
+                        audio_clone.stop_active();
+                        let mut st = st_rc.borrow_mut();
+                        let engine = tts_engine_index
+                            .map(TtsEngine::from_index)
+                            .unwrap_or(st.config.tts_engine);
+                        let voice = edge_voice_index
+                            .map(|idx| edge_voice_from_index(idx).to_string())
+                            .unwrap_or_else(|| st.config.edge_tts_voice.clone());
+                        let rate = tts_rate
+                            .map(|r| r.clamp(-5, 5))
+                            .unwrap_or(st.config.tts_rate);
+                        let time_phrase =
+                            render_tts_template("现在时间，{TIME}", now.hour(), now.minute());
+                        let preview_text =
+                            format!("{time_phrase}，当前语音音色与播报音量试听正常");
+                        st.tts_preview_status = "正在准备试听语音...".to_string();
+                        if let Some(sw) = sw_weak.upgrade() {
+                            sw.set_tts_preview_status("正在准备试听语音...".into());
+                        }
+                        let gen_id = audio_clone.play_chime(
+                            1,
+                            st.live_volume,
+                            false,
+                            None,
+                            Some(preview_text),
+                            engine,
+                            voice,
+                            rate,
+                        );
+                        preview_gen_tick.set(gen_id);
+                    }
+                    WebAction::TestMeal => {
+                        let st = st_rc.borrow();
+                        let custom_opt = if st.config.meal_custom_audio_path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(st.config.meal_custom_audio_path.clone())
+                        };
+                        let tts_opt = build_meal_tts_text(
+                            st.config.meal_tts_enabled,
+                            &st.config.meal_tts_text,
+                            now,
+                        );
+                        audio_clone.play_meal(
+                            1,
+                            st.live_volume,
+                            custom_opt,
+                            st.config.meal_play_chime_before_custom,
+                            tts_opt,
+                            st.config.tts_engine,
+                            st.config.edge_tts_voice.clone(),
+                            st.config.tts_rate,
+                        );
+                    }
                     WebAction::ToggleMute => {
                         let mut st = st_rc.borrow_mut();
                         let next_muted = !st.config.mute_mode;
@@ -2635,19 +3165,150 @@ fn main() {
                             refresh_main_window_ui(&mw, &st);
                         }
                     }
-                    WebAction::SyncNtp => {
+                    WebAction::SyncNtp { server } => {
                         if let (Some(mw), Some(sw)) = (mw_weak.upgrade(), sw_weak.upgrade()) {
-                            trigger_ntp_sync(&st_rc, &mw, &sw, None);
+                            let target = server.filter(|s| !s.trim().is_empty());
+                            trigger_ntp_sync(&st_rc, &mw, &sw, target);
                         }
+                    }
+                    WebAction::SetVolume(vol) => {
+                        let clamped = vol.min(100);
+                        let mut st = st_rc.borrow_mut();
+                        st.live_volume = clamped;
+                        st.config.volume = clamped;
+                        let _ = st.config_store.save(&st.config);
+                        audio_clone.set_live_volume(clamped);
+                        if let Some(sw) = sw_weak.upgrade() {
+                            sw.set_volume(clamped as i32);
+                        }
+                        wc_tick.borrow().update_config_view(config_to_web_view(&st.config));
+                    }
+                    WebAction::SetTheme(idx) => {
+                        let mut st = st_rc.borrow_mut();
+                        st.config.theme = ThemeMode::from_index(idx);
+                        let norm_idx = st.config.theme.to_index();
+                        let _ = st.config_store.save(&st.config);
+                        if let (Some(mw), Some(sw), Some(aw), Some(uw)) = (
+                            mw_weak.upgrade(),
+                            sw_weak.upgrade(),
+                            aw_weak.upgrade(),
+                            uw_weak.upgrade(),
+                        ) {
+                            sync_theme_across_windows(&mw, &sw, &aw, &uw, norm_idx);
+                            sw.set_theme_index(norm_idx);
+                        }
+                        wc_tick.borrow().update_config_view(config_to_web_view(&st.config));
+                    }
+                    WebAction::TrimMemory(reply_tx) => {
+                        let msg = perf_guard::trim_memory_now(&audio_clone);
+                        let _ = reply_tx.send(Ok(msg));
+                    }
+                    WebAction::RefreshHolidays(reply_tx) => {
+                        let source = st_rc.borrow().config.holiday_data_source_url.clone();
+                        if let Some(sw) = sw_weak.upgrade() {
+                            spawn_holiday_feed_refresh(source, sw.as_weak(), h_tx_tick.clone(), true);
+                        }
+                        let _ = reply_tx.send(Ok("已发起节假日数据源刷新请求".to_string()));
+                    }
+                    WebAction::CheckUpdate => {
+                        if let Some(aw) = aw_weak.upgrade() {
+                            let st = st_rc.borrow();
+                            trigger_manual_update_check(
+                                &u_tx_tick,
+                                &aw,
+                                st.config.update_check_url.clone(),
+                                st.config.update_github_token.clone(),
+                            );
+                        }
+                    }
+                    WebAction::ApplyUpdate => {
+                        if let Some(uw) = uw_weak.upgrade() {
+                            download_and_apply_auto_update(
+                                &update_ctx_tick,
+                                &uw,
+                                &u_tx_tick,
+                                &perf_stop_tick,
+                                &audio_clone,
+                                &guard_tick,
+                            );
+                        }
+                    }
+                    WebAction::OpenLogs => {
+                        let _ = win_sys::open_logs_folder();
+                    }
+                    WebAction::SaveConfig(patch, reply_tx) => {
+                        let res = (|| -> Result<String, String> {
+                            let prev_holiday_url = st_rc.borrow().config.holiday_data_source_url.clone();
+                            let prev_auto_start = st_rc.borrow().config.auto_start;
+                            let candidate = {
+                                let st = st_rc.borrow();
+                                apply_web_config_patch(&st.config, patch)?
+                            };
+                            if candidate.auto_start != prev_auto_start {
+                                win_sys::apply_auto_start(candidate.auto_start)?;
+                            }
+                            {
+                                let mut st = st_rc.borrow_mut();
+                                st.config_store.save(&candidate)?;
+                                st.config = candidate.clone();
+                                st.live_volume = candidate.volume;
+                                st.scheduler.reset_slots();
+                                if let Some(mw) = mw_weak.upgrade() {
+                                    refresh_main_window_ui(&mw, &st);
+                                }
+                                if let Some(sw) = sw_weak.upgrade() {
+                                    populate_settings_form(&sw, &st.config, &st.scheduler);
+                                }
+                            }
+                            if let Ok(mut tok_g) = update_ctx_tick.github_token.lock() {
+                                *tok_g = candidate.update_github_token.clone();
+                            }
+                            let _ = u_tx_tick.send(UpdateWorkerMsg::Reconfigure {
+                                enabled: candidate.update_check_enabled,
+                                url: candidate.update_check_url.clone(),
+                                token: candidate.update_github_token.clone(),
+                                interval_hours: candidate.update_check_interval_hours,
+                            });
+                            if candidate.holiday_data_source_url != prev_holiday_url {
+                                if let Some(sw) = sw_weak.upgrade() {
+                                    spawn_holiday_feed_refresh(
+                                        candidate.holiday_data_source_url.clone(),
+                                        sw.as_weak(),
+                                        h_tx_tick.clone(),
+                                        false,
+                                    );
+                                }
+                            }
+                            tray_for_tick.set_auto_start_checked(candidate.auto_start);
+                            audio_clone.set_live_volume(candidate.volume);
+                            if let (Some(mw), Some(sw), Some(aw), Some(uw)) = (
+                                mw_weak.upgrade(),
+                                sw_weak.upgrade(),
+                                aw_weak.upgrade(),
+                                uw_weak.upgrade(),
+                            ) {
+                                sync_theme_across_windows(
+                                    &mw,
+                                    &sw,
+                                    &aw,
+                                    &uw,
+                                    candidate.theme.to_index(),
+                                );
+                            }
+                            wc_tick.borrow().update_config_view(config_to_web_view(&candidate));
+                            Ok("配置已保存并立即生效".to_string())
+                        })();
+                        let _ = reply_tx.send(res);
                     }
                 }
             }
 
             let mut st = st_rc.borrow_mut();
 
-            // 同步语音试听状态至设置窗口提示行
+            // 同步语音试听状态至设置窗口提示行与本地控制台快照
             while let Ok((gen_id, status_msg)) = tts_status_rx.try_recv() {
                 if gen_id != 0 && gen_id == preview_gen_tick.get() {
+                    st.tts_preview_status = status_msg.clone();
                     if let Some(sw) = sw_weak.upgrade() {
                         sw.set_tts_preview_status(status_msg.into());
                     }
@@ -2656,14 +3317,25 @@ fn main() {
 
             // 接收异步拉取完成的外部节假日列表并刷新历法预览
             while let Ok((res, _manual)) = holiday_rx.try_recv() {
-                if let Ok(entries) = res {
-                    st.scheduler.set_external_holidays(entries);
-                    if let Some(sw) = sw_weak.upgrade() {
-                        sw.set_holiday_today_preview(
-                            st.scheduler
-                                .describe_day_calendar(now.date_naive(), &st.config)
-                                .into(),
-                        );
+                match res {
+                    Ok(entries) => {
+                        let count = entries.len();
+                        st.scheduler.set_external_holidays(entries);
+                        st.holiday_feed_status = if count > 0 {
+                            format!("已同步 {count} 条外部节假日规则")
+                        } else {
+                            "使用内置公历/农历节日表".to_string()
+                        };
+                        if let Some(sw) = sw_weak.upgrade() {
+                            sw.set_holiday_today_preview(
+                                st.scheduler
+                                    .describe_day_calendar(now.date_naive(), &st.config)
+                                    .into(),
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        st.holiday_feed_status = format!("同步失败（仍保留内置农历库）：{err}");
                     }
                 }
             }
@@ -2771,6 +3443,22 @@ fn main() {
                 } else {
                     "未启用静默时段".to_string()
                 };
+                let (fallback_ws_mb, fallback_priv_mb) = perf_guard::query_memory_mb_now();
+                let perf_snap = perf_sample_tick
+                    .lock()
+                    .map(|g| *g)
+                    .unwrap_or_default();
+                let ws_mb = if perf_snap.working_set_bytes > 0 {
+                    perf_guard::format_mb(perf_snap.working_set_bytes)
+                } else {
+                    fallback_ws_mb
+                };
+                let priv_mb = if perf_snap.private_bytes > 0 {
+                    perf_guard::format_mb(perf_snap.private_bytes)
+                } else {
+                    fallback_priv_mb
+                };
+
                 wc_tick.borrow().update_snapshot(WebSnapshot {
                     version: version::display_version(),
                     current_time: now.format("%H:%M:%S").to_string(),
@@ -2783,9 +3471,52 @@ fn main() {
                     next_event_countdown: next.countdown_text,
                     chime_minutes: st.config.format_chime_minutes(),
                     tts_engine: st.config.tts_engine.display_name().to_string(),
+                    tts_engine_index: st.config.tts_engine.to_index(),
                     edge_tts_voice: st.config.edge_tts_voice.clone(),
+                    edge_voice_index: edge_voice_to_index(&st.config.edge_tts_voice),
+                    tts_rate: st.config.tts_rate,
+                    tts_preview_status: st.tts_preview_status.clone(),
                     volume: st.live_volume,
+                    theme_index: st.config.theme.to_index(),
                     ntp_status: st.ntp_status_text.clone(),
+                    is_syncing: st.is_syncing,
+                    memory_ws_mb: ws_mb,
+                    memory_private_mb: priv_mb,
+                    process_cpu_pct: perf_snap.process_cpu_pct,
+                    system_cpu_pct: perf_snap.system_cpu_pct,
+                    uptime_text: format_uptime(app_started_at.elapsed()),
+                    config_path: st.config_store.path.to_string_lossy().to_string(),
+                    log_path: win_sys::current_log_path()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    today_calendar_preview: st
+                        .scheduler
+                        .describe_day_calendar(now.date_naive(), &st.config),
+                    holiday_feed_status: st.holiday_feed_status.clone(),
+                    update_checking: update_ctx_tick.is_checking.load(Ordering::SeqCst),
+                    has_update: update_ctx_tick.has_update.load(Ordering::SeqCst),
+                    update_version: update_ctx_tick
+                        .remote_version
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default(),
+                    update_status_text: update_ctx_tick
+                        .status_text
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default(),
+                    update_notes: update_ctx_tick
+                        .release_notes
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default(),
+                    update_downloading: update_ctx_tick.is_downloading.load(Ordering::SeqCst),
+                    update_progress: update_ctx_tick.download_progress.load(Ordering::SeqCst),
+                    update_download_status: update_ctx_tick
+                        .download_status_text
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default(),
                 });
             }
         });

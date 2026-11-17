@@ -121,6 +121,9 @@ pub struct RemoteVersionManifest {
     pub version: String,
     #[serde(alias = "downloadUrl")]
     pub download_url: String,
+    /// GitHub Releases API 资产接口地址（私有仓库需带 Token 通过此地址下载）
+    #[serde(default, alias = "apiDownloadUrl")]
+    pub api_download_url: String,
     #[serde(default, alias = "releaseNotes")]
     pub notes: String,
     /// 更新包类型："portable"（默认，单文件原地替换并重启）或 "installer"（启动安装程序）
@@ -132,6 +135,8 @@ pub struct RemoteVersionManifest {
 struct GitReleaseAsset {
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    url: String,
     #[serde(default)]
     browser_download_url: String,
 }
@@ -146,6 +151,8 @@ struct GitReleaseResponse {
     body: String,
     #[serde(default)]
     html_url: String,
+    #[serde(default)]
+    draft: bool,
     #[serde(default)]
     assets: Vec<GitReleaseAsset>,
 }
@@ -214,10 +221,21 @@ fn extract_google_drive_file_id(url: &str) -> Option<String> {
     None
 }
 
-fn extract_github_owner_repo(url: &str) -> Option<(String, String)> {
-    let rest = url
+pub fn extract_github_owner_repo(url: &str) -> Option<(String, String)> {
+    let trimmed = url.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix("https://api.github.com/repos/")
+        .or_else(|| trimmed.strip_prefix("http://api.github.com/repos/"))
+    {
+        let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 2 {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+
+    let rest = trimmed
         .strip_prefix("https://github.com/")
-        .or_else(|| url.strip_prefix("http://github.com/"))?;
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))?;
     let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
     if parts.len() < 2 {
         return None;
@@ -230,7 +248,60 @@ fn extract_github_owner_repo(url: &str) -> Option<(String, String)> {
     None
 }
 
-/// 解析更新清单内容：兼容标准 version.json 及 GitHub/Gitee Releases API JSON
+fn convert_git_release(rel: GitReleaseResponse) -> Option<RemoteVersionManifest> {
+    let version = if !rel.tag_name.trim().is_empty() {
+        rel.tag_name.trim().to_string()
+    } else {
+        rel.name.trim().to_string()
+    };
+    if version.is_empty() {
+        return None;
+    }
+
+    let exe_asset = rel
+        .assets
+        .iter()
+        .find(|a| {
+            let n = a.name.to_ascii_lowercase();
+            n.ends_with(".exe") && n.contains("halfhourchime")
+        })
+        .or_else(|| {
+            rel.assets
+                .iter()
+                .find(|a| a.name.to_ascii_lowercase().ends_with(".exe"))
+        })
+        .or_else(|| {
+            rel.assets
+                .iter()
+                .find(|a| a.name.to_ascii_lowercase().ends_with(".msi"))
+        })
+        .or_else(|| rel.assets.first());
+
+    let download_url = exe_asset
+        .map(|a| a.browser_download_url.clone())
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or(rel.html_url);
+
+    let api_download_url = exe_asset
+        .map(|a| a.url.trim().to_string())
+        .unwrap_or_default();
+
+    let package_type = if download_url.to_ascii_lowercase().ends_with(".msi") {
+        "installer".to_string()
+    } else {
+        "portable".to_string()
+    };
+
+    Some(RemoteVersionManifest {
+        version,
+        download_url: normalize_download_url(&download_url),
+        api_download_url,
+        notes: rel.body,
+        package_type,
+    })
+}
+
+/// 解析更新清单内容：兼容标准 version.json 及 GitHub/Gitee Releases API JSON（含列表数组）
 pub fn parse_remote_manifest_body(raw_body: &str) -> Result<RemoteVersionManifest, String> {
     let clean = raw_body.trim_start_matches('\u{feff}').trim();
     if clean.is_empty() {
@@ -247,53 +318,26 @@ pub fn parse_remote_manifest_body(raw_body: &str) -> Result<RemoteVersionManifes
     if let Ok(mut manifest) = serde_json::from_str::<RemoteVersionManifest>(clean) {
         manifest.version = manifest.version.trim().to_string();
         manifest.download_url = normalize_download_url(&manifest.download_url);
+        manifest.api_download_url = manifest.api_download_url.trim().to_string();
         return Ok(manifest);
     }
 
     if let Ok(rel) = serde_json::from_str::<GitReleaseResponse>(clean) {
-        let version = if !rel.tag_name.trim().is_empty() {
-            rel.tag_name.trim().to_string()
-        } else {
-            rel.name.trim().to_string()
-        };
-        if !version.is_empty() {
-            let exe_asset = rel
-                .assets
-                .iter()
-                .find(|a| {
-                    let n = a.name.to_ascii_lowercase();
-                    n.ends_with(".exe") && n.contains("halfhourchime")
-                })
-                .or_else(|| {
-                    rel.assets
-                        .iter()
-                        .find(|a| a.name.to_ascii_lowercase().ends_with(".exe"))
-                })
-                .or_else(|| {
-                    rel.assets
-                        .iter()
-                        .find(|a| a.name.to_ascii_lowercase().ends_with(".msi"))
-                })
-                .or_else(|| rel.assets.first());
-
-            let download_url = exe_asset
-                .map(|a| a.browser_download_url.clone())
-                .filter(|u| !u.trim().is_empty())
-                .unwrap_or(rel.html_url);
-
-            let package_type = if download_url.to_ascii_lowercase().ends_with(".msi") {
-                "installer".to_string()
-            } else {
-                "portable".to_string()
-            };
-
-            return Ok(RemoteVersionManifest {
-                version,
-                download_url: normalize_download_url(&download_url),
-                notes: rel.body,
-                package_type,
-            });
+        if let Some(manifest) = convert_git_release(rel) {
+            return Ok(manifest);
         }
+    }
+
+    if let Ok(list) = serde_json::from_str::<Vec<GitReleaseResponse>>(clean) {
+        if let Some(rel) = list
+            .into_iter()
+            .find(|r| !r.draft && (!r.tag_name.trim().is_empty() || !r.name.trim().is_empty()))
+        {
+            if let Some(manifest) = convert_git_release(rel) {
+                return Ok(manifest);
+            }
+        }
+        return Err("更新源仓库暂无已发布的正式 Release 版本".to_string());
     }
 
     serde_json::from_str::<RemoteVersionManifest>(clean)
@@ -373,6 +417,7 @@ mod tests {
             "assets": [
                 {{
                     "name": "HalfHourChime.exe",
+                    "url": "https://api.github.com/repos/zwai/half-hour-chime/releases/assets/9988",
                     "browser_download_url": "https://github.com/zwai/half-hour-chime/releases/download/{gh_tag}/HalfHourChime.exe"
                 }}
             ]
@@ -381,7 +426,12 @@ mod tests {
         let gh = parse_remote_manifest_body(&github_json).unwrap();
         assert_eq!(gh.version, gh_tag);
         assert!(gh.download_url.ends_with("/HalfHourChime.exe"));
+        assert!(gh.api_download_url.ends_with("/assets/9988"));
         assert!(is_newer_than_current(&gh.version).unwrap());
+
+        let array_json = format!("[{{\"draft\":true,\"tag_name\":\"v9.9.9\"}},{github_json}]");
+        let gh_arr = parse_remote_manifest_body(&array_json).unwrap();
+        assert_eq!(gh_arr.version, gh_tag);
     }
 
     #[test]
@@ -389,6 +439,10 @@ mod tests {
         assert_eq!(
             normalize_update_check_url("https://github.com/foo/bar/releases/latest"),
             "https://api.github.com/repos/foo/bar/releases/latest"
+        );
+        assert_eq!(
+            extract_github_owner_repo("https://api.github.com/repos/cqcmd/-/releases/latest"),
+            Some(("cqcmd".to_string(), "-".to_string()))
         );
         assert_eq!(
             normalize_update_check_url("https://drive.google.com/file/d/XYZ_123/view?usp=sharing"),

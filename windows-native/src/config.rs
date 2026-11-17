@@ -168,8 +168,10 @@ pub struct AppConfig {
     pub update_check_enabled: bool,
     /// 更新清单接口地址（JSON 格式：version, download_url, notes）
     pub update_check_url: String,
-    /// 后台检查间隔（小时，1..=168），默认 6 小时
+    /// 更新检查间隔（小时，1..=168），默认 6 小时
     pub update_check_interval_hours: u16,
+    /// 可选 GitHub 访问令牌（PAT，仅当更新源为私有仓库时需要；公开仓库留空即可）
+    pub update_github_token: String,
 
     /// 是否开启本地 Web 控制台（127.0.0.1:3000），默认 false（按需手动开启）
     pub web_console_enabled: bool,
@@ -212,6 +214,7 @@ impl Default for AppConfig {
             update_check_enabled: true,
             update_check_url: crate::version::DEFAULT_GITHUB_RELEASE_URL.to_string(),
             update_check_interval_hours: 6,
+            update_github_token: String::new(),
             web_console_enabled: false,
         }
     }
@@ -326,6 +329,7 @@ impl AppConfig {
         }
         self.update_check_enabled = true;
         self.update_check_url = update_url;
+        self.update_github_token = self.update_github_token.trim().to_string();
 
         if !(1..=168).contains(&self.update_check_interval_hours) {
             return Err("更新检查周期必须在 1–168 小时之间。".to_string());
