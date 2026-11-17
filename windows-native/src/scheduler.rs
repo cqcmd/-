@@ -206,6 +206,9 @@ pub fn fetch_holiday_feed_from_source(source: &str) -> Result<Vec<ExternalHolida
         let mut builder = ureq::AgentBuilder::new()
             .timeout_connect(std::time::Duration::from_secs(5))
             .timeout_read(std::time::Duration::from_secs(6));
+        if let Ok(connector) = native_tls::TlsConnector::new() {
+            builder = builder.tls_connector(std::sync::Arc::new(connector));
+        }
         if let Some(proxy_url) = win_sys::read_windows_proxy_url() {
             if let Ok(proxy) = ureq::Proxy::new(&proxy_url) {
                 builder = builder.proxy(proxy);

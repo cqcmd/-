@@ -45,10 +45,10 @@ impl ThemeMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TtsEngine {
-    /// Windows 原生 SAPI5 离线引擎（无需联网，内网隔离环境首选）
-    #[default]
+    /// Windows 原生 SAPI5 离线引擎（无需联网，内网隔离环境可选）
     Sapi5,
-    /// Microsoft Edge TTS 在线神经网络语音（网络异常或受限时自动回退至本地 SAPI5）
+    /// Microsoft Edge TTS 在线神经网络语音（默认，网络异常或受限时自动回退至本地 SAPI5）
+    #[default]
     EdgeTts,
 }
 
@@ -170,6 +170,9 @@ pub struct AppConfig {
     pub update_check_url: String,
     /// 后台检查间隔（小时，1..=168），默认 6 小时
     pub update_check_interval_hours: u16,
+
+    /// 是否开启本地 Web 控制台（127.0.0.1:3000），默认 false（按需手动开启）
+    pub web_console_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -199,7 +202,7 @@ impl Default for AppConfig {
             meal_play_chime_before_custom: true,
             meal_tts_enabled: false,
             meal_tts_text: "现在时间，{TIME}，请注意休息用餐".to_string(),
-            tts_engine: TtsEngine::Sapi5,
+            tts_engine: TtsEngine::EdgeTts,
             edge_tts_voice: DEFAULT_EDGE_TTS_VOICE.to_string(),
             tts_rate: 0,
             volume: 80,
@@ -207,8 +210,9 @@ impl Default for AppConfig {
             auto_start: false,
             theme: ThemeMode::WarmLounge,
             update_check_enabled: true,
-            update_check_url: String::new(),
+            update_check_url: crate::version::DEFAULT_GITHUB_RELEASE_URL.to_string(),
             update_check_interval_hours: 6,
+            web_console_enabled: false,
         }
     }
 }
@@ -301,9 +305,11 @@ impl AppConfig {
         }
         self.ntp_server = server;
 
-        let update_url = self.update_check_url.trim().to_string();
-        let is_valid_update_target = update_url.is_empty()
-            || update_url.starts_with("https://")
+        let mut update_url = self.update_check_url.trim().to_string();
+        if update_url.is_empty() {
+            update_url = crate::version::DEFAULT_GITHUB_RELEASE_URL.to_string();
+        }
+        let is_valid_update_target = update_url.starts_with("https://")
             || update_url.starts_with("http://")
             || update_url.starts_with("file://")
             || update_url.starts_with("\\\\")
@@ -318,6 +324,7 @@ impl AppConfig {
                     .to_string(),
             );
         }
+        self.update_check_enabled = true;
         self.update_check_url = update_url;
 
         if !(1..=168).contains(&self.update_check_interval_hours) {

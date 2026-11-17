@@ -35,7 +35,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 20
+          fetch-depth: 0
 
       - name: Install stable Rust toolchain (MSVC)
         uses: dtolnay/rust-toolchain@stable
@@ -122,9 +122,63 @@ jobs:
 
       - name: Build single-file Windows executable (Release)
         working-directory: windows-native
+        env:
+          RUSTFLAGS: "-C link-arg=/OPT:REF -C link-arg=/OPT:ICF"
         run: cargo build --release --target x86_64-pc-windows-msvc
 
-      - name: Stage HalfHourChime.exe, version.json and release notes
+      - name: Compress executable with UPX (preserve icon & version resource)
+        id: pack
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exePath = "windows-native/target/x86_64-pc-windows-msvc/release/HalfHourChime.exe"
+          New-Item -ItemType Directory -Force -Path "windows-native/dist" | Out-Null
+          $distExe = "windows-native/dist/HalfHourChime.exe"
+          Copy-Item $exePath $distExe -Force
+
+          $rawBytes = (Get-Item $distExe).Length
+          $rawMb = [Math]::Round($rawBytes / 1MB, 2)
+          $packedMb = $rawMb
+          $packInfo = "未压缩（$rawMb MB）"
+
+          $upxInstalled = $false
+          if (Get-Command upx -ErrorAction SilentlyContinue) {
+            $upxInstalled = $true
+          } else {
+            try {
+              choco install upx -y --no-progress | Out-Null
+              $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+              if (Get-Command upx -ErrorAction SilentlyContinue) { $upxInstalled = $true }
+            } catch {
+              Write-Host "UPX install via choco skipped: $_"
+            }
+          }
+
+          if ($upxInstalled) {
+            $ErrorActionPreference = "Continue"
+            upx --best --compress-resources=0 $distExe
+            $upxPackExit = $LASTEXITCODE
+            if ($upxPackExit -eq 0) {
+              upx -t $distExe
+              $upxTestExit = $LASTEXITCODE
+            } else {
+              $upxTestExit = 1
+            }
+            $ErrorActionPreference = "Stop"
+
+            if ($upxPackExit -eq 0 -and $upxTestExit -eq 0) {
+              $packedBytes = (Get-Item $distExe).Length
+              $packedMb = [Math]::Round($packedBytes / 1MB, 2)
+              $ratio = [Math]::Round(($packedBytes / $rawBytes) * 100, 1)
+              $packInfo = "已启用 UPX 资源保留压缩：$rawMb MB → $packedMb MB（约 ${ratio}%）"
+            } else {
+              Copy-Item $exePath $distExe -Force
+            }
+          }
+          Write-Host $packInfo
+          "pack_info=$packInfo" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Stage HalfHourChime.exe, version.json and Chinese release notes
         id: meta
         shell: pwsh
         env:
@@ -137,26 +191,64 @@ jobs:
           }
           $tagVer = $ver.Replace("+", "-")
           $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "v$tagVer" }
-          New-Item -ItemType Directory -Force -Path "windows-native/dist" | Out-Null
-          Copy-Item "windows-native/target/x86_64-pc-windows-msvc/release/HalfHourChime.exe" "windows-native/dist/HalfHourChime.exe" -Force
 
           $prevTag = "${{ steps.ver.outputs.prev_tag }}".Trim()
-          $commitLines = @()
-          $ErrorActionPreference = "Continue"
-          if ($prevTag) {
-            $commitLines = @(git log "$prevTag..HEAD" --no-merges --pretty=format:"- %s (%h)" 2>$null)
+          $notesFile = "windows-native/RELEASE_NOTES.md"
+          $useNotesFile = Test-Path $notesFile
+          if ($useNotesFile -and $prevTag) {
+            $ErrorActionPreference = "Continue"
+            $changedNotes = @(git diff --name-only "$prevTag..HEAD" -- $notesFile 2>$null)
+            $ErrorActionPreference = "Stop"
+            if ($changedNotes.Count -eq 0) {
+              $useNotesFile = $false
+            }
           }
-          if ($commitLines.Count -eq 0) {
-            $commitLines = @(git log -n 6 --no-merges --pretty=format:"- %s (%h)" 2>$null)
+
+          $zhBullets = @()
+          if ($useNotesFile) {
+            $zhBullets = @(Get-Content $notesFile -Encoding utf8 | Where-Object { $_.Trim() -match '^-\s+.+' } | ForEach-Object { $_.Trim() })
           }
-          $ErrorActionPreference = "Stop"
-          $changelogMd = if ($commitLines.Count -gt 0) { $commitLines -join "`n" } else { "- 自动构建与常规维护更新" }
+
+          if ($zhBullets.Count -eq 0) {
+            $rawCommits = @()
+            $ErrorActionPreference = "Continue"
+            if ($prevTag) {
+              $rawCommits = @(git log "$prevTag..HEAD" --no-merges --pretty=format:"%h|%s" 2>$null)
+            }
+            if ($rawCommits.Count -eq 0) {
+              $rawCommits = @(git log -n 6 --no-merges --pretty=format:"%h|%s" 2>$null)
+            }
+            $ErrorActionPreference = "Stop"
+
+            foreach ($entry in $rawCommits) {
+              $parts = "$entry" -split '\|', 2
+              if ($parts.Count -lt 2) { continue }
+              $hash = $parts[0].Trim()
+              $subj = $parts[1].Trim()
+              if ($subj -match '[\u4e00-\u9fff]') {
+                $zhBullets += "- $subj ($hash)"
+              } else {
+                $zhType = switch -Regex ($subj) {
+                  '^feat'     { "功能增强与体验优化" }
+                  '^fix'      { "问题修复与稳定性提升" }
+                  '^refactor' { "架构与底层代码重构" }
+                  '^build'    { "编译体积与依赖配置优化" }
+                  '^ci'       { "自动构建与发布流程改进" }
+                  '^docs'     { "文档与版本说明更新" }
+                  default     { "常规功能维护与性能调优" }
+                }
+                $zhBullets += "- $zhType ($hash)"
+              }
+            }
+          }
+
+          $changelogMd = if ($zhBullets.Count -gt 0) { $zhBullets -join "`n" } else { "- 自动构建与常规稳定性维护更新" }
 
           $inputNotes = "$env:INPUT_RELEASE_NOTES".Trim()
           $manifestNotes = if (-not [string]::IsNullOrWhiteSpace($inputNotes) -and $inputNotes -ne "通过 GitHub Actions 自动编译并发布的 Windows 单文件版本。") {
             $inputNotes
-          } elseif ($commitLines.Count -gt 0) {
-            ($commitLines | Select-Object -First 4) -join "；"
+          } elseif ($zhBullets.Count -gt 0) {
+            ($zhBullets | Select-Object -First 4 | ForEach-Object { $_.TrimStart('-').Trim() }) -join "；"
           } else {
             "通过 GitHub Actions 自动编译发布的单文件版本 ($ver)。"
           }
@@ -171,6 +263,7 @@ jobs:
           $manifestPath = Join-Path $PWD "windows-native/dist/version.json"
           [System.IO.File]::WriteAllText($manifestPath, $manifest, (New-Object System.Text.UTF8Encoding($false)))
 
+          $packInfo = "${{ steps.pack.outputs.pack_info }}"
           $releaseLines = @(
             "## 半整点提醒 Windows 原生单文件版 (``v$ver``)",
             "",
@@ -180,8 +273,9 @@ jobs:
             "### 构建与交付说明",
             "- **版本号规则**：三段式 + 日期（每段满 10 进位），本次版本 ``$ver``（PE 文件版本同步更新）",
             "- **编译平台**：Windows x86_64（MSVC 静态链接，零外部运行库依赖）",
+            "- **体积优化**：$packInfo",
             "- **交付文件**：``HalfHourChime.exe``（双击即用）与 ``version.json``",
-            "- **自动更新接口地址**：``https://github.com/$env:GITHUB_REPOSITORY/releases/latest``"
+            "- **自动更新接口**：``https://github.com/$env:GITHUB_REPOSITORY/releases/latest``"
           )
           $releaseBody = $releaseLines -join "`n"
           $notesPath = Join-Path $PWD "windows-native/dist/release_notes.md"

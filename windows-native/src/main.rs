@@ -5,6 +5,7 @@ mod config;
 mod ntp;
 mod scheduler;
 mod version;
+mod web_console;
 mod win_sys;
 
 use audio::AudioEngine;
@@ -28,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tray_icon::menu::MenuEvent;
 use tray_icon::{MouseButton, TrayIconEvent};
+use web_console::{WebAction, WebConsoleController, WebSnapshot, DEFAULT_WEB_CONSOLE_PORT, DEFAULT_WEB_CONSOLE_URL};
 use win_sys::TrayController;
 
 slint::include_modules!();
@@ -601,6 +603,10 @@ fn build_ureq_agent(connect_secs: u64, read_secs: u64) -> ureq::Agent {
         .timeout_connect(Duration::from_secs(connect_secs))
         .timeout_read(Duration::from_secs(read_secs));
 
+    if let Ok(connector) = native_tls::TlsConnector::new() {
+        builder = builder.tls_connector(Arc::new(connector));
+    }
+
     let proxy_opt = std::env::var("HTTPS_PROXY")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -685,7 +691,6 @@ fn start_update_check_worker(
     initial_url: String,
     initial_interval_hours: u16,
     main_w: &MainWindow,
-    settings_w: &SettingsWindow,
     about_w: &AboutWindow,
     update_w: &UpdateWindow,
     ctx: UpdateContext,
@@ -693,7 +698,6 @@ fn start_update_check_worker(
 ) -> Sender<UpdateWorkerMsg> {
     let (tx, rx) = mpsc::channel::<UpdateWorkerMsg>();
     let mw_weak = main_w.as_weak();
-    let sw_weak = settings_w.as_weak();
     let aw_weak = about_w.as_weak();
     let uw_weak = update_w.as_weak();
 
@@ -704,15 +708,11 @@ fn start_update_check_worker(
         });
 
         let mw_w = mw_weak.clone();
-        let sw_w = sw_weak.clone();
         let aw_w = aw_weak.clone();
         let uw_w = uw_weak.clone();
         let ctx_clone = ctx.clone();
 
         let _ = slint::invoke_from_event_loop(move || {
-            if let Some(sw) = sw_w.upgrade() {
-                sw.set_is_checking_update(false);
-            }
             if let Some(aw) = aw_w.upgrade() {
                 aw.set_is_checking_update(false);
             }
@@ -747,9 +747,6 @@ fn start_update_check_worker(
                     }
                     let found_msg =
                         format!("发现新版本 {display_remote}，可点击“自动更新”一键升级");
-                    if let Some(sw) = sw_w.upgrade() {
-                        sw.set_update_status_text(found_msg.clone().into());
-                    }
                     if let Some(aw) = aw_w.upgrade() {
                         aw.set_has_update(true);
                         aw.set_update_status_text(found_msg.into());
@@ -792,9 +789,6 @@ fn start_update_check_worker(
                     if manual {
                         let up_to_date_msg =
                             format!("当前已是最新版本（{}）", version::display_version());
-                        if let Some(sw) = sw_w.upgrade() {
-                            sw.set_update_status_text(up_to_date_msg.clone().into());
-                        }
                         if let Some(aw) = aw_w.upgrade() {
                             aw.set_has_update(false);
                             aw.set_update_status_text(up_to_date_msg.into());
@@ -805,9 +799,6 @@ fn start_update_check_worker(
                     win_sys::log_warn("update", &format!("version check error (manual={manual}): {err}"));
                     // 后台自动巡检遇到离线或内网未连通时保持静默，不打扰门店值守；仅在手动检查时展示具体状态
                     if manual {
-                        if let Some(sw) = sw_w.upgrade() {
-                            sw.set_update_status_text(err.clone().into());
-                        }
                         if let Some(aw) = aw_w.upgrade() {
                             aw.set_update_status_text(err.into());
                         }
@@ -1135,16 +1126,23 @@ fn populate_settings_form(
     settings_w.set_tts_engine_index(cfg.tts_engine.to_index());
     settings_w.set_edge_voice_index(edge_voice_to_index(&cfg.edge_tts_voice));
     settings_w.set_tts_rate(cfg.tts_rate as i32);
+    settings_w.set_tts_preview_status("".into());
 
     settings_w.set_volume(cfg.volume as i32);
     settings_w.set_ntp_server(cfg.ntp_server.clone().into());
     settings_w.set_auto_start(cfg.auto_start);
     settings_w.set_theme_index(cfg.theme.to_index());
-    settings_w.set_update_check_enabled(cfg.update_check_enabled);
-    settings_w.set_update_check_url(cfg.update_check_url.clone().into());
-    settings_w.set_update_check_interval_hours(cfg.update_check_interval_hours as i32);
+    settings_w.set_web_console_enabled(cfg.web_console_enabled);
+    settings_w.set_web_console_url(DEFAULT_WEB_CONSOLE_URL.into());
+    settings_w.set_web_console_status(
+        if cfg.web_console_enabled {
+            format!("已启用：点击右侧“打开网页”或访问 {DEFAULT_WEB_CONSOLE_URL}")
+        } else {
+            "未启用（本地 3000 端口处于关闭状态）".to_string()
+        }
+        .into(),
+    );
     settings_w.set_validation_error("".into());
-    settings_w.set_update_status_text("".into());
 }
 
 fn refresh_main_window_ui(main_w: &MainWindow, state: &AppState) {
@@ -1270,15 +1268,20 @@ fn trigger_ntp_sync(
 
 fn trigger_manual_update_check(
     update_tx: &Sender<UpdateWorkerMsg>,
-    settings_w: &SettingsWindow,
     about_w: &AboutWindow,
     url: String,
 ) {
-    settings_w.set_is_checking_update(true);
-    settings_w.set_update_status_text("正在检查服务端版本...".into());
+    let target = if url.trim().is_empty() {
+        version::DEFAULT_GITHUB_RELEASE_URL.to_string()
+    } else {
+        url
+    };
     about_w.set_is_checking_update(true);
     about_w.set_update_status_text("正在检查服务端版本...".into());
-    let _ = update_tx.send(UpdateWorkerMsg::CheckNow { url, manual: true });
+    let _ = update_tx.send(UpdateWorkerMsg::CheckNow {
+        url: target,
+        manual: true,
+    });
 }
 
 fn open_downloaded_update(ctx: &UpdateContext, about_w: &AboutWindow) {
@@ -1590,8 +1593,10 @@ fn main() {
         let _ = win_sys::apply_auto_start(cfg.auto_start);
     }
 
-    // 4. 启动音频播放引擎（内嵌 WAV 资源）
+    // 4. 启动音频播放引擎（内嵌 WAV 资源）并接入实时语音试听状态通道
     let audio = AudioEngine::start();
+    let (tts_status_tx, tts_status_rx) = mpsc::channel::<(u64, String)>();
+    audio.attach_tts_status_sender(tts_status_tx);
 
     // 5. 构建 Slint 原生多窗口组件（默认隐藏，仅托盘可见）
     let main_win = MainWindow::new().expect("Failed to create MainWindow");
@@ -1617,7 +1622,11 @@ fn main() {
     let initial_mute_mode = cfg.mute_mode;
     let initial_holiday_url = cfg.holiday_data_source_url.clone();
     let initial_update_enabled = cfg.update_check_enabled;
-    let initial_update_url = cfg.update_check_url.clone();
+    let initial_update_url = if cfg.update_check_url.trim().is_empty() {
+        version::DEFAULT_GITHUB_RELEASE_URL.to_string()
+    } else {
+        cfg.update_check_url.clone()
+    };
     let initial_update_interval = cfg.update_check_interval_hours;
 
     let state = Rc::new(RefCell::new(AppState {
@@ -1655,12 +1664,20 @@ fn main() {
         initial_update_url,
         initial_update_interval,
         &main_win,
-        &settings_win,
         &about_win,
         &update_win,
         update_ctx.clone(),
         Arc::clone(&cpu_throttled),
     );
+
+    // 5.6 初始化可选本地 Web 控制台（端口 3000，默认关闭，仅当用户启用时监听 127.0.0.1:3000）
+    let (web_action_tx, web_action_rx) = mpsc::channel::<WebAction>();
+    let web_console = Rc::new(RefCell::new(WebConsoleController::new(web_action_tx)));
+    if state.borrow().config.web_console_enabled {
+        if let Err(err) = web_console.borrow_mut().start(DEFAULT_WEB_CONSOLE_PORT) {
+            win_sys::log_warn("web", &format!("failed to auto-start web console: {err}"));
+        }
+    }
 
     // 6. 初始化系统托盘图标与右键上下文菜单（FR-14 / FR-15 / 运维快捷菜单）
     let tray = Arc::new(
@@ -1957,6 +1974,7 @@ fn main() {
                 let tts_rate = sw.get_tts_rate().clamp(-5, 5) as i8;
                 let time_phrase = render_tts_template("现在时间，{TIME}", now.hour(), now.minute());
                 let preview_text = format!("{time_phrase}，当前语音音色与播报音量试听正常");
+                sw.set_tts_preview_status("正在准备试听语音...".into());
                 let gen_id = audio_clone.play_chime(
                     1,
                     vol,
@@ -1976,12 +1994,12 @@ fn main() {
         let sw_weak = settings_win.as_weak();
         let audio_clone = audio.clone();
         let preview_gen_rc = Rc::clone(&last_voice_preview_gen);
-        settings_win.on_voice_option_switched(move || {
+        settings_win.on_voice_option_switched(move |auto_preview| {
             let was_voice_previewing = audio_clone.is_playing_gen(preview_gen_rc.get());
             audio_clone.stop_active();
             preview_gen_rc.set(0);
 
-            if was_voice_previewing {
+            if auto_preview || was_voice_previewing {
                 let vol = st_rc.borrow().live_volume;
                 if let Some(sw) = sw_weak.upgrade() {
                     let now = Local::now();
@@ -1991,6 +2009,7 @@ fn main() {
                     let time_phrase =
                         render_tts_template("现在时间，{TIME}", now.hour(), now.minute());
                     let preview_text = format!("{time_phrase}，当前语音音色与播报音量试听正常");
+                    sw.set_tts_preview_status("正在切换并试听新音色...".into());
                     let gen_id = audio_clone.play_chime(
                         1,
                         vol,
@@ -2003,6 +2022,8 @@ fn main() {
                     );
                     preview_gen_rc.set(gen_id);
                 }
+            } else if let Some(sw) = sw_weak.upgrade() {
+                sw.set_tts_preview_status("".into());
             }
         });
     }
@@ -2154,17 +2175,6 @@ fn main() {
         });
     }
     {
-        let sw_weak = settings_win.as_weak();
-        let aw_weak = about_win.as_weak();
-        let u_tx = update_tx.clone();
-        settings_win.on_check_update_now(move || {
-            if let (Some(sw), Some(aw)) = (sw_weak.upgrade(), aw_weak.upgrade()) {
-                let url = sw.get_update_check_url().to_string();
-                trigger_manual_update_check(&u_tx, &sw, &aw, url);
-            }
-        });
-    }
-    {
         let mw_weak = main_win.as_weak();
         let sw_weak = settings_win.as_weak();
         let aw_weak = about_win.as_weak();
@@ -2181,17 +2191,59 @@ fn main() {
         });
     }
     {
+        let sw_weak = settings_win.as_weak();
+        let wc_rc = Rc::clone(&web_console);
+        settings_win.on_web_console_toggled(move |enabled| {
+            if let Some(sw) = sw_weak.upgrade() {
+                if enabled {
+                    match wc_rc.borrow_mut().start(DEFAULT_WEB_CONSOLE_PORT) {
+                        Ok(url) => {
+                            sw.set_web_console_url(url.clone().into());
+                            sw.set_web_console_status(
+                                format!("已开启本地服务：可点击右侧“打开网页”访问 {url}").into(),
+                            );
+                        }
+                        Err(err) => {
+                            sw.set_web_console_enabled(false);
+                            sw.set_web_console_status(err.into());
+                        }
+                    }
+                } else {
+                    wc_rc.borrow_mut().stop();
+                    sw.set_web_console_status("已关闭：本地 3000 端口已停止监听".into());
+                }
+            }
+        });
+    }
+    {
+        let sw_weak = settings_win.as_weak();
+        settings_win.on_open_web_console(move || {
+            if let Some(sw) = sw_weak.upgrade() {
+                let url = sw.get_web_console_url().to_string();
+                if let Err(err) = win_sys::open_url_in_browser(&url) {
+                    sw.set_web_console_status(err.into());
+                }
+            }
+        });
+    }
+    {
         let st_rc = Rc::clone(&state);
         let sw_weak = settings_win.as_weak();
         let mw_weak = main_win.as_weak();
         let aw_weak = about_win.as_weak();
         let uw_weak = update_win.as_weak();
         let audio_clone = audio.clone();
+        let wc_rc = Rc::clone(&web_console);
         settings_win.on_cancel_clicked(move || {
             audio_clone.stop_active();
             let mut st = st_rc.borrow_mut();
             st.live_volume = st.config.volume;
             audio_clone.set_live_volume(st.config.volume);
+            if st.config.web_console_enabled {
+                let _ = wc_rc.borrow_mut().start(DEFAULT_WEB_CONSOLE_PORT);
+            } else {
+                wc_rc.borrow_mut().stop();
+            }
             if let (Some(mw), Some(sw), Some(aw), Some(uw)) = (
                 mw_weak.upgrade(),
                 sw_weak.upgrade(),
@@ -2213,6 +2265,7 @@ fn main() {
         let audio_clone = audio.clone();
         let u_tx = update_tx.clone();
         let h_tx = holiday_tx.clone();
+        let wc_rc = Rc::clone(&web_console);
         settings_win.on_save_clicked(move || {
             let (Some(sw), Some(mw), Some(aw), Some(uw)) = (
                 sw_weak.upgrade(),
@@ -2232,11 +2285,23 @@ fn main() {
                 }
             };
 
-            let (preserved_mute_mode, prev_holiday_url) = {
+            let (
+                preserved_mute_mode,
+                prev_holiday_url,
+                preserved_update_url,
+                preserved_update_interval,
+            ) = {
                 let st = st_rc.borrow();
+                let u_url = if st.config.update_check_url.trim().is_empty() {
+                    version::DEFAULT_GITHUB_RELEASE_URL.to_string()
+                } else {
+                    st.config.update_check_url.clone()
+                };
                 (
                     st.config.mute_mode,
                     st.config.holiday_data_source_url.clone(),
+                    u_url,
+                    st.config.update_check_interval_hours.clamp(1, 168),
                 )
             };
             let mut candidate = AppConfig {
@@ -2271,16 +2336,24 @@ fn main() {
                 ntp_server: sw.get_ntp_server().to_string(),
                 auto_start: sw.get_auto_start(),
                 theme: ThemeMode::from_index(sw.get_theme_index()),
-                update_check_enabled: sw.get_update_check_enabled(),
-                update_check_url: sw.get_update_check_url().to_string(),
-                update_check_interval_hours: sw
-                    .get_update_check_interval_hours()
-                    .clamp(1, 168) as u16,
+                update_check_enabled: true,
+                update_check_url: preserved_update_url,
+                update_check_interval_hours: preserved_update_interval,
+                web_console_enabled: sw.get_web_console_enabled(),
             };
 
             if let Err(err) = candidate.validate() {
                 sw.set_validation_error(err.into());
                 return;
+            }
+
+            if candidate.web_console_enabled {
+                if let Err(err) = wc_rc.borrow_mut().start(DEFAULT_WEB_CONSOLE_PORT) {
+                    sw.set_validation_error(err.into());
+                    return;
+                }
+            } else {
+                wc_rc.borrow_mut().stop();
             }
 
             if let Err(err) = win_sys::apply_auto_start(candidate.auto_start) {
@@ -2334,13 +2407,12 @@ fn main() {
     }
     {
         let st_rc = Rc::clone(&state);
-        let sw_weak = settings_win.as_weak();
         let aw_weak = about_win.as_weak();
         let u_tx = update_tx.clone();
         about_win.on_check_update_now(move || {
-            if let (Some(sw), Some(aw)) = (sw_weak.upgrade(), aw_weak.upgrade()) {
+            if let Some(aw) = aw_weak.upgrade() {
                 let url = st_rc.borrow().config.update_check_url.clone();
-                trigger_manual_update_check(&u_tx, &sw, &aw, url);
+                trigger_manual_update_check(&u_tx, &aw, url);
             }
         });
     }
@@ -2498,9 +2570,9 @@ fn main() {
                 } else if id == tray_clone.ids.open_logs_folder {
                     let _ = win_sys::open_logs_folder();
                 } else if id == tray_clone.ids.check_update {
-                    if let (Some(sw), Some(aw)) = (sw_weak.upgrade(), aw_weak.upgrade()) {
+                    if let Some(aw) = aw_weak.upgrade() {
                         let url = st_rc_main_thread.borrow().config.update_check_url.clone();
-                        trigger_manual_update_check(&u_tx, &sw, &aw, url);
+                        trigger_manual_update_check(&u_tx, &aw, url);
                         center_and_show_window(&aw, 452.0, 372.0);
                     }
                 } else if id == tray_clone.ids.about {
@@ -2525,10 +2597,62 @@ fn main() {
         let mw_weak = main_win.as_weak();
         let sw_weak = settings_win.as_weak();
         let audio_clone = audio.clone();
+        let tray_for_tick = Arc::clone(&tray);
         let ipc_wake_for_tick = Arc::clone(&ipc_wake_pending);
+        let preview_gen_tick = Rc::clone(&last_voice_preview_gen);
+        let wc_tick = Rc::clone(&web_console);
         tick_timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
             let now = Local::now();
+
+            // 处理本地 Web 控制台触发的控制指令
+            while let Ok(action) = web_action_rx.try_recv() {
+                match action {
+                    WebAction::TestChime => {
+                        let st = st_rc.borrow();
+                        let (holiday_audio_opt, tts_opt, _) =
+                            resolve_chime_playback_params(&st.config, &st.scheduler, now);
+                        audio_clone.play_chime(
+                            1,
+                            st.live_volume,
+                            st.config.chime_play_sound,
+                            holiday_audio_opt,
+                            tts_opt,
+                            st.config.tts_engine,
+                            st.config.edge_tts_voice.clone(),
+                            st.config.tts_rate,
+                        );
+                    }
+                    WebAction::ToggleMute => {
+                        let mut st = st_rc.borrow_mut();
+                        let next_muted = !st.config.mute_mode;
+                        st.config.mute_mode = next_muted;
+                        let _ = st.config_store.save(&st.config);
+                        tray_for_tick.set_mute_mode_checked(next_muted);
+                        if next_muted {
+                            audio_clone.stop_active();
+                        }
+                        if let Some(mw) = mw_weak.upgrade() {
+                            refresh_main_window_ui(&mw, &st);
+                        }
+                    }
+                    WebAction::SyncNtp => {
+                        if let (Some(mw), Some(sw)) = (mw_weak.upgrade(), sw_weak.upgrade()) {
+                            trigger_ntp_sync(&st_rc, &mw, &sw, None);
+                        }
+                    }
+                }
+            }
+
             let mut st = st_rc.borrow_mut();
+
+            // 同步语音试听状态至设置窗口提示行
+            while let Ok((gen_id, status_msg)) = tts_status_rx.try_recv() {
+                if gen_id != 0 && gen_id == preview_gen_tick.get() {
+                    if let Some(sw) = sw_weak.upgrade() {
+                        sw.set_tts_preview_status(status_msg.into());
+                    }
+                }
+            }
 
             // 接收异步拉取完成的外部节假日列表并刷新历法预览
             while let Ok((res, _manual)) = holiday_rx.try_recv() {
@@ -2628,6 +2752,42 @@ fn main() {
                     refresh_main_window_ui(&mw, &st);
                 }
             }
+
+            if wc_tick.borrow().is_running() {
+                let next = Scheduler::compute_next_event(&st.config, now);
+                let is_quiet_now = Scheduler::is_quiet_at(
+                    &st.config,
+                    chrono::Timelike::hour(&now),
+                    chrono::Timelike::minute(&now),
+                );
+                let quiet_summary = if st.config.quiet_enabled {
+                    format!(
+                        "{:02}:{:02}-{:02}:{:02}",
+                        st.config.quiet_start_hour,
+                        st.config.quiet_start_minute,
+                        st.config.quiet_end_hour,
+                        st.config.quiet_end_minute
+                    )
+                } else {
+                    "未启用静默时段".to_string()
+                };
+                wc_tick.borrow().update_snapshot(WebSnapshot {
+                    version: version::display_version(),
+                    current_time: now.format("%H:%M:%S").to_string(),
+                    current_date: format!("{} · {}", now.format("%Y-%m-%d"), weekday_zh(now.weekday())),
+                    mute_mode: st.config.mute_mode,
+                    is_quiet_now,
+                    quiet_summary,
+                    next_event_title: next.title,
+                    next_event_time: next.target_time_text,
+                    next_event_countdown: next.countdown_text,
+                    chime_minutes: st.config.format_chime_minutes(),
+                    tts_engine: st.config.tts_engine.display_name().to_string(),
+                    edge_tts_voice: st.config.edge_tts_voice.clone(),
+                    volume: st.live_volume,
+                    ntp_status: st.ntp_status_text.clone(),
+                });
+            }
         });
     }
 
@@ -2639,6 +2799,7 @@ fn main() {
     // 14. 进入事件主循环（仅通过托盘菜单“退出”调用 quit_event_loop 时结束）
     let _ = slint::run_event_loop_until_quit();
     win_sys::log_info("lifecycle", "application shutting down cleanly");
+    web_console.borrow_mut().stop();
     let _ = perf_stop_tx.send(());
     let _ = update_tx.send(UpdateWorkerMsg::Shutdown);
     audio.shutdown();

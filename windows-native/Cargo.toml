@@ -29,11 +29,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# 轻量级同步 HTTP/HTTPS 客户端（无 async 运行时，用于后台检查版本更新）
-ureq = { version = "2.10", default-features = false, features = ["tls"] }
+# 轻量级同步 HTTP/HTTPS 客户端（使用 Windows 原生 Schannel TLS，无需内置 rustls/webpki-roots）
+ureq = { version = "2.10", default-features = false, features = ["native-tls"] }
+native-tls = "0.2"
 
 # 轻量级同步 WebSocket 与 SHA-256（用于 Microsoft Edge TTS 在线神经网络语音接口）
-tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "native-tls"] }
 sha2 = "0.10"
 
 # Windows 原生 API（互斥体单实例、IPC 唤出、注册表自启、SetSystemTime、UAC 提权、DWM 圆角、SAPI 语音合成、PDH 性能计数器与内存回收）
@@ -65,7 +66,7 @@ winresource = "0.1"
 
 [profile.release]
 opt-level = "z"
-lto = true
+lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = "symbols"

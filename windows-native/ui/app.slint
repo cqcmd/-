@@ -730,22 +730,21 @@ export component SettingsWindow inherits Window {
     in-out property <bool> meal-play-chime-before-custom: true;
     in-out property <bool> meal-tts-enabled: false;
     in-out property <string> meal-tts-text: "现在时间，{TIME}，请注意休息用餐";
-    in-out property <int> tts-engine-index: 0;
+    in-out property <int> tts-engine-index: 1;
     in-out property <int> edge-voice-index: 0;
     in-out property <int> tts-rate: 0;
+    in-out property <string> tts-preview-status: "";
 
     in-out property <int> volume: 80;
     in-out property <string> ntp-server: "ntp.aliyun.com";
     in-out property <bool> auto-start: false;
     in-out property <int> theme-index: 2;
-    in-out property <bool> update-check-enabled: true;
-    in-out property <string> update-check-url: "";
-    in-out property <int> update-check-interval-hours: 6;
+    in-out property <bool> web-console-enabled: false;
+    in property <string> web-console-url: "http://127.0.0.1:3000";
+    in property <string> web-console-status: "未启用（本地 3000 端口处于关闭状态）";
 
     in-out property <string> validation-error: "";
     in property <bool> is-syncing: false;
-    in property <bool> is-checking-update: false;
-    in property <string> update-status-text: "";
 
     callback drag-window(length, length);
     callback minimize-window();
@@ -753,14 +752,15 @@ export component SettingsWindow inherits Window {
     callback preview-volume-changed(int);
     callback test-chime();
     callback test-voice-preview(bool);
-    callback voice-option-switched();
+    callback voice-option-switched(bool);
     callback test-holiday-chime();
     callback browse-holiday-audio();
     callback refresh-holiday-feed();
     callback test-meal-chime();
     callback browse-meal-audio();
     callback sync-ntp();
-    callback check-update-now();
+    callback web-console-toggled(bool);
+    callback open-web-console();
     callback select-theme(int);
     callback save-clicked();
     callback cancel-clicked();
@@ -1392,7 +1392,7 @@ export component SettingsWindow inherits Window {
                                     mouse-cursor: pointer;
                                     clicked => {
                                         root.tts-engine-index = idx;
-                                        root.voice-option-switched();
+                                        root.voice-option-switched(false);
                                     }
                                 }
                             }
@@ -1429,13 +1429,13 @@ export component SettingsWindow inherits Window {
                                         mouse-cursor: pointer;
                                         clicked => {
                                             root.edge-voice-index = idx;
-                                            root.voice-option-switched();
+                                            root.voice-option-switched(true);
                                         }
                                     }
                                 }
                             }
                             Text {
-                                text: "通过 Microsoft Edge TTS 网络接口合成自然人声；若网络受限或离线超时，将自动回退至本地 SAPI5 播报。";
+                                text: "点击上方任意音色即可立即切换并试听；若网络受限或离线超时，将自动回退至本地 SAPI5 播报。";
                                 color: ThemeStore.palette.text-muted;
                                 font-size: 12px;
                                 wrap: word-wrap;
@@ -1469,6 +1469,13 @@ export component SettingsWindow inherits Window {
                                 label: "试听音色";
                                 clicked => { root.test-voice-preview(false); }
                             }
+                        }
+
+                        if root.tts-preview-status != "" : Text {
+                            text: root.tts-preview-status;
+                            color: ThemeStore.palette.accent;
+                            font-size: 12px;
+                            wrap: word-wrap;
                         }
 
                         HorizontalLayout {
@@ -1525,7 +1532,7 @@ export component SettingsWindow inherits Window {
                     }
                 }
 
-                // 分组 7：后台版本检查与更新
+                // 分组 7：可选本地 Web 控制台（端口 3000，默认关闭）
                 Rectangle {
                     border-radius: 8px;
                     border-width: 1px;
@@ -1537,68 +1544,59 @@ export component SettingsWindow inherits Window {
                         spacing: 10px;
 
                         HorizontalLayout {
-                            Text {
+                            VerticalLayout {
                                 horizontal-stretch: 1;
-                                text: "后台定期检查版本更新";
-                                color: ThemeStore.palette.text-primary;
-                                font-size: 13px;
-                                font-weight: 700;
-                                vertical-alignment: center;
+                                spacing: 2px;
+                                Text {
+                                    text: "本地 Web 控制台（3000 端口）";
+                                    color: ThemeStore.palette.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                }
+                                Text {
+                                    text: "默认关闭；开启后仅在本机开放 http://127.0.0.1:3000 网页控制台";
+                                    color: ThemeStore.palette.text-muted;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
                             }
                             SwitchToggle {
-                                checked <=> root.update-check-enabled;
+                                checked <=> root.web-console-enabled;
+                                toggled(next) => { root.web-console-toggled(next); }
                             }
                         }
 
-                        HorizontalLayout {
+                        if root.web-console-enabled : HorizontalLayout {
                             spacing: 10px;
-                            Text {
-                                width: 70px;
-                                text: "清单地址";
-                                color: ThemeStore.palette.text-secondary;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                            }
-                            StyledInput {
+                            Rectangle {
                                 horizontal-stretch: 1;
-                                text <=> root.update-check-url;
-                                placeholder: "支持 version.json / GitHub Releases / Google Drive / \\\\局域网路径";
-                            }
-                        }
-
-                        HorizontalLayout {
-                            spacing: 10px;
-                            Text {
-                                width: 70px;
-                                text: "检查间隔";
-                                color: ThemeStore.palette.text-secondary;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                            }
-                            NumberStepper {
-                                value <=> root.update-check-interval-hours;
-                                min: 1;
-                                max: 168;
-                                pad-two: false;
-                                enabled: root.update-check-enabled;
-                            }
-                            Text {
-                                horizontal-stretch: 1;
-                                text: "小时（1–168）";
-                                color: ThemeStore.palette.text-muted;
-                                font-size: 12px;
-                                vertical-alignment: center;
+                                height: 32px;
+                                border-radius: 6px;
+                                border-width: 1px;
+                                border-color: ThemeStore.palette.border-hairline;
+                                background: ThemeStore.palette.input-bg;
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    Text {
+                                        text: root.web-console-url;
+                                        color: ThemeStore.palette.accent;
+                                        font-family: "Consolas";
+                                        font-size: 13px;
+                                        font-weight: 700;
+                                        vertical-alignment: center;
+                                    }
+                                }
                             }
                             SecondaryButton {
                                 width: 88px;
-                                enabled: !root.is-checking-update;
-                                label: root.is-checking-update ? "检查中" : "立即检查";
-                                clicked => { root.check-update-now(); }
+                                label: "打开网页";
+                                clicked => { root.open-web-console(); }
                             }
                         }
 
-                        if root.update-status-text != "" : Text {
-                            text: root.update-status-text;
+                        if root.web-console-status != "" : Text {
+                            text: root.web-console-status;
                             color: ThemeStore.palette.text-muted;
                             font-size: 12px;
                             wrap: word-wrap;
@@ -1664,7 +1662,7 @@ export component AboutWindow inherits Window {
     in property <string> app-version: "v2.0.0+20261114";
     in property <string> app-vendor: "Z.W.&AI";
     in property <string> config-path: "config.json";
-    in property <string> update-status-text: "后台自动检查更新已就绪";
+    in property <string> update-status-text: "已启用 GitHub Releases 自动更新检查";
     in property <bool> is-checking-update: false;
     in property <bool> has-update: false;
 

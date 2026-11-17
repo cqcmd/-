@@ -7,6 +7,10 @@ pub const APP_PKG_VERSION: &str = match option_env!("APP_BUILD_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
+pub const DEFAULT_GITHUB_RELEASE_URL: &str = match option_env!("DEFAULT_UPDATE_CHECK_URL") {
+    Some(v) => v,
+    None => "https://github.com/cqcmd/-/releases/latest",
+};
 
 /// 三段式 + 日期版本号模型（本地构建每段 0–9 满 10 进位；远端对比兼容无日期或更大数字段）
 #[derive(Debug, Clone, PartialEq, Eq)]

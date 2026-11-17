@@ -153,6 +153,7 @@ pub struct AudioEngine {
     active_seq_gen: Arc<AtomicU64>,
     live_volume: Arc<AtomicU8>,
     tts_cache: Arc<Mutex<EdgeTtsCache>>,
+    tts_status_tx: Arc<Mutex<Option<Sender<(u64, String)>>>>,
 }
 
 /// 平滑余弦 S 型曲线：t=0 时为 0.0，t=1 时为 1.0，两端一阶导数为 0，消除淡入/淡出切换爆音
@@ -1057,9 +1058,13 @@ fn synthesize_edge_tts_mp3_once(
     }
     let stream =
         tcp_stream.ok_or_else(|| format!("连接 Edge TTS 服务器超时或被拦截：{last_err}"))?;
-    // 采用 120ms 短读取超时以便切换音色时即时取消，同时限制总等待不超过 8 秒
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(120)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(4)));
+    if gen_seq.load(Ordering::SeqCst) != gen_id {
+        return Err("cancelled".to_string());
+    }
+    let _ = stream.set_nodelay(true);
+    // TLS + WebSocket Upgrade 握手期间使用 5 秒超时，避免高延迟网络下被误判超时而回退到 SAPI5
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
     let (mut socket, _resp) = match tungstenite::client_tls(request, stream) {
         Ok(pair) => pair,
@@ -1085,6 +1090,21 @@ fn synthesize_edge_tts_mp3_once(
             return Err(format!("Edge TTS WebSocket TLS 握手失败：{err}"));
         }
     };
+
+    if gen_seq.load(Ordering::SeqCst) != gen_id {
+        let _ = socket.close(None);
+        return Err("cancelled".to_string());
+    }
+    // 握手完成后切回 120ms 读取超时，以便在接收流式音频时能即时响应切换音色打断
+    match socket.get_ref() {
+        tungstenite::stream::MaybeTlsStream::Plain(tcp) => {
+            let _ = tcp.set_read_timeout(Some(Duration::from_millis(120)));
+        }
+        tungstenite::stream::MaybeTlsStream::NativeTls(tls) => {
+            let _ = tls.get_ref().set_read_timeout(Some(Duration::from_millis(120)));
+        }
+        _ => {}
+    }
 
     let timestamp = Utc::now()
         .format("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)")
@@ -1173,6 +1193,27 @@ fn synthesize_edge_tts_mp3(
     synthesize_edge_tts_mp3_once(trimmed, voice, rate, gen_id, gen_seq, true)
 }
 
+fn edge_voice_display_name(voice: &str) -> &'static str {
+    match voice.trim() {
+        "zh-CN-YunxiNeural" => "云希（男声）",
+        "zh-CN-YunyangNeural" => "云扬（播音）",
+        "zh-CN-XiaoyiNeural" => "晓伊（甜美）",
+        _ => "晓晓（女声）",
+    }
+}
+
+fn emit_tts_status(
+    tx_holder: &Arc<Mutex<Option<Sender<(u64, String)>>>>,
+    gen_id: u64,
+    msg: String,
+) {
+    if let Ok(guard) = tx_holder.lock() {
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send((gen_id, msg));
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn speak_with_engine(
     text: &str,
@@ -1184,6 +1225,7 @@ fn speak_with_engine(
     gen_seq: &AtomicU64,
     audio_tx_seq: &Sender<AudioCommand>,
     tts_cache: &Arc<Mutex<EdgeTtsCache>>,
+    tts_status_tx: &Arc<Mutex<Option<Sender<(u64, String)>>>>,
 ) -> bool {
     if gen_seq.load(Ordering::SeqCst) != gen_id {
         return false;
@@ -1203,17 +1245,25 @@ fn speak_with_engine(
         } else {
             edge_voice.trim()
         };
+        let voice_label = edge_voice_display_name(voice);
         let cache_key = format!("{voice}|{tts_rate}|{text}");
         let cached = tts_cache.lock().ok().and_then(|c| c.get(&cache_key));
 
         let mp3_result = match cached {
             Some(bytes) => Ok(bytes),
-            None => synthesize_edge_tts_mp3(text, voice, tts_rate, gen_id, gen_seq).map(|bytes| {
-                if let Ok(mut c) = tts_cache.lock() {
-                    c.insert(cache_key, bytes.clone());
-                }
-                bytes
-            }),
+            None => {
+                emit_tts_status(
+                    tts_status_tx,
+                    gen_id,
+                    format!("正在连接 Edge TTS 在线音色（{voice_label}）..."),
+                );
+                synthesize_edge_tts_mp3(text, voice, tts_rate, gen_id, gen_seq).map(|bytes| {
+                    if let Ok(mut c) = tts_cache.lock() {
+                        c.insert(cache_key, bytes.clone());
+                    }
+                    bytes
+                })
+            }
         };
 
         if gen_seq.load(Ordering::SeqCst) != gen_id {
@@ -1229,11 +1279,21 @@ fn speak_with_engine(
                     reply: reply_tx,
                 });
                 if let Ok(Some(sink)) = reply_rx.recv() {
+                    emit_tts_status(
+                        tts_status_tx,
+                        gen_id,
+                        format!("Edge TTS 在线音色：{voice_label}"),
+                    );
                     return wait_sink_with_cancel(&sink, gen_id, gen_seq);
                 }
                 win_sys::log_warn(
                     "tts",
                     "Edge TTS MP3 decoder unavailable, falling back to local SAPI5",
+                );
+                emit_tts_status(
+                    tts_status_tx,
+                    gen_id,
+                    "Edge TTS 音频解码异常，已自动回退本地 SAPI5".to_string(),
                 );
             }
             Err(err) => {
@@ -1244,8 +1304,19 @@ fn speak_with_engine(
                     "tts",
                     &format!("Edge TTS unavailable ({err}), falling back to local SAPI5"),
                 );
+                emit_tts_status(
+                    tts_status_tx,
+                    gen_id,
+                    format!("Edge TTS 连接受限，已自动回退本地 SAPI5（{err}）"),
+                );
             }
         }
+    } else {
+        emit_tts_status(
+            tts_status_tx,
+            gen_id,
+            "本地 SAPI5（离线系统语音）".to_string(),
+        );
     }
 
     if gen_seq.load(Ordering::SeqCst) != gen_id {
@@ -1270,6 +1341,7 @@ impl AudioEngine {
         let active_seq_gen = Arc::new(AtomicU64::new(0));
         let live_volume = Arc::new(AtomicU8::new(80));
         let tts_cache = Arc::new(Mutex::new(EdgeTtsCache::default()));
+        let tts_status_tx = Arc::new(Mutex::new(None));
 
         // 1. 底层 rodio 音频线程（负责 OutputStream、提示音/自定义音频、Edge TTS MP3 播放与实时音量）
         thread::Builder::new()
@@ -1406,7 +1478,10 @@ impl AudioEngine {
                                 if let Some(prev) = active_sink.take() {
                                     fade_out_and_stop_sink(prev, AUDIO_SWITCH_FADE_MS);
                                 }
-                                match (Sink::try_new(handle), Decoder::new(Cursor::new(bytes))) {
+                                match (
+                                    Sink::try_new(handle),
+                                    Decoder::new_mp3(Cursor::new(bytes)),
+                                ) {
                                     (Ok(sink), Ok(source)) => {
                                         sink.set_volume(vol_f);
                                         let faded = FadeEnvelopeSource::new(
@@ -1419,7 +1494,20 @@ impl AudioEngine {
                                         active_sink = Some(Arc::clone(&arc_sink));
                                         Some(arc_sink)
                                     }
-                                    _ => None,
+                                    (Err(err), _) => {
+                                        win_sys::log_warn(
+                                            "tts",
+                                            &format!("Sink::try_new failed: {err}"),
+                                        );
+                                        None
+                                    }
+                                    (_, Err(err)) => {
+                                        win_sys::log_warn(
+                                            "tts",
+                                            &format!("Decoder::new_mp3 failed: {err}"),
+                                        );
+                                        None
+                                    }
                                 }
                             } else {
                                 None
@@ -1450,6 +1538,7 @@ impl AudioEngine {
         let active_seq_clone = Arc::clone(&active_seq_gen);
         let vol_seq = Arc::clone(&live_volume);
         let cache_seq = Arc::clone(&tts_cache);
+        let status_tx_seq = Arc::clone(&tts_status_tx);
         thread::Builder::new()
             .name("audio-sequence-worker".to_string())
             .spawn(move || {
@@ -1513,6 +1602,7 @@ impl AudioEngine {
                                         &gen_seq,
                                         &audio_tx_seq,
                                         &cache_seq,
+                                        &status_tx_seq,
                                     ) {
                                         break;
                                     }
@@ -1574,6 +1664,7 @@ impl AudioEngine {
                                         &gen_seq,
                                         &audio_tx_seq,
                                         &cache_seq,
+                                        &status_tx_seq,
                                     ) {
                                         break;
                                     }
@@ -1599,6 +1690,13 @@ impl AudioEngine {
             active_seq_gen,
             live_volume,
             tts_cache,
+            tts_status_tx,
+        }
+    }
+
+    pub fn attach_tts_status_sender(&self, tx: Sender<(u64, String)>) {
+        if let Ok(mut guard) = self.tts_status_tx.lock() {
+            *guard = Some(tx);
         }
     }
 

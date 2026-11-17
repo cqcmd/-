@@ -91,6 +91,14 @@ fn main() {
             bumped
         };
 
+    println!("cargo:rerun-if-env-changed=GITHUB_REPOSITORY");
+    let repo = std::env::var("GITHUB_REPOSITORY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.contains('/'))
+        .unwrap_or_else(|| "cqcmd/-".to_string());
+    let default_update_url = format!("https://github.com/{repo}/releases/latest");
+    println!("cargo:rustc-env=DEFAULT_UPDATE_CHECK_URL={default_update_url}");
     println!("cargo:rustc-env=APP_BUILD_VERSION={next_version}");
 
     // 2. 编译 Slint 原生 UI 资源
