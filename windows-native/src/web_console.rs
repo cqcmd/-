@@ -175,7 +175,7 @@ fn handle_http_client(
                 &mut stream,
                 "200 OK",
                 "application/json; charset=utf-8",
-                br#"{"ok":true,"message":"已触发测试报时"}"#,
+                r#"{"ok":true,"message":"已触发测试报时"}"#.as_bytes(),
             );
         }
         ("POST", "/api/action/toggle-mute") => {
@@ -184,7 +184,7 @@ fn handle_http_client(
                 &mut stream,
                 "200 OK",
                 "application/json; charset=utf-8",
-                br#"{"ok":true,"message":"已切换全局静音状态"}"#,
+                r#"{"ok":true,"message":"已切换全局静音状态"}"#.as_bytes(),
             );
         }
         ("POST", "/api/action/sync-ntp") => {
@@ -193,7 +193,7 @@ fn handle_http_client(
                 &mut stream,
                 "200 OK",
                 "application/json; charset=utf-8",
-                br#"{"ok":true,"message":"已发起网络校时"}"#,
+                r#"{"ok":true,"message":"已发起网络校时"}"#.as_bytes(),
             );
         }
         _ => {
