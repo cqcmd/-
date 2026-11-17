@@ -1266,38 +1266,74 @@ pub fn apply_rounded_window_corners(
     }
 }
 
-/// 调用 Windows 原生 SAPI 5（ISpVoice）执行文字转语音同步播报（零外部依赖）
-pub fn speak_text_sapi(text: &str, volume: u8, rate: i8) -> Result<(), String> {
+/// 调用 Windows 原生 SAPI 5（ISpVoice）执行文字转语音播报（支持 35ms 级取消打断，零外部依赖）
+pub fn speak_text_sapi_cancellable<F>(
+    text: &str,
+    volume: u8,
+    rate: i8,
+    mut should_cancel: F,
+) -> Result<bool, String>
+where
+    F: FnMut() -> bool,
+{
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Ok(());
+        return Ok(true);
+    }
+    if should_cancel() {
+        return Ok(false);
     }
 
     #[cfg(target_os = "windows")]
     {
+        use std::time::{Duration, Instant};
         use windows::core::PCWSTR;
-        use windows::Win32::Media::Speech::{ISpVoice, SpVoice};
+        use windows::Win32::Media::Speech::{ISpVoice, SpVoice, SPRS_DONE, SPVOICESTATUS};
         use windows::Win32::System::Com::{
             CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL,
             COINIT_APARTMENTTHREADED,
         };
 
+        // SPF_ASYNC (1) | SPF_PURGEBEFORESPEAK (2) = 3：异步启动并立即清除自身缓冲
+        const SPF_ASYNC_PURGE: u32 = 1 | 2;
+
         unsafe {
             let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             let need_uninit = hr.is_ok();
 
-            let res = (|| -> Result<(), String> {
+            let res = (|| -> Result<bool, String> {
                 let voice: ISpVoice = CoCreateInstance(&SpVoice, None, CLSCTX_ALL)
                     .map_err(|e| format!("初始化 Windows 语音引擎失败：{e}"))?;
                 let _ = voice.SetVolume(volume.min(100) as u16);
                 let _ = voice.SetRate(rate.clamp(-10, 10) as i32);
 
                 let wide: Vec<u16> = trimmed.encode_utf16().chain(std::iter::once(0)).collect();
-                // SPF_PURGEBEFORESPEAK = 2：打断前一条未播完的语音并同步播报当前文本
                 voice
-                    .Speak(PCWSTR(wide.as_ptr()), 2, None)
+                    .Speak(PCWSTR(wide.as_ptr()), SPF_ASYNC_PURGE, None)
                     .map_err(|e| format!("Windows 语音播报失败：{e}"))?;
-                Ok(())
+
+                let started = Instant::now();
+                let max_wait = Duration::from_secs(60);
+                let mut completed = true;
+
+                while started.elapsed() < max_wait {
+                    if should_cancel() {
+                        let _ = voice.Speak(PCWSTR::null(), SPF_ASYNC_PURGE, None);
+                        let _ = voice.WaitUntilDone(80);
+                        completed = false;
+                        break;
+                    }
+                    let _ = voice.WaitUntilDone(35);
+                    let mut status = SPVOICESTATUS::default();
+                    if voice
+                        .GetStatus(&mut status, std::ptr::null_mut())
+                        .is_err()
+                        || status.dwRunningState == SPRS_DONE.0 as u32
+                    {
+                        break;
+                    }
+                }
+                Ok(completed)
             })();
 
             if need_uninit {
@@ -1309,9 +1345,15 @@ pub fn speak_text_sapi(text: &str, volume: u8, rate: i8) -> Result<(), String> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (trimmed, volume, rate);
-        Ok(())
+        let _ = (trimmed, volume, rate, &mut should_cancel);
+        Ok(true)
     }
+}
+
+/// 调用 Windows 原生 SAPI 5（ISpVoice）执行文字转语音同步播报（零外部依赖）
+#[allow(dead_code)]
+pub fn speak_text_sapi(text: &str, volume: u8, rate: i8) -> Result<(), String> {
+    speak_text_sapi_cancellable(text, volume, rate, || false).map(|_| ())
 }
 
 #[cfg(test)]

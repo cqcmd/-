@@ -2,18 +2,17 @@ use crate::config::{render_tts_template, AppConfig, TtsEngine, DEFAULT_EDGE_TTS_
 use crate::win_sys;
 use chrono::{DateTime, Local, Timelike, Utc};
 use rodio::{Decoder, OutputStream, Sink, Source};
-use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::f32::consts::PI;
 use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::{BufReader, Cursor, ErrorKind};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::http::HeaderValue;
 use tungstenite::Message;
@@ -23,13 +22,15 @@ static CHIME_WAV_BYTES: &[u8] = include_bytes!("../assets/chime.wav");
 static MEAL_WAV_BYTES: &[u8] = include_bytes!("../assets/meal.wav");
 
 const EDGE_TRUSTED_CLIENT_TOKEN: &str = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
-const EDGE_SEC_MS_GEC_VERSION: &str = "1-130.0.2849.68";
-const EDGE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0";
+const EDGE_SEC_MS_GEC_VERSION: &str = "2-143.0.3650.75";
+const EDGE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0";
 const EDGE_ORIGIN: &str = "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold";
 const WIN_EPOCH_SECS: u64 = 11_644_473_600;
 const EDGE_TTS_MAX_CACHE_ENTRIES: usize = 6;
 const EDGE_TTS_MAX_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const EDGE_TTS_MAX_AUDIO_BYTES: usize = 4 * 1024 * 1024;
+
+static EDGE_CLOCK_SKEW_SECS: AtomicI64 = AtomicI64::new(0);
 
 /// 提示音与自定义音频默认淡入/淡出时长（避免网吧公放或耳机环境下起止突兀）
 const AUDIO_FADE_IN_MS: u64 = 180;
@@ -38,7 +39,7 @@ const AUDIO_FADE_OUT_MS: u64 = 240;
 const SPEECH_FADE_IN_MS: u64 = 90;
 const SPEECH_FADE_OUT_MS: u64 = 130;
 /// 打断切换旧音频时的平滑渐隐时长
-const AUDIO_SWITCH_FADE_MS: u64 = 140;
+const AUDIO_SWITCH_FADE_MS: u64 = 80;
 
 /// 触发餐饮提醒时对其他应用背景音乐的压低策略（压低至原音量的 25%，最低保留 5%）
 const AUDIO_DUCK_TARGET_RATIO: f32 = 0.25;
@@ -149,6 +150,7 @@ pub struct AudioEngine {
     audio_tx: Sender<AudioCommand>,
     seq_tx: Sender<SequenceJob>,
     gen_counter: Arc<AtomicU64>,
+    active_seq_gen: Arc<AtomicU64>,
     live_volume: Arc<AtomicU8>,
     tts_cache: Arc<Mutex<EdgeTtsCache>>,
 }
@@ -625,16 +627,310 @@ fn generate_request_id_hex() -> String {
     format!("{:016x}{:016x}", nanos ^ pid.rotate_left(17), seq.wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
-/// 计算 Microsoft Edge Read Aloud WebSocket 接口所需的 Sec-MS-GEC 校验令牌
+const EDGE_SHA256_INITIAL: [u32; 8] = [
+    0x6A09_E667,
+    0xBB67_AE85,
+    0x3C6E_F372,
+    0xA54F_F53A,
+    0x510E_527F,
+    0x9B05_688C,
+    0x1F83_D9AB,
+    0x5BE0_CD19,
+];
+const EDGE_SHA256_STATE: [u32; 8] = [
+    0xFD9F_BEA2,
+    0x9124_3CE7,
+    0xBE49_9094,
+    0xCD2E_1E0A,
+    0x6C00_6F49,
+    0x04BD_35AB,
+    0xFEB0_A7E4,
+    0x03EF_FBD2,
+];
+const EDGE_SHA256_SCHEDULE: [u32; 14] = [
+    0xEB24_BF9E,
+    0x1558_691F,
+    0xA0C0_9EE2,
+    0x0CFA_32BA,
+    0xA622_EE8C,
+    0xD1DD_9491,
+    0xC0DD_25A0,
+    0xF9E7_0AB6,
+    0xF0C3_1573,
+    0x7058_CE4E,
+    0x7188_E606,
+    0x00E5_AB33,
+    0xD258_B060,
+    0x7276_6564,
+];
+const EDGE_SHA256_ROUND_CONSTANTS: [u32; 64] = [
+    0x428A_2F98, 0x7137_4491, 0xB5C0_FBCF, 0xE9B5_DBA5,
+    0x3956_C25B, 0x59F1_11F1, 0x923F_82A4, 0xAB1C_5ED5,
+    0xD807_AA98, 0x1283_5B01, 0x2431_85BE, 0x550C_7DC3,
+    0x72BE_5D74, 0x80DE_B1FE, 0x9BDC_06A7, 0xC19B_F174,
+    0xE49B_69C1, 0xEFBE_4786, 0x0FC1_9DC6, 0x240C_A1CC,
+    0x2DE9_2C6F, 0x4A74_84AA, 0x5CB0_A9DC, 0x76F9_88DA,
+    0x983E_5152, 0xA831_C66D, 0xB003_27C8, 0xBF59_7FC7,
+    0xC6E0_0BF3, 0xD5A7_9147, 0x06CA_6351, 0x1429_2967,
+    0x27B7_0A85, 0x2E1B_2138, 0x4D2C_6DFC, 0x5338_0D13,
+    0x650A_7354, 0x766A_0ABB, 0x81C2_C92E, 0x9272_2C85,
+    0xA2BF_E8A1, 0xA81A_664B, 0xC24B_8B70, 0xC76C_51A3,
+    0xD192_E819, 0xD699_0624, 0xF40E_3585, 0x106A_A070,
+    0x19A4_C116, 0x1E37_6C08, 0x2748_774C, 0x34B0_BCB5,
+    0x391C_0CB3, 0x4ED8_AA4A, 0x5B9C_CA4F, 0x682E_6FF3,
+    0x748F_82EE, 0x78A5_636F, 0x84C8_7814, 0x8CC7_0208,
+    0x90BE_FFFA, 0xA450_6CEB, 0xBEF9_A3F7, 0xC671_78F2,
+];
+const EDGE_SHA256_ADJUSTMENT: u32 = 0xC9DC_06A7;
+const EDGE_SHA256_SIGMA0_ADJUSTMENT: u32 = 0x059C_0B80;
+const EDGE_SHA256_SIGMA1_ADJUSTMENT: u32 = 0x000B_92C0;
+const EDGE_CS64_COEFFICIENTS: [(u32, u32); 14] = [
+    (0xE82E_91B1, 0xB327_00D0),
+    (0x44DE_24C6, 0x88DF_F51D),
+    (0x3BEB_65BC, 0x2951_4038),
+    (0xC89C_5933, 0xB328_CBDF),
+    (0x8D1E_C211, 0xD405_B4D5),
+    (0x314E_F5D5, 0x26E5_5F3C),
+    (0xE924_91B1, 0x6078_01C6),
+    (0xF0A5_B9D5, 0x82B2_C1FB),
+    (0x0606_4CF3, 0xFA51_A3DA),
+    (0xDA79_FA60, 0x207C_C464),
+    (0xBED2_0560, 0x3C3C_74F3),
+    (0x89F9_C9F8, 0xD2D1_4B61),
+    (0x35FA_38C6, 0xBB04_A2C1),
+    (0xCB49_E3C6, 0xC562_6167),
+];
+const EDGE_CS64_FACTOR: u32 = 0x8289_3933;
+const EDGE_CS64_ADJUSTMENT0: u32 = 0xF2F9_0B1A;
+const EDGE_CS64_ADJUSTMENT1: u32 = 0x0B1A_0000;
+
+#[inline]
+fn edge_sigma0(v: u32) -> u32 {
+    v.rotate_right(7) ^ v.rotate_right(18) ^ (v >> 3)
+}
+
+#[inline]
+fn edge_sigma1(v: u32) -> u32 {
+    v.rotate_right(17) ^ v.rotate_right(19) ^ (v >> 10)
+}
+
+fn edge_expand_sha256_schedule(words: &mut Vec<u32>, first_word: usize) {
+    for idx in first_word..64 {
+        let s1 = edge_sigma1(words[idx - 2]);
+        let s0 = edge_sigma0(words[idx - 15]);
+        let val = s1
+            .wrapping_add(words[idx - 7])
+            .wrapping_add(s0)
+            .wrapping_add(words[idx - 16]);
+        words.push(val);
+    }
+}
+
+fn edge_sha256_rounds(state: [u32; 8], words: &[u32], first_round: usize) -> [u32; 8] {
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+    for (idx, &word) in words.iter().enumerate().take(64).skip(first_round) {
+        let k = if first_round == 14 && idx == 14 {
+            EDGE_SHA256_ADJUSTMENT
+        } else {
+            EDGE_SHA256_ROUND_CONSTANTS[idx]
+        };
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = g ^ (e & (f ^ g));
+        let t1 = h
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(k)
+            .wrapping_add(word);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) | (c & (a | b));
+        let t2 = s0.wrapping_add(maj);
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    [a, b, c, d, e, f, g, h]
+}
+
+fn edge_sha256_init(data: &[u8]) -> [u32; 8] {
+    let mut words = Vec::with_capacity(64);
+    words.resize(14, 0u32);
+    words.push((u32::from(data[0]) << 16) | (u32::from(data[1]) << 8) | u32::from(data[2]));
+    words.push(u32::from_be_bytes([data[3], data[4], data[5], data[6]]));
+
+    for idx in 16..30 {
+        let mut val = EDGE_SHA256_SCHEDULE[idx - 16];
+        if idx - 2 >= 14 {
+            let s1 = edge_sigma1(words[idx - 2]);
+            val = val.wrapping_add(if idx == 16 {
+                s1 ^ EDGE_SHA256_SIGMA1_ADJUSTMENT
+            } else {
+                s1
+            });
+        }
+        if idx - 7 >= 14 {
+            val = val.wrapping_add(words[idx - 7]);
+        }
+        if idx - 15 >= 14 {
+            let s0 = edge_sigma0(words[idx - 15]);
+            val = val.wrapping_add(if idx == 29 {
+                s0 ^ EDGE_SHA256_SIGMA0_ADJUSTMENT
+            } else {
+                s0
+            });
+        }
+        words.push(val);
+    }
+
+    let w30 = edge_sigma1(words[28])
+        .wrapping_add(words[23])
+        .wrapping_add(edge_sigma0(words[15]))
+        .wrapping_add(words[14])
+        .wrapping_add(EDGE_SHA256_ADJUSTMENT)
+        .wrapping_sub(EDGE_SHA256_ROUND_CONSTANTS[14]);
+    words.push(w30);
+
+    edge_expand_sha256_schedule(&mut words, 31);
+    let working = edge_sha256_rounds(EDGE_SHA256_STATE, &words, 14);
+    let mut out = [0u32; 8];
+    for i in 0..8 {
+        out[i] = EDGE_SHA256_INITIAL[i].wrapping_add(working[i]);
+    }
+    out
+}
+
+fn edge_sha256_digest(data: &[u8]) -> [u8; 32] {
+    let mut state = edge_sha256_init(&data[..7]);
+    let length = 57usize + data.len();
+    let pad_zeros = (55isize - (length as isize)).rem_euclid(64) as usize;
+
+    let mut padded = Vec::with_capacity(data.len() - 7 + 1 + pad_zeros + 8);
+    padded.extend_from_slice(&data[7..]);
+    padded.push(0x80);
+    padded.resize(padded.len() + pad_zeros, 0u8);
+    padded.extend_from_slice(&((length as u64) * 8).to_be_bytes());
+
+    for block in padded.chunks_exact(64) {
+        let mut words = Vec::with_capacity(64);
+        for chunk in block.chunks_exact(4) {
+            words.push(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        edge_expand_sha256_schedule(&mut words, 16);
+        let working = edge_sha256_rounds(state, &words, 0);
+        for i in 0..8 {
+            state[i] = state[i].wrapping_add(working[i]);
+        }
+    }
+
+    let mut digest = [0u8; 32];
+    for (i, word) in state.iter().enumerate() {
+        digest[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    digest
+}
+
+fn edge_cs64_digest(data: &[u8], digest: &[u8; 32]) -> (u32, u32) {
+    let key_a = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) | 1;
+    let key_b = u32::from_le_bytes([digest[4], digest[5], digest[6], digest[7]]) | 1;
+    let factors = [
+        key_a.wrapping_mul(EDGE_CS64_FACTOR),
+        key_b.wrapping_mul(EDGE_CS64_FACTOR),
+    ];
+
+    let mut terms = Vec::with_capacity(32);
+    let mut offsets = Vec::with_capacity(32);
+    for (idx, &(coeff, off)) in EDGE_CS64_COEFFICIENTS.iter().enumerate() {
+        terms.push(coeff.wrapping_mul(factors[idx % 2]));
+        offsets.push(off);
+    }
+
+    let mut prefixed = Vec::with_capacity(1 + data.len() + 4);
+    prefixed.push(0);
+    prefixed.extend_from_slice(data);
+    while prefixed.len() % 4 != 0 {
+        prefixed.push(0);
+    }
+    let mut data_words: Vec<u32> = prefixed
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if data_words.len() % 2 == 1 {
+        data_words.push(0);
+    }
+
+    for (idx, word) in data_words.into_iter().enumerate() {
+        let mut term = word.wrapping_mul(if idx % 2 == 0 { key_a } else { key_b });
+        let mut offset = word
+            .rotate_left(16)
+            .wrapping_mul(if idx % 2 == 0 { 0xEF05_69FB } else { 0xC317_13DB });
+        if idx == 0 {
+            term = term.wrapping_add(EDGE_CS64_ADJUSTMENT0.wrapping_mul(factors[0]));
+            offset = offset.wrapping_add(EDGE_CS64_ADJUSTMENT1);
+        }
+        terms.push(term);
+        offsets.push(offset);
+    }
+
+    let mut swap_acc = 0u32;
+    let mut swap_last = 0u32;
+    let mut state = 0u32;
+    let mut acc = 0u32;
+
+    for idx in (0..terms.len()).step_by(2) {
+        let (x, y) = (terms[idx], terms[idx + 1]);
+        let t1 = offsets[idx].wrapping_add(x).rotate_left(16);
+        let q1 = t1.wrapping_mul(0x76F5_0F34);
+        swap_acc = swap_acc.wrapping_add(q1.rotate_left(16).wrapping_mul(0xC3EF_EA97).wrapping_add(q1));
+
+        let t2 = offsets[idx + 1].wrapping_add(y).rotate_left(16);
+        let q2 = t2.wrapping_mul(0x1881_CE3C);
+        swap_last = q2.rotate_left(16).wrapping_mul(0x35BD_1EC9).wrapping_add(q2);
+        swap_acc = swap_acc.wrapping_add(swap_last);
+
+        state = state.wrapping_mul(key_a).wrapping_add(x);
+        state = state.rotate_left(16).wrapping_mul(0xCF98_B111);
+        state = state.rotate_left(16).wrapping_mul(0x8708_5B9F);
+        state = state.rotate_left(16).wrapping_mul(0x12CE_B96D);
+        state = state.rotate_left(16).wrapping_mul(0x257E_1D83);
+        acc = acc.wrapping_add(state);
+
+        let mut tb = state.wrapping_mul(key_b).wrapping_add(y);
+        tb = tb.rotate_left(16).wrapping_mul(0xA274_16F5);
+        tb = tb.rotate_left(16).wrapping_mul(0xD383_96FF);
+        state = tb
+            .rotate_left(16)
+            .wrapping_mul(0x7C93_2B89)
+            .rotate_left(16)
+            .wrapping_mul(0xBFA4_9F69);
+        acc = acc.wrapping_add(state);
+    }
+
+    (swap_last ^ state, swap_acc ^ acc)
+}
+
+/// 计算 Microsoft Edge Read Aloud WebSocket 接口所需的 v2 Sec-MS-GEC 校验令牌
 pub fn generate_sec_ms_gec(unix_secs: u64) -> String {
     let win_secs = unix_secs.saturating_add(WIN_EPOCH_SECS);
     let rounded_secs = win_secs - (win_secs % 300);
     let ticks = u128::from(rounded_secs) * 10_000_000;
     let payload = format!("{ticks}{EDGE_TRUSTED_CLIENT_TOKEN}");
-    let digest = Sha256::digest(payload.as_bytes());
-    let mut hex = String::with_capacity(64);
+    let digest = edge_sha256_digest(payload.as_bytes());
+    let (cs_lo, cs_hi) = edge_cs64_digest(payload.as_bytes(), &digest);
+
+    let mut hex = String::with_capacity(81);
+    use std::fmt::Write;
+    for byte in cs_lo.to_le_bytes() {
+        let _ = write!(&mut hex, "{byte:02X}");
+    }
+    for byte in cs_hi.to_le_bytes() {
+        let _ = write!(&mut hex, "{byte:02X}");
+    }
+    hex.push('-');
     for byte in digest {
-        use std::fmt::Write;
         let _ = write!(&mut hex, "{byte:02X}");
     }
     hex
@@ -692,21 +988,32 @@ pub fn extract_audio_chunk_from_binary_frame(frame: &[u8]) -> Option<&[u8]> {
     }
 }
 
-/// 通过 Microsoft Edge TTS 在线 WebSocket 接口合成 MP3 字节流（带连接/读写超时保护）
-fn synthesize_edge_tts_mp3(text: &str, voice: &str, rate: i8) -> Result<Vec<u8>, String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Err("empty tts text".to_string());
-    }
-
-    let unix_secs = SystemTime::now()
+fn current_edge_unix_secs() -> u64 {
+    let raw = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or(0) as i64;
+    let skew = EDGE_CLOCK_SKEW_SECS.load(Ordering::Relaxed);
+    raw.saturating_add(skew).max(0) as u64
+}
+
+fn synthesize_edge_tts_mp3_once(
+    trimmed: &str,
+    voice: &str,
+    rate: i8,
+    gen_id: u64,
+    gen_seq: &AtomicU64,
+    allow_clock_skew_retry: bool,
+) -> Result<Vec<u8>, String> {
+    if gen_seq.load(Ordering::SeqCst) != gen_id {
+        return Err("cancelled".to_string());
+    }
+
     let conn_id = generate_request_id_hex();
-    let sec_ms_gec = generate_sec_ms_gec(unix_secs);
+    let muid = generate_request_id_hex().to_ascii_uppercase();
+    let sec_ms_gec = generate_sec_ms_gec(current_edge_unix_secs());
     let url = format!(
-        "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken={EDGE_TRUSTED_CLIENT_TOKEN}&Sec-MS-GEC={sec_ms_gec}&Sec-MS-GEC-Version={EDGE_SEC_MS_GEC_VERSION}&ConnectionId={conn_id}"
+        "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken={EDGE_TRUSTED_CLIENT_TOKEN}&ConnectionId={conn_id}&Sec-MS-GEC={sec_ms_gec}&Sec-MS-GEC-Version={EDGE_SEC_MS_GEC_VERSION}"
     );
 
     let mut request = url
@@ -721,8 +1028,11 @@ fn synthesize_edge_tts_mp3(text: &str, voice: &str, rate: i8) -> Result<Vec<u8>,
         headers.insert("User-Agent", HeaderValue::from_static(EDGE_USER_AGENT));
         headers.insert(
             "Accept-Language",
-            HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
+            HeaderValue::from_static("en-US,en;q=0.9"),
         );
+        if let Ok(cookie_val) = HeaderValue::from_str(&format!("muid={muid};")) {
+            headers.insert("Cookie", cookie_val);
+        }
     }
 
     let addrs = ("speech.platform.bing.com", 443)
@@ -732,7 +1042,10 @@ fn synthesize_edge_tts_mp3(text: &str, voice: &str, rate: i8) -> Result<Vec<u8>,
     let mut tcp_stream: Option<TcpStream> = None;
     let mut last_err = String::from("无可用网络地址");
     for addr in addrs {
-        match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+        if gen_seq.load(Ordering::SeqCst) != gen_id {
+            return Err("cancelled".to_string());
+        }
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
             Ok(s) => {
                 tcp_stream = Some(s);
                 break;
@@ -742,19 +1055,41 @@ fn synthesize_edge_tts_mp3(text: &str, voice: &str, rate: i8) -> Result<Vec<u8>,
             }
         }
     }
-    let stream = tcp_stream.ok_or_else(|| format!("连接 Edge TTS 服务器超时或被拦截：{last_err}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let stream =
+        tcp_stream.ok_or_else(|| format!("连接 Edge TTS 服务器超时或被拦截：{last_err}"))?;
+    // 采用 120ms 短读取超时以便切换音色时即时取消，同时限制总等待不超过 8 秒
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(120)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(4)));
 
-    let (mut socket, _resp) = tungstenite::client_tls(request, stream)
-        .map_err(|e| format!("Edge TTS WebSocket TLS 握手失败：{e}"))?;
+    let (mut socket, _resp) = match tungstenite::client_tls(request, stream) {
+        Ok(pair) => pair,
+        Err(tungstenite::Error::Http(resp)) if allow_clock_skew_retry => {
+            if let Some(date_hdr) = resp.headers().get("Date").and_then(|v| v.to_str().ok()) {
+                if let Ok(server_dt) = DateTime::parse_from_rfc2822(date_hdr) {
+                    let local_raw = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let skew = server_dt.timestamp().saturating_sub(local_raw);
+                    EDGE_CLOCK_SKEW_SECS.store(skew, Ordering::Relaxed);
+                    return synthesize_edge_tts_mp3_once(
+                        trimmed, voice, rate, gen_id, gen_seq, false,
+                    );
+                }
+            }
+            return Err(format!("Edge TTS HTTP 拒绝连接：{}", resp.status()));
+        }
+        Err(err) => {
+            return Err(format!("Edge TTS WebSocket TLS 握手失败：{err}"));
+        }
+    };
 
     let timestamp = Utc::now()
         .format("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)")
         .to_string();
 
     let speech_config_msg = format!(
-        "X-Timestamp:{timestamp}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{{\"context\":{{\"synthesis\":{{\"audio\":{{\"metadataoptions\":{{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"}},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}}}}}"
+        "X-Timestamp:{timestamp}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{{\"context\":{{\"synthesis\":{{\"audio\":{{\"metadataoptions\":{{\"sentenceBoundaryEnabled\":\"true\",\"wordBoundaryEnabled\":\"false\"}},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}}}}}\r\n"
     );
     socket
         .send(Message::Text(speech_config_msg.into()))
@@ -769,7 +1104,19 @@ fn synthesize_edge_tts_mp3(text: &str, voice: &str, rate: i8) -> Result<Vec<u8>,
         .map_err(|e| format!("发送 SSML 请求失败：{e}"))?;
 
     let mut audio_bytes: Vec<u8> = Vec::with_capacity(32 * 1024);
+    let started = Instant::now();
     loop {
+        if gen_seq.load(Ordering::SeqCst) != gen_id {
+            let _ = socket.close(None);
+            return Err("cancelled".to_string());
+        }
+        if started.elapsed() > Duration::from_secs(8) {
+            let _ = socket.close(None);
+            if audio_bytes.is_empty() {
+                return Err("接收 Edge TTS 音频流超时".to_string());
+            }
+            break;
+        }
         match socket.read() {
             Ok(Message::Binary(bin)) => {
                 if let Some(chunk) = extract_audio_chunk_from_binary_frame(&bin) {
@@ -788,6 +1135,11 @@ fn synthesize_edge_tts_mp3(text: &str, voice: &str, rate: i8) -> Result<Vec<u8>,
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
+            Err(tungstenite::Error::Io(ref io_err))
+                if matches!(io_err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                continue;
+            }
             Err(err) => {
                 if audio_bytes.is_empty() {
                     return Err(format!("接收 Edge TTS 音频流失败：{err}"));
@@ -802,6 +1154,21 @@ fn synthesize_edge_tts_mp3(text: &str, voice: &str, rate: i8) -> Result<Vec<u8>,
         return Err("Edge TTS 返回空音频流".to_string());
     }
     Ok(audio_bytes)
+}
+
+/// 通过 Microsoft Edge TTS 在线 WebSocket 接口合成 MP3 字节流（带时钟偏差自修正与即时取消保护）
+fn synthesize_edge_tts_mp3(
+    text: &str,
+    voice: &str,
+    rate: i8,
+    gen_id: u64,
+    gen_seq: &AtomicU64,
+) -> Result<Vec<u8>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("empty tts text".to_string());
+    }
+    synthesize_edge_tts_mp3_once(trimmed, voice, rate, gen_id, gen_seq, true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -822,7 +1189,10 @@ fn speak_with_engine(
 
     win_sys::log_debug(
         "tts",
-        &format!("speaking via {:?} rate={tts_rate} vol={volume}: \"{text}\"", tts_engine),
+        &format!(
+            "speaking via {:?} voice={edge_voice} rate={tts_rate} vol={volume}: \"{text}\"",
+            tts_engine
+        ),
     );
 
     if tts_engine == TtsEngine::EdgeTts {
@@ -836,7 +1206,7 @@ fn speak_with_engine(
 
         let mp3_result = match cached {
             Some(bytes) => Ok(bytes),
-            None => synthesize_edge_tts_mp3(text, voice, tts_rate).map(|bytes| {
+            None => synthesize_edge_tts_mp3(text, voice, tts_rate, gen_id, gen_seq).map(|bytes| {
                 if let Ok(mut c) = tts_cache.lock() {
                     c.insert(cache_key, bytes.clone());
                 }
@@ -865,6 +1235,9 @@ fn speak_with_engine(
                 );
             }
             Err(err) => {
+                if err == "cancelled" || gen_seq.load(Ordering::SeqCst) != gen_id {
+                    return false;
+                }
                 win_sys::log_warn(
                     "tts",
                     &format!("Edge TTS unavailable ({err}), falling back to local SAPI5"),
@@ -876,10 +1249,15 @@ fn speak_with_engine(
     if gen_seq.load(Ordering::SeqCst) != gen_id {
         return false;
     }
-    if let Err(err) = win_sys::speak_text_sapi(text, volume, tts_rate) {
-        win_sys::log_warn("tts", &err);
+    match win_sys::speak_text_sapi_cancellable(text, volume, tts_rate, || {
+        gen_seq.load(Ordering::SeqCst) != gen_id
+    }) {
+        Ok(completed) => completed && gen_seq.load(Ordering::SeqCst) == gen_id,
+        Err(err) => {
+            win_sys::log_warn("tts", &err);
+            gen_seq.load(Ordering::SeqCst) == gen_id
+        }
     }
-    gen_seq.load(Ordering::SeqCst) == gen_id
 }
 
 impl AudioEngine {
@@ -887,6 +1265,7 @@ impl AudioEngine {
         let (audio_tx, audio_rx) = mpsc::channel::<AudioCommand>();
         let (seq_tx, seq_rx) = mpsc::channel::<SequenceJob>();
         let gen_counter = Arc::new(AtomicU64::new(0));
+        let active_seq_gen = Arc::new(AtomicU64::new(0));
         let live_volume = Arc::new(AtomicU8::new(80));
         let tts_cache = Arc::new(Mutex::new(EdgeTtsCache::default()));
 
@@ -1066,6 +1445,7 @@ impl AudioEngine {
         // 2. 编排线程（保证提示音、自定义音频与 SAPI5 / Edge TTS 语音按顺序串行播放，不叠音、不阻塞 UI）
         let audio_tx_seq = audio_tx.clone();
         let gen_seq = Arc::clone(&gen_counter);
+        let active_seq_clone = Arc::clone(&active_seq_gen);
         let vol_seq = Arc::clone(&live_volume);
         let cache_seq = Arc::clone(&tts_cache);
         thread::Builder::new()
@@ -1073,6 +1453,12 @@ impl AudioEngine {
             .spawn(move || {
                 while let Ok(job) = seq_rx.recv() {
                     if gen_seq.load(Ordering::SeqCst) != job.gen_id {
+                        let _ = active_seq_clone.compare_exchange(
+                            job.gen_id,
+                            0,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        );
                         continue;
                     }
 
@@ -1193,6 +1579,13 @@ impl AudioEngine {
                             }
                         }
                     }
+
+                    let _ = active_seq_clone.compare_exchange(
+                        job.gen_id,
+                        0,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
                 }
             })
             .expect("Failed to spawn audio sequence worker thread");
@@ -1201,6 +1594,7 @@ impl AudioEngine {
             audio_tx,
             seq_tx,
             gen_counter,
+            active_seq_gen,
             live_volume,
             tts_cache,
         }
@@ -1217,9 +1611,10 @@ impl AudioEngine {
         tts_engine: TtsEngine,
         edge_voice: String,
         tts_rate: i8,
-    ) {
+    ) -> u64 {
         self.live_volume.store(volume.min(100), Ordering::Relaxed);
         let gen_id = self.gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        self.active_seq_gen.store(gen_id, Ordering::SeqCst);
         let _ = self.audio_tx.send(AudioCommand::StopActive);
         let _ = self.seq_tx.send(SequenceJob {
             gen_id,
@@ -1233,6 +1628,7 @@ impl AudioEngine {
                 tts_rate,
             },
         });
+        gen_id
     }
 
     /// 依据配置开关（`chime_tts_enabled`）在半/整点报时时自动调用 TTS 引擎播报当前真实系统时间
@@ -1252,7 +1648,7 @@ impl AudioEngine {
         } else {
             None
         };
-        self.play_chime(
+        let _ = self.play_chime(
             repeat,
             volume,
             cfg.chime_play_sound,
@@ -1278,6 +1674,7 @@ impl AudioEngine {
     ) {
         self.live_volume.store(volume.min(100), Ordering::Relaxed);
         let gen_id = self.gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        self.active_seq_gen.store(gen_id, Ordering::SeqCst);
         let _ = self.audio_tx.send(AudioCommand::StopActive);
         let _ = self.seq_tx.send(SequenceJob {
             gen_id,
@@ -1299,9 +1696,14 @@ impl AudioEngine {
         let _ = self.audio_tx.send(AudioCommand::SetLiveVolume(clamped));
     }
 
-    /// 立即平滑停止当前正在播放的报时/语音（例如托盘切换为“静音模式”时调用）
+    pub fn is_playing_gen(&self, gen_id: u64) -> bool {
+        gen_id != 0 && self.active_seq_gen.load(Ordering::SeqCst) == gen_id
+    }
+
+    /// 立即平滑停止当前正在播放的报时/语音（例如托盘切换为“静音模式”或切换音色时调用）
     pub fn stop_active(&self) {
         self.gen_counter.fetch_add(1, Ordering::SeqCst);
+        self.active_seq_gen.store(0, Ordering::SeqCst);
         let _ = self.audio_tx.send(AudioCommand::StopActive);
     }
 
@@ -1325,11 +1727,18 @@ mod tests {
 
     #[test]
     fn test_generate_sec_ms_gec_format() {
-        let token = generate_sec_ms_gec(1_731_570_000);
-        assert_eq!(token.len(), 64);
-        assert!(token.chars().all(|c| matches!(c, '0'..='9' | 'A'..='F')));
+        let token_a = generate_sec_ms_gec(1_731_570_000);
+        assert_eq!(token_a.len(), 81);
+        assert_eq!(
+            token_a,
+            "8DE5A7CF1DA2BF9C-6347C725761C960EAE4066BF45CFF934648415B93EA251E031565E06FCC93160"
+        );
         // 同一个 5 分钟时间窗口内应保持幂等一致
-        assert_eq!(token, generate_sec_ms_gec(1_731_570_120));
+        assert_eq!(token_a, generate_sec_ms_gec(1_731_570_120));
+        assert_eq!(
+            generate_sec_ms_gec(1_700_000_000),
+            "2CD23A2CA0B2595A-F3C846C370E05F9CC83ACC5F995C5F5D87A4D0F14CE8936A0F902E64099E38A2"
+        );
     }
 
     #[test]

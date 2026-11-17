@@ -752,7 +752,8 @@ export component SettingsWindow inherits Window {
     callback close-clicked();
     callback preview-volume-changed(int);
     callback test-chime();
-    callback test-voice-preview();
+    callback test-voice-preview(bool);
+    callback voice-option-switched();
     callback test-holiday-chime();
     callback browse-holiday-audio();
     callback refresh-holiday-feed();
@@ -1357,7 +1358,7 @@ export component SettingsWindow inherits Window {
                             SecondaryButton {
                                 width: 82px;
                                 label: "试听语音";
-                                clicked => { root.test-voice-preview(); }
+                                clicked => { root.test-voice-preview(true); }
                             }
                         }
 
@@ -1389,7 +1390,10 @@ export component SettingsWindow inherits Window {
                                 }
                                 TouchArea {
                                     mouse-cursor: pointer;
-                                    clicked => { root.tts-engine-index = idx; }
+                                    clicked => {
+                                        root.tts-engine-index = idx;
+                                        root.voice-option-switched();
+                                    }
                                 }
                             }
                         }
@@ -1423,7 +1427,10 @@ export component SettingsWindow inherits Window {
                                     }
                                     TouchArea {
                                         mouse-cursor: pointer;
-                                        clicked => { root.edge-voice-index = idx; }
+                                        clicked => {
+                                            root.edge-voice-index = idx;
+                                            root.voice-option-switched();
+                                        }
                                     }
                                 }
                             }
@@ -1460,7 +1467,7 @@ export component SettingsWindow inherits Window {
                             SecondaryButton {
                                 width: 82px;
                                 label: "试听音色";
-                                clicked => { root.test-voice-preview(); }
+                                clicked => { root.test-voice-preview(false); }
                             }
                         }
 

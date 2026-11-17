@@ -19,7 +19,7 @@ use scheduler::{
     Scheduler, TriggerEvent,
 };
 use slint::{ComponentHandle, Timer, TimerMode};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::{Read, Write};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1896,6 +1896,7 @@ fn main() {
     }
 
     // 10. 绑定设置窗口回调（实时音量滑块 / 实时主题预览 / 手动查更新 / 校验保存 / 取消回滚）
+    let last_voice_preview_gen = Rc::new(Cell::new(0u64));
     {
         let st_rc = Rc::clone(&state);
         let audio_clone = audio.clone();
@@ -1928,7 +1929,7 @@ fn main() {
                 let tts_rate = sw.get_tts_rate().clamp(-5, 5) as i8;
                 let (holiday_audio_opt, tts_opt, _) =
                     resolve_chime_playback_params(&preview_cfg, &st.scheduler, Local::now());
-                audio_clone.play_chime(
+                let _ = audio_clone.play_chime(
                     1,
                     vol,
                     preview_cfg.chime_play_sound,
@@ -1945,18 +1946,18 @@ fn main() {
         let st_rc = Rc::clone(&state);
         let sw_weak = settings_win.as_weak();
         let audio_clone = audio.clone();
-        settings_win.on_test_voice_preview(move || {
-            let st = st_rc.borrow();
-            let vol = st.live_volume;
+        let preview_gen_rc = Rc::clone(&last_voice_preview_gen);
+        settings_win.on_test_voice_preview(move |include_chime| {
+            let vol = st_rc.borrow().live_volume;
             if let Some(sw) = sw_weak.upgrade() {
                 let now = Local::now();
-                let play_sound = sw.get_chime_play_sound();
+                let play_sound = include_chime && sw.get_chime_play_sound();
                 let tts_engine = TtsEngine::from_index(sw.get_tts_engine_index());
                 let edge_voice = edge_voice_from_index(sw.get_edge_voice_index()).to_string();
                 let tts_rate = sw.get_tts_rate().clamp(-5, 5) as i8;
                 let time_phrase = render_tts_template("现在时间，{TIME}", now.hour(), now.minute());
                 let preview_text = format!("{time_phrase}，当前语音音色与播报音量试听正常");
-                audio_clone.play_chime(
+                let gen_id = audio_clone.play_chime(
                     1,
                     vol,
                     play_sound,
@@ -1966,6 +1967,42 @@ fn main() {
                     edge_voice,
                     tts_rate,
                 );
+                preview_gen_rc.set(gen_id);
+            }
+        });
+    }
+    {
+        let st_rc = Rc::clone(&state);
+        let sw_weak = settings_win.as_weak();
+        let audio_clone = audio.clone();
+        let preview_gen_rc = Rc::clone(&last_voice_preview_gen);
+        settings_win.on_voice_option_switched(move || {
+            let was_voice_previewing = audio_clone.is_playing_gen(preview_gen_rc.get());
+            audio_clone.stop_active();
+            preview_gen_rc.set(0);
+
+            if was_voice_previewing {
+                let vol = st_rc.borrow().live_volume;
+                if let Some(sw) = sw_weak.upgrade() {
+                    let now = Local::now();
+                    let tts_engine = TtsEngine::from_index(sw.get_tts_engine_index());
+                    let edge_voice = edge_voice_from_index(sw.get_edge_voice_index()).to_string();
+                    let tts_rate = sw.get_tts_rate().clamp(-5, 5) as i8;
+                    let time_phrase =
+                        render_tts_template("现在时间，{TIME}", now.hour(), now.minute());
+                    let preview_text = format!("{time_phrase}，当前语音音色与播报音量试听正常");
+                    let gen_id = audio_clone.play_chime(
+                        1,
+                        vol,
+                        false,
+                        None,
+                        Some(preview_text),
+                        tts_engine,
+                        edge_voice,
+                        tts_rate,
+                    );
+                    preview_gen_rc.set(gen_id);
+                }
             }
         });
     }
@@ -2151,6 +2188,7 @@ fn main() {
         let uw_weak = update_win.as_weak();
         let audio_clone = audio.clone();
         settings_win.on_cancel_clicked(move || {
+            audio_clone.stop_active();
             let mut st = st_rc.borrow_mut();
             st.live_volume = st.config.volume;
             audio_clone.set_live_volume(st.config.volume);
