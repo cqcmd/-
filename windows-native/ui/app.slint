@@ -1,0 +1,1966 @@
+import { ScrollView } from "std-widgets.slint";
+import { ThemeStore } from "theme.slint";
+
+// 基础控件：主按钮
+component PrimaryButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 34px;
+    border-radius: 6px;
+    background: !enabled ? ThemeStore.palette.border-hairline : (ta.pressed ? ThemeStore.palette.accent-hover : (ta.has-hover ? ThemeStore.palette.accent-hover : ThemeStore.palette.accent));
+    animate background { duration: 150ms; easing: ease-out; }
+
+    Text {
+        text: root.label;
+        color: root.enabled ? ThemeStore.palette.accent-fg : ThemeStore.palette.text-muted;
+        font-size: 13px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 基础控件：次级描边按钮
+component SecondaryButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 34px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: ThemeStore.palette.border-hairline;
+    background: ta.has-hover && root.enabled ? ThemeStore.palette.surface-hover : ThemeStore.palette.surface;
+    animate background { duration: 150ms; easing: ease-out; }
+
+    Text {
+        text: root.label;
+        color: root.enabled ? ThemeStore.palette.text-primary : ThemeStore.palette.text-muted;
+        font-size: 13px;
+        font-weight: 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 基础控件：纯文本链接动作按钮
+component GhostButton inherits Rectangle {
+    in property <string> label;
+    callback clicked();
+
+    height: 28px;
+    border-radius: 5px;
+    background: ta.has-hover ? ThemeStore.palette.surface-hover : transparent;
+    animate background { duration: 150ms; easing: ease-out; }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        Text {
+            text: root.label;
+            color: ta.has-hover ? ThemeStore.palette.text-primary : ThemeStore.palette.text-secondary;
+            font-size: 12px;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 基础控件：滑动开关
+component SwitchToggle inherits Rectangle {
+    in-out property <bool> checked;
+    callback toggled(bool);
+
+    width: 42px;
+    height: 22px;
+    border-radius: 11px;
+    background: checked ? ThemeStore.palette.accent : ThemeStore.palette.border-hairline;
+    animate background { duration: 150ms; easing: ease-out; }
+
+    Rectangle {
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        y: 3px;
+        x: root.checked ? (root.width - self.width - 3px) : 3px;
+        background: root.checked ? ThemeStore.palette.accent-fg : ThemeStore.palette.surface;
+        animate x { duration: 150ms; easing: ease-out; }
+    }
+
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+}
+
+// 基础控件：单行文本输入框
+component StyledInput inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder: "";
+
+    height: 34px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: ti.has-focus ? ThemeStore.palette.accent : ThemeStore.palette.border-hairline;
+    background: ThemeStore.palette.input-bg;
+    animate border-color { duration: 150ms; }
+
+    if root.text == "" : Text {
+        x: 10px;
+        text: root.placeholder;
+        color: ThemeStore.palette.text-muted;
+        font-size: 13px;
+        vertical-alignment: center;
+        height: parent.height;
+    }
+
+    ti := TextInput {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        text <=> root.text;
+        color: ThemeStore.palette.text-primary;
+        font-size: 13px;
+        single-line: true;
+        vertical-alignment: center;
+    }
+}
+
+// 基础控件：整数步进器（时/分/次数）
+component NumberStepper inherits Rectangle {
+    in-out property <int> value;
+    in property <int> min: 0;
+    in property <int> max: 59;
+    in property <bool> pad-two: true;
+    in property <bool> enabled: true;
+
+    width: 96px;
+    height: 32px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: ThemeStore.palette.border-hairline;
+    background: root.enabled ? ThemeStore.palette.input-bg : ThemeStore.palette.surface;
+
+    HorizontalLayout {
+        Rectangle {
+            width: 28px;
+            background: minus-ta.has-hover && root.enabled ? ThemeStore.palette.surface-hover : transparent;
+            border-radius: 5px;
+            Text {
+                text: "-";
+                color: root.enabled ? ThemeStore.palette.text-secondary : ThemeStore.palette.text-muted;
+                font-size: 14px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            minus-ta := TouchArea {
+                enabled: root.enabled;
+                mouse-cursor: root.enabled ? pointer : default;
+                clicked => {
+                    if root.value > root.min {
+                        root.value -= 1;
+                    } else {
+                        root.value = root.max;
+                    }
+                }
+            }
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            text: (root.pad-two && root.value < 10 ? "0" : "") + root.value;
+            color: root.enabled ? ThemeStore.palette.text-primary : ThemeStore.palette.text-muted;
+            font-family: "Consolas";
+            font-size: 13px;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        Rectangle {
+            width: 28px;
+            background: plus-ta.has-hover && root.enabled ? ThemeStore.palette.surface-hover : transparent;
+            border-radius: 5px;
+            Text {
+                text: "+";
+                color: root.enabled ? ThemeStore.palette.text-secondary : ThemeStore.palette.text-muted;
+                font-size: 14px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            plus-ta := TouchArea {
+                enabled: root.enabled;
+                mouse-cursor: root.enabled ? pointer : default;
+                clicked => {
+                    if root.value < root.max {
+                        root.value += 1;
+                    } else {
+                        root.value = root.min;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 基础控件：实时音量滑块（0-100 拖动立即触发预览）
+component VolumeSlider inherits Rectangle {
+    in-out property <int> value: 80;
+    callback live-changed(int);
+
+    height: 26px;
+    background: transparent;
+
+    // 轨道背景
+    track := Rectangle {
+        y: (parent.height - self.height) / 2;
+        width: parent.width;
+        height: 6px;
+        border-radius: 3px;
+        background: ThemeStore.palette.border-hairline;
+
+        // 高亮进度条
+        Rectangle {
+            x: 0;
+            y: 0;
+            height: parent.height;
+            width: parent.width * (Math.clamp(root.value, 0, 100) / 100.0);
+            border-radius: 3px;
+            background: ThemeStore.palette.accent;
+        }
+    }
+
+    // 滑块手柄
+    Rectangle {
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        y: (parent.height - self.height) / 2;
+        x: Math.clamp((root.width - self.width) * (Math.clamp(root.value, 0, 100) / 100.0), 0px, root.width - self.width);
+        background: ThemeStore.palette.surface;
+        border-width: 2px;
+        border-color: ThemeStore.palette.accent;
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        function update-from-pointer() {
+            if (root.width > 0px) {
+                root.value = Math.round(Math.clamp(self.mouse-x / root.width, 0.0, 1.0) * 100);
+                root.live-changed(root.value);
+            }
+        }
+        pointer-event(ev) => {
+            if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
+                update-from-pointer();
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                update-from-pointer();
+            }
+        }
+    }
+}
+
+// 无边框圆角窗口统一几何令牌（8px 外圆角与 Windows 11 DWM DWMWCP_ROUND 硬件圆角一致）
+export global WindowStyle {
+    out property <length> corner-radius: 8px;
+    out property <length> border-width: 1px;
+    out property <length> inner-corner-radius: 7px;
+    out property <length> titlebar-height: 36px;
+    out property <length> control-button-width: 34px;
+    out property <length> control-button-height: 28px;
+    out property <length> control-button-radius: 5px;
+}
+
+// 基础控件：圆角无边框自定义标题栏（仅含最小化与关闭按钮，支持拖拽移动，顶部圆角与 DWM 硬件圆角对齐）
+component CustomTitleBar inherits Rectangle {
+    in property <string> title-text: "半整点提醒";
+    in property <length> top-radius: WindowStyle.inner-corner-radius;
+    callback drag-window(length, length);
+    callback minimize-clicked();
+    callback close-clicked();
+
+    height: WindowStyle.titlebar-height;
+    background: ThemeStore.palette.surface;
+    border-top-left-radius: root.top-radius;
+    border-top-right-radius: root.top-radius;
+    border-bottom-left-radius: 0px;
+    border-bottom-right-radius: 0px;
+    clip: true;
+
+    // 底部分隔线
+    Rectangle {
+        y: parent.height - 1px;
+        width: parent.width;
+        height: 1px;
+        background: ThemeStore.palette.border-hairline;
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 4px;
+        spacing: 6px;
+
+        // 左侧可拖拽区域（图标 + 窗口标题）
+        Rectangle {
+            horizontal-stretch: 1;
+            background: transparent;
+
+            HorizontalLayout {
+                spacing: 8px;
+                Image {
+                    source: @image-url("../assets/app_icon_512.png");
+                    width: 18px;
+                    height: 18px;
+                    y: (parent.height - self.height) / 2;
+                    image-fit: contain;
+                }
+                Text {
+                    text: root.title-text;
+                    color: ThemeStore.palette.text-primary;
+                    font-size: 13px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+
+            drag-ta := TouchArea {
+                property <length> drag-start-x: 0px;
+                property <length> drag-start-y: 0px;
+
+                pointer-event(ev) => {
+                    if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
+                        drag-start-x = self.mouse-x;
+                        drag-start-y = self.mouse-y;
+                    }
+                }
+                moved => {
+                    if (self.pressed) {
+                        root.drag-window(self.mouse-x - drag-start-x, self.mouse-y - drag-start-y);
+                    }
+                }
+            }
+        }
+
+        // 最小化按钮
+        Rectangle {
+            width: WindowStyle.control-button-width;
+            height: WindowStyle.control-button-height;
+            y: (parent.height - self.height) / 2;
+            border-radius: WindowStyle.control-button-radius;
+            background: min-ta.pressed ? ThemeStore.palette.border-hairline : (min-ta.has-hover ? ThemeStore.palette.surface-hover : transparent);
+            animate background { duration: 120ms; }
+
+            Rectangle {
+                width: 10px;
+                height: 1.5px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2 + 2px;
+                background: ThemeStore.palette.text-primary;
+            }
+
+            min-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.minimize-clicked(); }
+            }
+        }
+
+        // 关闭按钮
+        Rectangle {
+            width: WindowStyle.control-button-width;
+            height: WindowStyle.control-button-height;
+            y: (parent.height - self.height) / 2;
+            border-radius: WindowStyle.control-button-radius;
+            background: close-ta.pressed ? #C42B1C : (close-ta.has-hover ? #E81123 : transparent);
+            animate background { duration: 120ms; }
+
+            Path {
+                width: 10px;
+                height: 10px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                viewbox-x: 0;
+                viewbox-y: 0;
+                viewbox-width: 10;
+                viewbox-height: 10;
+                stroke: (close-ta.has-hover || close-ta.pressed) ? #FFFFFF : ThemeStore.palette.text-primary;
+                stroke-width: 1.5px;
+                MoveTo { x: 1; y: 1; }
+                LineTo { x: 9; y: 9; }
+                MoveTo { x: 9; y: 1; }
+                LineTo { x: 1; y: 9; }
+            }
+
+            close-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.close-clicked(); }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 主状态窗口（460x376 逻辑像素，圆角无系统边框）
+// ============================================================================
+export component MainWindow inherits Window {
+    title: "半整点提醒";
+    icon: @image-url("../assets/app_icon_512.png");
+    default-font-family: "Microsoft YaHei UI";
+    preferred-width: 460px;
+    preferred-height: 376px;
+    min-width: 440px;
+    min-height: 356px;
+    no-frame: true;
+    background: transparent;
+
+    // 主窗状态属性
+    in property <string> current-time: "00:00:00";
+    in property <string> current-date: "2026-11-14 · 星期六";
+    in property <string> next-event-title: "半点报时";
+    in property <string> next-event-time: "00:30";
+    in property <string> next-event-countdown: "00分00秒";
+    in property <bool> is-quiet-now: false;
+    in property <string> quiet-badge-text: "报时运行中";
+    in property <string> chime-summary-text: "报时分钟：0, 30";
+    // 0: 未校时 | 1: 校时中 | 2: 成功 | 3: 失败
+    in property <int> ntp-status-code: 0;
+    in property <string> ntp-status-text: "校时状态：尚未校时";
+    in property <bool> is-syncing: false;
+
+    // 后台更新检查状态
+    in property <bool> has-update: false;
+    in property <string> update-version: "";
+
+    callback drag-window(length, length);
+    callback minimize-window();
+    callback close-clicked();
+    callback test-chime();
+    callback sync-ntp();
+    callback open-settings();
+    callback cycle-theme();
+    callback minimize-to-tray();
+    callback download-update();
+    callback dismiss-update();
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: WindowStyle.corner-radius;
+        clip: true;
+        border-width: WindowStyle.border-width;
+        border-color: ThemeStore.palette.border-hairline;
+        background: ThemeStore.palette.canvas;
+
+        VerticalLayout {
+            padding: WindowStyle.border-width;
+            spacing: 0px;
+
+            CustomTitleBar {
+                title-text: "半整点提醒";
+                drag-window(dx, dy) => { root.drag-window(dx, dy); }
+                minimize-clicked => { root.minimize-window(); }
+                close-clicked => { root.close-clicked(); }
+            }
+
+            VerticalLayout {
+                vertical-stretch: 1;
+                padding: 18px;
+                spacing: 12px;
+
+                // 次级操作栏：报时规则摘要 + 主题切换 + 隐藏托盘
+                HorizontalLayout {
+                    height: 28px;
+                    spacing: 8px;
+
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.chime-summary-text;
+                        color: ThemeStore.palette.text-muted;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    GhostButton {
+                        label: "主题：" + ThemeStore.palette.name;
+                        clicked => { root.cycle-theme(); }
+                    }
+
+                    GhostButton {
+                        label: "隐藏托盘";
+                        clicked => { root.minimize-to-tray(); }
+                    }
+                }
+
+        // 核心视觉锚点卡片：实时时钟 + 下一事件倒计时
+        Rectangle {
+            vertical-stretch: 1;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: ThemeStore.palette.border-hairline;
+            background: ThemeStore.palette.surface;
+
+            VerticalLayout {
+                padding: 18px;
+                spacing: 14px;
+
+                // 实时时间与日期
+                HorizontalLayout {
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 4px;
+                        Text {
+                            text: root.current-time;
+                            color: ThemeStore.palette.text-primary;
+                            font-family: "Consolas";
+                            font-size: 38px;
+                            font-weight: 700;
+                            letter-spacing: 1px;
+                        }
+                        Text {
+                            text: root.current-date;
+                            color: ThemeStore.palette.text-muted;
+                            font-size: 12px;
+                            overflow: elide;
+                        }
+                    }
+
+                    // 静默或运行状态文本标识（无胶囊堆砌）
+                    VerticalLayout {
+                        alignment: start;
+                        Text {
+                            text: root.is-quiet-now ? "静默中" : "正常运行";
+                            color: root.is-quiet-now ? ThemeStore.palette.status-warn : ThemeStore.palette.status-ok;
+                            font-size: 13px;
+                            font-weight: 700;
+                            horizontal-alignment: right;
+                        }
+                        Text {
+                            text: root.quiet-badge-text;
+                            color: ThemeStore.palette.text-muted;
+                            font-size: 12px;
+                            horizontal-alignment: right;
+                        }
+                    }
+                }
+
+                // 1px 分隔线
+                Rectangle {
+                    height: 1px;
+                    background: ThemeStore.palette.border-hairline;
+                }
+
+                // 下一事件倒计时区
+                HorizontalLayout {
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 2px;
+                        Text {
+                            text: "下一提醒事件";
+                            color: ThemeStore.palette.text-muted;
+                            font-size: 12px;
+                        }
+                        Text {
+                            text: root.next-event-title + " · " + root.next-event-time;
+                            color: ThemeStore.palette.text-secondary;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: root.next-event-countdown;
+                            color: ThemeStore.palette.accent;
+                            font-family: "Consolas";
+                            font-size: 20px;
+                            font-weight: 700;
+                            horizontal-alignment: right;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 校时状态文本行
+        HorizontalLayout {
+            height: 20px;
+            Text {
+                text: root.ntp-status-text;
+                color: root.ntp-status-code == 2 ? ThemeStore.palette.status-ok : (root.ntp-status-code == 3 ? ThemeStore.palette.status-err : (root.ntp-status-code == 1 ? ThemeStore.palette.accent : ThemeStore.palette.text-muted));
+                font-size: 12px;
+                font-weight: 500;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        // 发现新版本时的轻量提示横幅
+        if root.has-update : Rectangle {
+            height: 36px;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: ThemeStore.palette.accent;
+            background: ThemeStore.palette.surface;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 8px;
+                spacing: 8px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: "发现新版本 " + root.update-version + "，可立即下载更新";
+                    color: ThemeStore.palette.accent;
+                    font-size: 12px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                GhostButton {
+                    y: (parent.height - self.height) / 2;
+                    label: "自动更新";
+                    clicked => { root.download-update(); }
+                }
+                GhostButton {
+                    y: (parent.height - self.height) / 2;
+                    label: "忽略";
+                    clicked => { root.dismiss-update(); }
+                }
+            }
+        }
+
+        // 底部高频直达操作区
+        HorizontalLayout {
+            spacing: 10px;
+            height: 36px;
+
+            SecondaryButton {
+                horizontal-stretch: 1;
+                label: "测试报时";
+                clicked => { root.test-chime(); }
+            }
+
+            SecondaryButton {
+                horizontal-stretch: 1;
+                enabled: !root.is-syncing;
+                label: root.is-syncing ? "校时中..." : "立即校时";
+                clicked => { root.sync-ntp(); }
+            }
+
+            PrimaryButton {
+                horizontal-stretch: 1;
+                label: "设置";
+                clicked => { root.open-settings(); }
+            }
+        }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 集中设置面板窗口（560x660，无系统边框，可滚动分组表单 + 自定义餐饮音频 + 实时音量预览）
+// ============================================================================
+export component SettingsWindow inherits Window {
+    title: "半整点提醒 · 设置";
+    icon: @image-url("../assets/app_icon_512.png");
+    default-font-family: "Microsoft YaHei UI";
+    preferred-width: 560px;
+    preferred-height: 660px;
+    min-width: 520px;
+    min-height: 540px;
+    no-frame: true;
+    background: transparent;
+
+    // 表单绑定字段
+    in-out property <string> chime-minutes-str: "0, 30";
+    in-out property <int> chime-repeat: 1;
+    in-out property <bool> chime-play-sound: true;
+    in-out property <bool> chime-tts-enabled: false;
+    in-out property <string> chime-tts-template: "现在时间，{TIME}";
+
+    in-out property <bool> holiday-enabled: false;
+    in-out property <string> holiday-custom-audio-path: "";
+    in-out property <string> holiday-greeting-template: "今天是{HOLIDAY}，{GREETING}现在时间，{TIME}";
+    in-out property <string> holiday-custom-rules: "";
+    in-out property <string> holiday-data-source-url: "";
+    in property <string> holiday-today-preview: "";
+    in-out property <string> holiday-feed-status: "";
+
+    in-out property <bool> quiet-enabled: false;
+    in-out property <int> quiet-start-hour: 0;
+    in-out property <int> quiet-start-minute: 0;
+    in-out property <int> quiet-end-hour: 8;
+    in-out property <int> quiet-end-minute: 0;
+
+    in-out property <bool> meal-enabled: false;
+    in-out property <int> meal-hour: 12;
+    in-out property <int> meal-minute: 0;
+    in-out property <int> meal-repeat: 1;
+    in-out property <string> meal-custom-audio-path: "";
+    in-out property <bool> meal-play-chime-before-custom: true;
+    in-out property <bool> meal-tts-enabled: false;
+    in-out property <string> meal-tts-text: "现在时间，{TIME}，请注意休息用餐";
+    in-out property <int> tts-engine-index: 0;
+    in-out property <int> edge-voice-index: 0;
+    in-out property <int> tts-rate: 0;
+
+    in-out property <int> volume: 80;
+    in-out property <string> ntp-server: "ntp.aliyun.com";
+    in-out property <bool> auto-start: false;
+    in-out property <int> theme-index: 2;
+    in-out property <bool> update-check-enabled: true;
+    in-out property <string> update-check-url: "";
+    in-out property <int> update-check-interval-hours: 6;
+
+    in-out property <string> validation-error: "";
+    in property <bool> is-syncing: false;
+    in property <bool> is-checking-update: false;
+    in property <string> update-status-text: "";
+
+    callback drag-window(length, length);
+    callback minimize-window();
+    callback close-clicked();
+    callback preview-volume-changed(int);
+    callback test-chime();
+    callback test-voice-preview();
+    callback test-holiday-chime();
+    callback browse-holiday-audio();
+    callback refresh-holiday-feed();
+    callback test-meal-chime();
+    callback browse-meal-audio();
+    callback sync-ntp();
+    callback check-update-now();
+    callback select-theme(int);
+    callback save-clicked();
+    callback cancel-clicked();
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: WindowStyle.corner-radius;
+        clip: true;
+        border-width: WindowStyle.border-width;
+        border-color: ThemeStore.palette.border-hairline;
+        background: ThemeStore.palette.canvas;
+
+        VerticalLayout {
+            padding: WindowStyle.border-width;
+            spacing: 0px;
+
+            CustomTitleBar {
+                title-text: "半整点提醒 · 参数与偏好设置";
+                drag-window(dx, dy) => { root.drag-window(dx, dy); }
+                minimize-clicked => { root.minimize-window(); }
+                close-clicked => { root.close-clicked(); }
+            }
+
+            VerticalLayout {
+                vertical-stretch: 1;
+                padding: 18px;
+                spacing: 12px;
+
+                Text {
+                    text: "音量调节即时生效支持试听，其余参数点击“确定保存”后应用";
+                    color: ThemeStore.palette.text-muted;
+                    font-size: 12px;
+                }
+
+        // 可滚动分组表单区域
+        ScrollView {
+            vertical-stretch: 1;
+            viewport-width: self.width - 14px;
+
+            VerticalLayout {
+                spacing: 12px;
+                padding-right: 6px;
+
+                // 分组 1：外观主题切换
+                Rectangle {
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: ThemeStore.palette.border-hairline;
+                    background: ThemeStore.palette.surface;
+
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+                        Text {
+                            text: "界面主题";
+                            color: ThemeStore.palette.text-primary;
+                            font-size: 13px;
+                            font-weight: 700;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            for theme-opt[idx] in ["暗夜曜石", "晨曦云母", "暖金咖啡馆"] : Rectangle {
+                                horizontal-stretch: 1;
+                                height: 32px;
+                                border-radius: 6px;
+                                border-width: 1px;
+                                border-color: root.theme-index == idx ? ThemeStore.palette.accent : ThemeStore.palette.border-hairline;
+                                background: root.theme-index == idx ? ThemeStore.palette.accent : ThemeStore.palette.input-bg;
+                                animate background { duration: 150ms; }
+                                Text {
+                                    text: theme-opt;
+                                    color: root.theme-index == idx ? ThemeStore.palette.accent-fg : ThemeStore.palette.text-secondary;
+                                    font-size: 12px;
+                                    font-weight: 600;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.theme-index = idx;
+                                        root.select-theme(idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 分组 2：报时提醒（核心）
+                Rectangle {
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: ThemeStore.palette.border-hairline;
+                    background: ThemeStore.palette.surface;
+
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+
+                        Text {
+                            text: "报时规则";
+                            color: ThemeStore.palette.text-primary;
+                            font-size: 13px;
+                            font-weight: 700;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                width: 110px;
+                                text: "报时分钟集合";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                            }
+                            StyledInput {
+                                horizontal-stretch: 1;
+                                text <=> root.chime-minutes-str;
+                                placeholder: "逗号分隔（0–59），例如：0, 30";
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                width: 110px;
+                                text: "提示音播放次数";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                            }
+                            NumberStepper {
+                                value <=> root.chime-repeat;
+                                min: 1;
+                                max: 10;
+                                pad-two: false;
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "次（1–10）";
+                                color: ThemeStore.palette.text-muted;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            SecondaryButton {
+                                width: 82px;
+                                label: "试听报时";
+                                clicked => { root.test-chime(); }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "播放内置报时提示音";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            SwitchToggle {
+                                checked <=> root.chime-play-sound;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "半/整点语音报真实时间（文字转语音）";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            SwitchToggle {
+                                checked <=> root.chime-tts-enabled;
+                            }
+                        }
+
+                        if root.chime-tts-enabled : VerticalLayout {
+                            spacing: 6px;
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text {
+                                    width: 84px;
+                                    text: "报时语音文本";
+                                    color: ThemeStore.palette.text-secondary;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                                StyledInput {
+                                    horizontal-stretch: 1;
+                                    text <=> root.chime-tts-template;
+                                    placeholder: "例如：现在时间，{TIME}";
+                                }
+                            }
+                            Text {
+                                text: "可用变量：{TIME} 真实中文时间（如十四点三十分 / 十二点整）、{TIME12} 含时段、{PERIOD} 上/下午、{HH}:{MM}";
+                                color: ThemeStore.palette.text-muted;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+
+                // 分组 2.5：农历与节假日专属报时（节庆氛围）
+                Rectangle {
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: ThemeStore.palette.border-hairline;
+                    background: ThemeStore.palette.surface;
+
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+
+                        HorizontalLayout {
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "农历与节假日专属报时（节庆氛围）";
+                                color: ThemeStore.palette.text-primary;
+                                font-size: 13px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            SwitchToggle {
+                                checked <=> root.holiday-enabled;
+                            }
+                        }
+
+                        if root.holiday-today-preview != "" : Text {
+                            text: "今日历法：" + root.holiday-today-preview;
+                            color: ThemeStore.palette.accent;
+                            font-size: 12px;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
+
+                        Text {
+                            text: "默认关闭；开启并保存后，将在已设定的「报时分钟」（默认整点 :00 与半点 :30，且非静默/静音时段）自动识别当天节假日，自动切换专属提示音并播报节日问候与真实时间（内置 2010–2040 农历、法定及 520/双十一/圣诞等节点）。";
+                            color: ThemeStore.palette.text-muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                width: 70px;
+                                text: "节庆提示音";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            StyledInput {
+                                horizontal-stretch: 1;
+                                text <=> root.holiday-custom-audio-path;
+                                placeholder: "可选：浏览本地 WAV / MP3 / OGG / FLAC";
+                            }
+                            SecondaryButton {
+                                width: 62px;
+                                label: "浏览...";
+                                clicked => { root.browse-holiday-audio(); }
+                            }
+                            if root.holiday-custom-audio-path != "" : SecondaryButton {
+                                width: 52px;
+                                label: "清除";
+                                clicked => { root.holiday-custom-audio-path = ""; }
+                            }
+                            SecondaryButton {
+                                width: 76px;
+                                label: "试听节庆";
+                                clicked => { root.test-holiday-chime(); }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                width: 70px;
+                                text: "问候语模板";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            StyledInput {
+                                horizontal-stretch: 1;
+                                text <=> root.holiday-greeting-template;
+                                placeholder: "例如：今天是{HOLIDAY}，{GREETING}现在时间，{TIME}";
+                            }
+                        }
+
+                        Text {
+                            text: "可用变量：{HOLIDAY} 节日名、{GREETING} 节日祝福语、{LUNAR} 农历日期、{TIME} 真实中文时间";
+                            color: ThemeStore.palette.text-muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                width: 70px;
+                                text: "自定义节日";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            StyledInput {
+                                horizontal-stretch: 1;
+                                text <=> root.holiday-custom-rules;
+                                placeholder: "分号分隔，如：11-14=电竞周年庆|全场开黑福利|D:\\fest.wav; L01-01=新春特惠";
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                width: 70px;
+                                text: "节假日接口";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            StyledInput {
+                                horizontal-stretch: 1;
+                                text <=> root.holiday-data-source-url;
+                                placeholder: "可选：https://... 或本地/局域网节假日 JSON 清单路径";
+                            }
+                            SecondaryButton {
+                                width: 76px;
+                                label: "立即拉取";
+                                clicked => { root.refresh-holiday-feed(); }
+                            }
+                        }
+
+                        if root.holiday-feed-status != "" : Text {
+                            text: root.holiday-feed-status;
+                            color: ThemeStore.palette.text-muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                // 分组 3：静默时段（含跨日识别提示）
+                Rectangle {
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: ThemeStore.palette.border-hairline;
+                    background: ThemeStore.palette.surface;
+
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+
+                        HorizontalLayout {
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "静默时段（该区间内暂停报时）";
+                                color: ThemeStore.palette.text-primary;
+                                font-size: 13px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            SwitchToggle {
+                                checked <=> root.quiet-enabled;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                width: 70px;
+                                text: "开始时间";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            NumberStepper { value <=> root.quiet-start-hour; min: 0; max: 23; enabled: root.quiet-enabled; }
+                            Text { text: ":"; color: ThemeStore.palette.text-muted; vertical-alignment: center; }
+                            NumberStepper { value <=> root.quiet-start-minute; min: 0; max: 59; enabled: root.quiet-enabled; }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                width: 70px;
+                                text: "结束时间";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            NumberStepper { value <=> root.quiet-end-hour; min: 0; max: 23; enabled: root.quiet-enabled; }
+                            Text { text: ":"; color: ThemeStore.palette.text-muted; vertical-alignment: center; }
+                            NumberStepper { value <=> root.quiet-end-minute; min: 0; max: 59; enabled: root.quiet-enabled; }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: (root.quiet-start-hour * 60 + root.quiet-start-minute) > (root.quiet-end-hour * 60 + root.quiet-end-minute) ? "跨日区间" : "同日区间";
+                                color: ThemeStore.palette.text-muted;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
+                            }
+                        }
+                    }
+                }
+
+                // 分组 4：餐饮提醒
+                Rectangle {
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: ThemeStore.palette.border-hairline;
+                    background: ThemeStore.palette.surface;
+
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+
+                        HorizontalLayout {
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "餐饮提醒";
+                                color: ThemeStore.palette.text-primary;
+                                font-size: 13px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            SwitchToggle {
+                                checked <=> root.meal-enabled;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                width: 70px;
+                                text: "提醒时间";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            NumberStepper { value <=> root.meal-hour; min: 0; max: 23; enabled: root.meal-enabled; }
+                            Text { text: ":"; color: ThemeStore.palette.text-muted; vertical-alignment: center; }
+                            NumberStepper { value <=> root.meal-minute; min: 0; max: 59; enabled: root.meal-enabled; }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                width: 70px;
+                                text: "播放次数";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            NumberStepper { value <=> root.meal-repeat; min: 1; max: 10; pad-two: false; enabled: root.meal-enabled; }
+                            Rectangle { horizontal-stretch: 1; }
+                            GhostButton {
+                                label: "12:00 午间";
+                                clicked => { root.meal-hour = 12; root.meal-minute = 0; }
+                            }
+                            GhostButton {
+                                label: "18:00 晚间";
+                                clicked => { root.meal-hour = 18; root.meal-minute = 0; }
+                            }
+                        }
+
+                        // 自定义餐饮音频选择与试听（支持 WAV/MP3/OGG/FLAC）
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                width: 70px;
+                                text: "自定义音频";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            StyledInput {
+                                horizontal-stretch: 1;
+                                text <=> root.meal-custom-audio-path;
+                                placeholder: "可选：浏览本地 WAV / MP3 / OGG / FLAC";
+                            }
+                            SecondaryButton {
+                                width: 62px;
+                                label: "浏览...";
+                                clicked => { root.browse-meal-audio(); }
+                            }
+                            if root.meal-custom-audio-path != "" : SecondaryButton {
+                                width: 52px;
+                                label: "清除";
+                                clicked => { root.meal-custom-audio-path = ""; }
+                            }
+                            SecondaryButton {
+                                width: 76px;
+                                label: "试听餐饮";
+                                clicked => { root.test-meal-chime(); }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "播报自定义音频或语音前先播放内置提示音";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                wrap: word-wrap;
+                            }
+                            SwitchToggle {
+                                checked <=> root.meal-play-chime-before-custom;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "启用定时自定义文字转语音播报";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            SwitchToggle {
+                                checked <=> root.meal-tts-enabled;
+                            }
+                        }
+
+                        if root.meal-tts-enabled : HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                width: 70px;
+                                text: "播报文字";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            StyledInput {
+                                horizontal-stretch: 1;
+                                text <=> root.meal-tts-text;
+                                placeholder: "例如：现在时间，{TIME}，请注意休息用餐";
+                            }
+                        }
+                    }
+                }
+
+                // 分组 5：音量控制与 NTP 校时
+                Rectangle {
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: ThemeStore.palette.border-hairline;
+                    background: ThemeStore.palette.surface;
+
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+
+                        Text {
+                            text: "音量与时间校时";
+                            color: ThemeStore.palette.text-primary;
+                            font-size: 13px;
+                            font-weight: 700;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                width: 70px;
+                                text: "播报音量";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            VolumeSlider {
+                                horizontal-stretch: 1;
+                                value <=> root.volume;
+                                live-changed(v) => { root.preview-volume-changed(v); }
+                            }
+                            Text {
+                                width: 34px;
+                                text: root.volume + "%";
+                                color: ThemeStore.palette.text-primary;
+                                font-family: "Consolas";
+                                font-size: 12px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
+                            }
+                            SecondaryButton {
+                                width: 82px;
+                                label: "试听语音";
+                                clicked => { root.test-voice-preview(); }
+                            }
+                        }
+
+                        // 语音合成引擎切换：本地 SAPI5（离线） vs Microsoft Edge TTS（在线神经网络）
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                width: 70px;
+                                text: "语音引擎";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            for eng-opt[idx] in ["本地 SAPI5（离线可用）", "Microsoft Edge TTS（在线）"] : Rectangle {
+                                horizontal-stretch: 1;
+                                height: 30px;
+                                border-radius: 6px;
+                                border-width: 1px;
+                                border-color: root.tts-engine-index == idx ? ThemeStore.palette.accent : ThemeStore.palette.border-hairline;
+                                background: root.tts-engine-index == idx ? ThemeStore.palette.accent : ThemeStore.palette.input-bg;
+                                animate background { duration: 150ms; }
+                                Text {
+                                    text: eng-opt;
+                                    color: root.tts-engine-index == idx ? ThemeStore.palette.accent-fg : ThemeStore.palette.text-secondary;
+                                    font-size: 12px;
+                                    font-weight: 600;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.tts-engine-index = idx; }
+                                }
+                            }
+                        }
+
+                        if root.tts-engine-index == 1 : VerticalLayout {
+                            spacing: 6px;
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text {
+                                    width: 70px;
+                                    text: "在线音色";
+                                    color: ThemeStore.palette.text-secondary;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                                for voice-opt[idx] in ["晓晓（女声）", "云希（男声）", "云扬（播音）", "晓伊（甜美）"] : Rectangle {
+                                    horizontal-stretch: 1;
+                                    height: 28px;
+                                    border-radius: 5px;
+                                    border-width: 1px;
+                                    border-color: root.edge-voice-index == idx ? ThemeStore.palette.accent : ThemeStore.palette.border-hairline;
+                                    background: root.edge-voice-index == idx ? ThemeStore.palette.accent : ThemeStore.palette.input-bg;
+                                    animate background { duration: 150ms; }
+                                    Text {
+                                        text: voice-opt;
+                                        color: root.edge-voice-index == idx ? ThemeStore.palette.accent-fg : ThemeStore.palette.text-secondary;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.edge-voice-index = idx; }
+                                    }
+                                }
+                            }
+                            Text {
+                                text: "通过 Microsoft Edge TTS 网络接口合成自然人声；若网络受限或离线超时，将自动回退至本地 SAPI5 播报。";
+                                color: ThemeStore.palette.text-muted;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                width: 70px;
+                                text: "语音语速";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            NumberStepper {
+                                value <=> root.tts-rate;
+                                min: -5;
+                                max: 5;
+                                pad-two: false;
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "语速（-5 较慢，0 标准，5 较快）";
+                                color: ThemeStore.palette.text-muted;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            SecondaryButton {
+                                width: 82px;
+                                label: "试听音色";
+                                clicked => { root.test-voice-preview(); }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                width: 70px;
+                                text: "NTP 地址";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            StyledInput {
+                                horizontal-stretch: 1;
+                                text <=> root.ntp-server;
+                                placeholder: "如：ntp.aliyun.com";
+                            }
+                            SecondaryButton {
+                                width: 88px;
+                                enabled: !root.is-syncing;
+                                label: root.is-syncing ? "校时中" : "立即校时";
+                                clicked => { root.sync-ntp(); }
+                            }
+                        }
+                    }
+                }
+
+                // 分组 6：系统自启
+                Rectangle {
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: ThemeStore.palette.border-hairline;
+                    background: ThemeStore.palette.surface;
+
+                    HorizontalLayout {
+                        padding: 14px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 2px;
+                            Text {
+                                text: "开机自动启动";
+                                color: ThemeStore.palette.text-primary;
+                                font-size: 13px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "随 Windows 登录自动隐身启动并驻留右下角托盘";
+                                color: ThemeStore.palette.text-muted;
+                                font-size: 12px;
+                            }
+                        }
+                        SwitchToggle {
+                            checked <=> root.auto-start;
+                        }
+                    }
+                }
+
+                // 分组 7：后台版本检查与更新
+                Rectangle {
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: ThemeStore.palette.border-hairline;
+                    background: ThemeStore.palette.surface;
+
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+
+                        HorizontalLayout {
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "后台定期检查版本更新";
+                                color: ThemeStore.palette.text-primary;
+                                font-size: 13px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            SwitchToggle {
+                                checked <=> root.update-check-enabled;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                width: 70px;
+                                text: "清单地址";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            StyledInput {
+                                horizontal-stretch: 1;
+                                text <=> root.update-check-url;
+                                placeholder: "支持 version.json / GitHub Releases / Google Drive / \\\\局域网路径";
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                width: 70px;
+                                text: "检查间隔";
+                                color: ThemeStore.palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            NumberStepper {
+                                value <=> root.update-check-interval-hours;
+                                min: 1;
+                                max: 168;
+                                pad-two: false;
+                                enabled: root.update-check-enabled;
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "小时（1–168）";
+                                color: ThemeStore.palette.text-muted;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            SecondaryButton {
+                                width: 88px;
+                                enabled: !root.is-checking-update;
+                                label: root.is-checking-update ? "检查中" : "立即检查";
+                                clicked => { root.check-update-now(); }
+                            }
+                        }
+
+                        if root.update-status-text != "" : Text {
+                            text: root.update-status-text;
+                            color: ThemeStore.palette.text-muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 校验失败提示条（输入非法时显式拦截并解释原因）
+        if root.validation-error != "" : Rectangle {
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: ThemeStore.palette.status-err;
+            background: ThemeStore.palette.surface;
+            HorizontalLayout {
+                padding: 10px;
+                Text {
+                    text: root.validation-error;
+                    color: ThemeStore.palette.status-err;
+                    font-size: 12px;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        // 底部保存 / 取消按钮
+        HorizontalLayout {
+            height: 36px;
+            spacing: 10px;
+            Rectangle { horizontal-stretch: 1; }
+            SecondaryButton {
+                width: 96px;
+                label: "取消";
+                clicked => { root.cancel-clicked(); }
+            }
+            PrimaryButton {
+                width: 110px;
+                label: "确定保存";
+                clicked => { root.save-clicked(); }
+            }
+        }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 关于窗口（由托盘右键菜单“关于”呼出，圆角无系统边框，居中显示）
+// ============================================================================
+export component AboutWindow inherits Window {
+    title: "关于半整点提醒";
+    icon: @image-url("../assets/app_icon_512.png");
+    default-font-family: "Microsoft YaHei UI";
+    preferred-width: 452px;
+    preferred-height: 372px;
+    min-width: 430px;
+    min-height: 350px;
+    no-frame: true;
+    background: transparent;
+
+    in property <string> app-version: "v2.0.0+20261114";
+    in property <string> app-vendor: "Z.W.&AI";
+    in property <string> config-path: "config.json";
+    in property <string> update-status-text: "后台自动检查更新已就绪";
+    in property <bool> is-checking-update: false;
+    in property <bool> has-update: false;
+
+    callback drag-window(length, length);
+    callback minimize-window();
+    callback check-update-now();
+    callback download-update();
+    callback close-clicked();
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: WindowStyle.corner-radius;
+        clip: true;
+        border-width: WindowStyle.border-width;
+        border-color: ThemeStore.palette.border-hairline;
+        background: ThemeStore.palette.canvas;
+
+        VerticalLayout {
+            padding: WindowStyle.border-width;
+            spacing: 0px;
+
+            CustomTitleBar {
+                title-text: "关于半整点提醒";
+                drag-window(dx, dy) => { root.drag-window(dx, dy); }
+                minimize-clicked => { root.minimize-window(); }
+                close-clicked => { root.close-clicked(); }
+            }
+
+            VerticalLayout {
+                vertical-stretch: 1;
+                padding: 18px;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    spacing: 14px;
+                    Image {
+                        source: @image-url("../assets/app_icon_512.png");
+                        width: 48px;
+                        height: 48px;
+                        image-fit: contain;
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        alignment: center;
+                        spacing: 4px;
+                        Text {
+                            text: "半整点提醒";
+                            color: ThemeStore.palette.text-primary;
+                            font-size: 17px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: "当前版本：" + root.app-version;
+                            color: ThemeStore.palette.accent;
+                            font-family: "Consolas";
+                            font-size: 12px;
+                            font-weight: 600;
+                        }
+                    }
+                }
+
+                Text {
+                    text: "一款轻量、安静的 Windows 桌面半整点报时与定时提醒工具。零外部依赖、低内存常驻，支持多主题切换、真实时间语音播报、自定义音频与网络校时。";
+                    color: ThemeStore.palette.text-secondary;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: ThemeStore.palette.border-hairline;
+                    background: ThemeStore.palette.surface;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                width: 68px;
+                                text: "发行出品：";
+                                color: ThemeStore.palette.text-muted;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: root.app-vendor;
+                                color: ThemeStore.palette.text-primary;
+                                font-family: "Consolas";
+                                font-size: 12px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Rectangle {
+                            height: 1px;
+                            background: ThemeStore.palette.border-hairline;
+                        }
+
+                        Text {
+                            text: "配置文件路径：";
+                            color: ThemeStore.palette.text-muted;
+                            font-size: 12px;
+                        }
+                        Text {
+                            text: root.config-path;
+                            color: ThemeStore.palette.text-secondary;
+                            font-family: "Consolas";
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.update-status-text;
+                    color: root.has-update ? ThemeStore.palette.accent : ThemeStore.palette.text-muted;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    SecondaryButton {
+                        width: 104px;
+                        enabled: !root.is-checking-update;
+                        label: root.is-checking-update ? "检查中..." : "检查更新";
+                        clicked => { root.check-update-now(); }
+                    }
+                    if root.has-update : PrimaryButton {
+                        width: 108px;
+                        label: "自动更新";
+                        clicked => { root.download-update(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    PrimaryButton {
+                        width: 88px;
+                        label: "关闭";
+                        clicked => { root.close-clicked(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 发现新版本提示弹窗（圆角无系统边框，居中显示，支持自动更新下载临时包并触发平滑重启）
+// ============================================================================
+export component UpdateWindow inherits Window {
+    title: "发现新版本";
+    icon: @image-url("../assets/app_icon_512.png");
+    default-font-family: "Microsoft YaHei UI";
+    preferred-width: 452px;
+    preferred-height: 360px;
+    min-width: 430px;
+    min-height: 340px;
+    no-frame: true;
+    background: transparent;
+
+    in property <string> current-version: "v2.0.0+20261114";
+    in property <string> remote-version: "";
+    in property <string> release-notes: "包含稳定性优化与功能改进，建议更新体验。";
+    in property <bool> is-downloading: false;
+    in property <int> download-progress: 0;
+    in property <string> download-status-text: "";
+
+    callback drag-window(length, length);
+    callback minimize-window();
+    callback close-clicked();
+    callback auto-update-clicked();
+    callback browser-download-clicked();
+    callback later-clicked();
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: WindowStyle.corner-radius;
+        clip: true;
+        border-width: WindowStyle.border-width;
+        border-color: ThemeStore.palette.border-hairline;
+        background: ThemeStore.palette.canvas;
+
+        VerticalLayout {
+            padding: WindowStyle.border-width;
+            spacing: 0px;
+
+            CustomTitleBar {
+                title-text: "发现新版本 · 在线升级";
+                drag-window(dx, dy) => { root.drag-window(dx, dy); }
+                minimize-clicked => { root.minimize-window(); }
+                close-clicked => { root.close-clicked(); }
+            }
+
+            VerticalLayout {
+                vertical-stretch: 1;
+                padding: 18px;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    spacing: 12px;
+                    Image {
+                        source: @image-url("../assets/app_icon_512.png");
+                        width: 42px;
+                        height: 42px;
+                        image-fit: contain;
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        alignment: center;
+                        spacing: 2px;
+                        Text {
+                            text: "发现新版本 " + root.remote-version;
+                            color: ThemeStore.palette.text-primary;
+                            font-size: 15px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: "当前版本：" + root.current-version + "  →  最新版本：" + root.remote-version;
+                            color: ThemeStore.palette.accent;
+                            font-family: "Consolas";
+                            font-size: 12px;
+                            font-weight: 600;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: ThemeStore.palette.border-hairline;
+                    background: ThemeStore.palette.surface;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 4px;
+                        Text {
+                            text: "更新说明：";
+                            color: ThemeStore.palette.text-muted;
+                            font-size: 12px;
+                        }
+                        Text {
+                            text: root.release-notes;
+                            color: ThemeStore.palette.text-secondary;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                // 自动更新下载进度条与状态文本
+                if root.is-downloading || root.download-status-text != "" : VerticalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: root.download-status-text;
+                        color: root.is-downloading ? ThemeStore.palette.accent : ThemeStore.palette.status-err;
+                        font-size: 12px;
+                        font-weight: 500;
+                        overflow: elide;
+                    }
+                    if root.is-downloading : Rectangle {
+                        height: 6px;
+                        border-radius: 3px;
+                        background: ThemeStore.palette.border-hairline;
+                        Rectangle {
+                            x: 0;
+                            y: 0;
+                            height: parent.height;
+                            width: parent.width * (Math.clamp(root.download-progress, 0, 100) / 100.0);
+                            border-radius: 3px;
+                            background: ThemeStore.palette.accent;
+                            animate width { duration: 120ms; }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 36px;
+                    GhostButton {
+                        y: (parent.height - self.height) / 2;
+                        label: "浏览器下载";
+                        clicked => { root.browser-download-clicked(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    SecondaryButton {
+                        width: 92px;
+                        enabled: !root.is-downloading;
+                        label: "稍后提醒";
+                        clicked => { root.later-clicked(); }
+                    }
+                    PrimaryButton {
+                        width: 124px;
+                        enabled: !root.is-downloading;
+                        label: root.is-downloading ? "正在下载..." : "自动更新";
+                        clicked => { root.auto-update-clicked(); }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,82 @@
+// 统一语义色彩令牌与三套主题配置（严格遵循 60-30-10 配比与 WCAG AA 对比度）
+export struct ThemePalette {
+    name: string,
+    is-dark: bool,
+    // 60% 主画布与次级背景
+    canvas: color,
+    // 30% 结构卡片与表单输入底色
+    surface: color,
+    surface-hover: color,
+    input-bg: color,
+    border-hairline: color,
+    // 文本层级
+    text-primary: color,
+    text-secondary: color,
+    text-muted: color,
+    // 10% 高意图焦点强调色
+    accent: color,
+    accent-hover: color,
+    accent-fg: color,
+    // 语义状态色（界面中始终配合文字说明展示，避免纯色盲区）
+    status-ok: color,
+    status-warn: color,
+    status-err: color,
+}
+
+export global ThemeStore {
+    // 0: 暗夜曜石 | 1: 晨曦云母 | 2: 暖金咖啡馆（默认）
+    in-out property <int> active-index: 2;
+
+    out property <ThemePalette> palette: active-index == 1 ? {
+        name: "晨曦云母",
+        is-dark: false,
+        canvas: #F4F6F9,
+        surface: #FFFFFF,
+        surface-hover: #F1F5F9,
+        input-bg: #F8FAFC,
+        border-hairline: #E2E8F0,
+        text-primary: #0F172A,
+        text-secondary: #334155,
+        text-muted: #64748B,
+        accent: #2563EB,
+        accent-hover: #1D4ED8,
+        accent-fg: #FFFFFF,
+        status-ok: #16A34A,
+        status-warn: #D97706,
+        status-err: #DC2626,
+    } : active-index == 2 ? {
+        name: "暖金咖啡馆",
+        is-dark: false,
+        canvas: #F5F1E8,
+        surface: #FCFBF7,
+        surface-hover: #EFE9DA,
+        input-bg: #F8F5EE,
+        border-hairline: #E2DAC6,
+        text-primary: #292218,
+        text-secondary: #574B3A,
+        text-muted: #7C6E5A,
+        accent: #B45309,
+        accent-hover: #92400E,
+        accent-fg: #FFFFFF,
+        status-ok: #15803D,
+        status-warn: #C2410C,
+        status-err: #B91C1C,
+    } : {
+        name: "暗夜曜石",
+        is-dark: true,
+        canvas: #0D1117,
+        surface: #151B24,
+        surface-hover: #1E2733,
+        input-bg: #0E131A,
+        border-hairline: #303B4C,
+        text-primary: #F8FAFC,
+        text-secondary: #E2E8F0,
+        text-muted: #A9B7CA,
+        accent: #38BDF8,
+        accent-hover: #0EA5E9,
+        accent-fg: #082F49,
+        status-ok: #22C55E,
+        status-warn: #F59E0B,
+        status-err: #EF4444,
+    };
+}

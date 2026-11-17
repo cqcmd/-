@@ -1,0 +1,10 @@
+node_modules/
+build/
+dist/
+windows-native/target/
+windows-native/dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example

@@ -1,0 +1,6 @@
+# 静态链接 MSVC 运行时库 (/MT)，确保在未安装 VC++ Redistributable 的网吧/精简版 Windows 上双击即用
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

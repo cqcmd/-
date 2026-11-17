@@ -1,0 +1,6 @@
+{
+  "name": "半整点提醒 · Windows 原生源码框架",
+  "description": "面向网吧、电竞酒店与集中值守场景的 Windows 原生单文件报时工具技术方案与 Rust + Slint 源码框架。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
