@@ -171,18 +171,19 @@ jobs:
           $manifestPath = Join-Path $PWD "windows-native/dist/version.json"
           [System.IO.File]::WriteAllText($manifestPath, $manifest, (New-Object System.Text.UTF8Encoding($false)))
 
-          $releaseBody = @"
-## 半整点提醒 Windows 原生单文件版 (``v$ver``)
-
-### 本次更新内容
-$changelogMd
-
-### 构建与交付说明
-- **版本号规则**：三段式 + 日期（每段满 10 进位），本次版本 ``$ver``（PE 文件版本同步更新）
-- **编译平台**：Windows x86_64（MSVC 静态链接，零外部运行库依赖）
-- **交付文件**：``HalfHourChime.exe``（双击即用）与 ``version.json``
-- **自动更新接口地址**：``https://github.com/$env:GITHUB_REPOSITORY/releases/latest``
-"@
+          $releaseLines = @(
+            "## 半整点提醒 Windows 原生单文件版 (``v$ver``)",
+            "",
+            "### 本次更新内容",
+            "$changelogMd",
+            "",
+            "### 构建与交付说明",
+            "- **版本号规则**：三段式 + 日期（每段满 10 进位），本次版本 ``$ver``（PE 文件版本同步更新）",
+            "- **编译平台**：Windows x86_64（MSVC 静态链接，零外部运行库依赖）",
+            "- **交付文件**：``HalfHourChime.exe``（双击即用）与 ``version.json``",
+            "- **自动更新接口地址**：``https://github.com/$env:GITHUB_REPOSITORY/releases/latest``"
+          )
+          $releaseBody = $releaseLines -join "`n"
           $notesPath = Join-Path $PWD "windows-native/dist/release_notes.md"
           [System.IO.File]::WriteAllText($notesPath, $releaseBody, (New-Object System.Text.UTF8Encoding($false)))
 
