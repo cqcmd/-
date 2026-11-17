@@ -1030,106 +1030,272 @@ pub fn open_logs_folder() -> Result<(), String> {
     }
 }
 
-/// 生成独立分离的 Windows 批处理升级器，在当前进程退出释放文件锁后替换可执行文件并平滑重启
-pub fn spawn_detached_updater_and_restart(
+/// 原地升级重启执行计划（完全免除 cmd.exe / ping.exe，不弹出任何控制台窗口）
+#[derive(Debug, Clone)]
+pub enum UpdateLaunchPlan {
+    /// 可写目录已完成原地替换：主进程释放互斥锁与端口后直接拉起新版本 exe
+    DirectRelaunch(std::path::PathBuf),
+    /// 已通过 UAC 拉起 GUI 子系统提权副本：主进程只需立即释放锁并退出
+    ElevatedAlreadySpawned,
+    /// 安装包模式（.msi / setup.exe）：主进程释放锁后直接打开安装程序
+    RunInstaller(std::path::PathBuf),
+}
+
+fn build_old_backup_path(exe_path: &std::path::Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.old", exe_path.to_string_lossy()))
+}
+
+fn is_dir_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(format!(".chime_update_probe_{}.tmp", std::process::id()));
+    match std::fs::write(&probe, b"ok") {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 准备自动更新替换与重启计划：
+/// - 便携单文件且目录可写：直接利用 Windows 允许重命名运行中 exe 的特性，先改名为 `.old` 再跨盘复制新版本（零外部进程/零控制台窗）
+/// - 受保护目录（如 Program Files）：通过 UAC 提权启动刚下载好的 GUI 子系统自身副本（`--apply-elevated-update`），全程无 cmd/ping 弹窗
+pub fn prepare_update_and_build_launch(
     temp_package_path: &std::path::Path,
     is_installer_mode: bool,
-) -> Result<(), String> {
+) -> Result<UpdateLaunchPlan, String> {
+    if is_installer_mode {
+        log_info(
+            "updater",
+            &format!("prepared installer launch path=\"{}\"", temp_package_path.display()),
+        );
+        return Ok(UpdateLaunchPlan::RunInstaller(temp_package_path.to_path_buf()));
+    }
+
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        use std::process::Command;
-
         let current_exe =
             std::env::current_exe().map_err(|e| format!("获取当前程序路径失败：{e}"))?;
-        let pid = std::process::id();
-        let script_path = std::env::temp_dir().join(format!("half_hour_chime_updater_{pid}.cmd"));
+        let writable = current_exe
+            .parent()
+            .map(is_dir_writable)
+            .unwrap_or(false);
+
+        if writable {
+            let old_backup = build_old_backup_path(&current_exe);
+            let _ = std::fs::remove_file(&old_backup);
+
+            match std::fs::rename(&current_exe, &old_backup) {
+                Ok(()) => {
+                    let copy_res = std::fs::copy(temp_package_path, &current_exe).and_then(|copied| {
+                        if copied < 64 * 1024 {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "copied exe size too small",
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    match copy_res {
+                        Ok(()) => {
+                            let _ = std::fs::remove_file(temp_package_path);
+                            log_info(
+                                "updater",
+                                &format!(
+                                    "in-place exe replaced silently dst=\"{}\" backup=\"{}\"",
+                                    current_exe.display(),
+                                    old_backup.display()
+                                ),
+                            );
+                            return Ok(UpdateLaunchPlan::DirectRelaunch(current_exe));
+                        }
+                        Err(copy_err) => {
+                            let _ = std::fs::rename(&old_backup, &current_exe);
+                            log_warn("updater", &format!("in-place copy failed, rolled back: {copy_err}"));
+                            return Err(format!("写入新版本程序失败：{copy_err}"));
+                        }
+                    }
+                }
+                Err(rename_err) => {
+                    log_warn(
+                        "updater",
+                        &format!("in-place rename failed ({rename_err}), falling back to elevated self-apply"),
+                    );
+                }
+            }
+        }
+
+        // 受保护目录或重命名受阻：用下载好的 GUI 子系统 exe 自身请求 UAC 提权完成替换（无控制台窗）
+        use windows::core::{w, HSTRING, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
         let src_str = temp_package_path.to_string_lossy().replace('"', "");
         let dst_str = current_exe.to_string_lossy().replace('"', "");
+        let exe_h = HSTRING::from(src_str.as_str());
+        let params = HSTRING::from(format!(
+            "--apply-elevated-update \"{src_str}\" \"{dst_str}\""
+        ));
 
-        let script = if is_installer_mode {
-            format!(
-                "@echo off\r\nchcp 65001 >nul\r\nping -n 2 127.0.0.1 >nul\r\nstart \"\" \"{src_str}\"\r\n(goto) 2>nul & del \"%~f0\"\r\n"
-            )
-        } else {
-            format!(
-                "@echo off\r\nchcp 65001 >nul\r\nset \"SRC={src_str}\"\r\nset \"DST={dst_str}\"\r\nfor /L %%i in (1,1,15) do (\r\n    move /Y \"%SRC%\" \"%DST%\" >nul 2>nul\r\n    if not errorlevel 1 goto launched\r\n    ping -n 2 127.0.0.1 >nul\r\n)\r\nexit /b 1\r\n:launched\r\nstart \"\" \"%DST%\" --show\r\n(goto) 2>nul & del \"%~f0\"\r\n"
+        let res = unsafe {
+            ShellExecuteW(
+                None,
+                w!("runas"),
+                PCWSTR(exe_h.as_ptr()),
+                PCWSTR(params.as_ptr()),
+                None,
+                SW_SHOWNORMAL,
             )
         };
-
-        std::fs::write(&script_path, script.as_bytes())
-            .map_err(|e| format!("写入升级辅助脚本失败：{e}"))?;
-
-        let needs_elevation = if is_installer_mode {
-            false
-        } else if let Some(parent) = current_exe.parent() {
-            let probe = parent.join(".chime_update_probe.tmp");
-            match std::fs::write(&probe, b"ok") {
-                Ok(_) => {
-                    let _ = std::fs::remove_file(&probe);
-                    false
-                }
-                Err(_) => true,
-            }
-        } else {
-            false
-        };
-
-        if needs_elevation {
-            use windows::core::{w, HSTRING, PCWSTR};
-            use windows::Win32::UI::Shell::ShellExecuteW;
-            use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
-
-            let params = HSTRING::from(format!("/C \"{}\"", script_path.to_string_lossy()));
-            let res = unsafe {
-                ShellExecuteW(
-                    None,
-                    w!("runas"),
-                    w!("cmd.exe"),
-                    PCWSTR(params.as_ptr()),
-                    None,
-                    SW_HIDE,
-                )
-            };
-            if (res.0 as usize) <= 32 {
-                let _ = std::fs::remove_file(&script_path);
-                log_warn("updater", "elevated detached updater canceled by UAC");
-                return Err("管理员授权被取消，无法替换受保护目录中的程序文件".to_string());
-            }
-            log_info(
-                "updater",
-                &format!(
-                    "spawned elevated detached updater script=\"{}\" installer_mode={is_installer_mode}",
-                    script_path.display()
-                ),
-            );
-        } else {
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-
-            Command::new("cmd.exe")
-                .args(["/C", &script_path.to_string_lossy()])
-                .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-                .spawn()
-                .map_err(|e| format!("启动升级重启进程失败：{e}"))?;
-            log_info(
-                "updater",
-                &format!(
-                    "spawned detached updater script=\"{}\" installer_mode={is_installer_mode}",
-                    script_path.display()
-                ),
-            );
+        if (res.0 as usize) <= 32 {
+            log_warn("updater", "elevated GUI self-updater canceled by UAC");
+            return Err("管理员授权被取消，无法替换受保护目录中的程序文件".to_string());
         }
 
-        Ok(())
+        log_info(
+            "updater",
+            &format!(
+                "spawned elevated GUI self-updater src=\"{}\" dst=\"{}\"",
+                temp_package_path.display(),
+                current_exe.display()
+            ),
+        );
+        Ok(UpdateLaunchPlan::ElevatedAlreadySpawned)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (temp_package_path, is_installer_mode);
-        Ok(())
+        let _ = temp_package_path;
+        Ok(UpdateLaunchPlan::ElevatedAlreadySpawned)
     }
+}
+
+/// 在主线程释放单实例互斥锁与本地端口之后执行最终启动动作
+pub fn execute_update_launch_plan(plan: &UpdateLaunchPlan) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        match plan {
+            UpdateLaunchPlan::DirectRelaunch(exe_path) => {
+                std::process::Command::new(exe_path)
+                    .arg("--show")
+                    .spawn()
+                    .map_err(|e| format!("启动新版本程序失败：{e}"))?;
+            }
+            UpdateLaunchPlan::RunInstaller(installer_path) => {
+                use windows::core::{w, HSTRING, PCWSTR};
+                use windows::Win32::UI::Shell::ShellExecuteW;
+                use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+                let path_h = HSTRING::from(installer_path.to_string_lossy().as_ref());
+                let res = unsafe {
+                    ShellExecuteW(
+                        None,
+                        w!("open"),
+                        PCWSTR(path_h.as_ptr()),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    )
+                };
+                if (res.0 as usize) <= 32 {
+                    return Err("无法启动安装程序".to_string());
+                }
+            }
+            UpdateLaunchPlan::ElevatedAlreadySpawned => {}
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = plan;
+    }
+    Ok(())
+}
+
+/// 提权自更新 CLI 模式（GUI 子系统运行，零控制台窗口）：等待旧进程退出 -> 原地替换 -> 拉起新版并清理临时文件
+pub fn run_elevated_update_apply_mode(src_path: &std::path::Path, dst_path: &std::path::Path) -> i32 {
+    #[cfg(target_os = "windows")]
+    {
+        use std::time::Duration;
+
+        std::thread::sleep(Duration::from_millis(350));
+        let old_backup = build_old_backup_path(dst_path);
+
+        for _ in 0..24 {
+            let _ = std::fs::remove_file(&old_backup);
+            if dst_path.exists() {
+                let _ = std::fs::rename(dst_path, &old_backup);
+            }
+            if let Ok(copied) = std::fs::copy(src_path, dst_path) {
+                if copied >= 64 * 1024 {
+                    let _ = std::fs::remove_file(&old_backup);
+                    let src_clean = src_path.to_string_lossy().to_string();
+                    let _ = std::process::Command::new(dst_path)
+                        .args(["--show", "--cleanup-temp", &src_clean])
+                        .spawn();
+                    return 0;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        1
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (src_path, dst_path);
+        0
+    }
+}
+
+/// 启动后静默清理上次原地升级遗留的 `.old` 备份文件及临时安装包（无任何控制台窗口）
+pub fn spawn_cleanup_stale_update_files(cleanup_temp_arg: Option<String>) {
+    let current_exe = std::env::current_exe().ok();
+    let _ = std::thread::Builder::new()
+        .name("update-cleanup-worker".to_string())
+        .spawn(move || {
+            for attempt in 0..12 {
+                let mut all_done = true;
+
+                if let Some(ref exe) = current_exe {
+                    let old_backup = build_old_backup_path(exe);
+                    if old_backup.exists() && std::fs::remove_file(&old_backup).is_err() {
+                        all_done = false;
+                    }
+                }
+
+                if let Some(ref temp_str) = cleanup_temp_arg {
+                    let p = std::path::Path::new(temp_str);
+                    if p.exists() && std::fs::remove_file(p).is_err() {
+                        all_done = false;
+                    }
+                }
+
+                if attempt == 0 {
+                    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if (name.starts_with("HalfHourChime_update_")
+                                || name.starts_with("half_hour_chime_updater_"))
+                                && entry
+                                    .metadata()
+                                    .and_then(|m| m.modified())
+                                    .ok()
+                                    .and_then(|t| t.elapsed().ok())
+                                    .map(|age| age > std::time::Duration::from_secs(3600))
+                                    .unwrap_or(false)
+                            {
+                                let _ = std::fs::remove_file(entry.path());
+                            }
+                        }
+                    }
+                }
+
+                if all_done {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        });
 }
 
 /// 呼出 Windows 原生文件选择器，允许用户挑选餐饮提醒自定义音频文件（支持 WAV/MP3/OGG/FLAC）

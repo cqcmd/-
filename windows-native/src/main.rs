@@ -128,8 +128,7 @@ mod perf_guard {
         threshold_bytes: u64,
         cooldown: Duration,
     ) -> GcDecision {
-        let exceeded =
-            sample.working_set_bytes > threshold_bytes || sample.private_bytes > threshold_bytes;
+        let exceeded = sample.working_set_bytes > threshold_bytes;
         if !exceeded {
             return GcDecision::None;
         }
@@ -1508,12 +1507,13 @@ fn open_downloaded_update(ctx: &UpdateContext, about_w: &AboutWindow) {
     }
 }
 
-/// 执行“自动更新”：流式下载临时安装包 -> 校验 PE 可执行头部 -> 拉起分离升级脚本 -> 释放单实例锁并重启
+/// 执行“自动更新”：流式下载临时安装包 -> 校验 PE 可执行头部 -> 原地无感替换（免 cmd/ping 窗口）-> 释放锁与端口并重启
 fn download_and_apply_auto_update(
     ctx: &UpdateContext,
     update_w: &UpdateWindow,
     update_tx: &Sender<UpdateWorkerMsg>,
     perf_stop_tx: &Sender<()>,
+    web_console: &Rc<RefCell<WebConsoleController>>,
     audio: &AudioEngine,
     single_instance_guard: &Rc<RefCell<Option<win_sys::SingleInstanceGuard>>>,
 ) {
@@ -1571,21 +1571,39 @@ fn download_and_apply_auto_update(
     let u_tx_clone = update_tx.clone();
     let perf_tx_clone = perf_stop_tx.clone();
     let audio_clone = audio.clone();
-    // 使用通道通知主线程执行优雅退出与平滑重启（确保在主线程释放 Rc<RefCell<SingleInstanceGuard>>）
-    let (restart_tx, restart_rx) = mpsc::channel::<()>();
+    // 使用通道通知主线程执行优雅退出与平滑重启（确保在主线程释放互斥锁与 Web 端口后再拉起新版）
+    let (restart_tx, restart_rx) = mpsc::channel::<win_sys::UpdateLaunchPlan>();
     {
         let guard_rc = Rc::clone(single_instance_guard);
+        let wc_exit = Rc::clone(web_console);
+        let uw_w_exit = uw_weak.clone();
+        let ctx_exit = ctx.clone();
         let u_tx_exit = u_tx_clone.clone();
         let perf_tx_exit = perf_tx_clone.clone();
         let audio_exit = audio_clone.clone();
         let restart_poll = Timer::default();
         restart_poll.start(TimerMode::Repeated, Duration::from_millis(80), move || {
-            if restart_rx.try_recv().is_ok() {
+            if let Ok(plan) = restart_rx.try_recv() {
                 let _ = u_tx_exit.send(UpdateWorkerMsg::Shutdown);
                 let _ = perf_tx_exit.send(());
+                wc_exit.borrow_mut().stop();
                 audio_exit.shutdown();
-                // 必须在退出前释放单实例互斥锁，防止重启后的新版本被误判为重复启动
+                // 必须在拉起新版前释放单实例互斥锁，防止新版本被误判为重复启动
                 let _ = guard_rc.borrow_mut().take();
+                win_sys::flush_logs();
+                if let Err(err) = win_sys::execute_update_launch_plan(&plan) {
+                    win_sys::log_error("updater", &format!("execute_update_launch_plan failed: {err}"));
+                    ctx_exit.is_downloading.store(false, Ordering::SeqCst);
+                    if let Ok(mut ds) = ctx_exit.download_status_text.lock() {
+                        *ds = err.clone();
+                    }
+                    if let Some(uw) = uw_w_exit.upgrade() {
+                        uw.set_is_downloading(false);
+                        uw.set_download_progress(0);
+                        uw.set_download_status_text(err.into());
+                    }
+                    return;
+                }
                 let _ = slint::quit_event_loop();
             }
         });
@@ -1778,31 +1796,32 @@ fn download_and_apply_auto_update(
                         }
                     });
 
-                    if let Err(err) =
-                        win_sys::spawn_detached_updater_and_restart(&temp_pkg_path, is_installer_mode)
-                    {
-                        let _ = std::fs::remove_file(&temp_pkg_path);
-                        ctx_clone.is_downloading.store(false, Ordering::SeqCst);
-                        let uw_w2 = uw_weak.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(uw) = uw_w2.upgrade() {
-                                uw.set_is_downloading(false);
-                                uw.set_download_status_text(err.into());
+                    let launch_plan = match win_sys::prepare_update_and_build_launch(
+                        &temp_pkg_path,
+                        is_installer_mode,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(err) => {
+                            let _ = std::fs::remove_file(&temp_pkg_path);
+                            ctx_clone.is_downloading.store(false, Ordering::SeqCst);
+                            if let Ok(mut ds) = ctx_clone.download_status_text.lock() {
+                                *ds = err.clone();
                             }
-                        });
-                        return;
-                    }
+                            let uw_w2 = uw_weak.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(uw) = uw_w2.upgrade() {
+                                    uw.set_is_downloading(false);
+                                    uw.set_download_status_text(err.into());
+                                }
+                            });
+                            return;
+                        }
+                    };
 
-                    // 通知主线程释放单实例锁并退出，由分离式升级器替换文件并自动重启
-                    win_sys::log_info(
-                        "updater",
-                        &format!(
-                            "temp package verified at \"{}\", signaling graceful restart",
-                            temp_pkg_path.display()
-                        ),
-                    );
+                    // 通知主线程释放单实例锁与本地端口并无缝重启新版本
+                    win_sys::log_info("updater", "temp package verified, signaling seamless restart");
                     win_sys::flush_logs();
-                    let _ = restart_tx.send(());
+                    let _ = restart_tx.send(launch_plan);
                 }
                 Err(err) => {
                     win_sys::log_error("updater", &format!("auto-update download failed: {err}"));
@@ -1985,7 +2004,7 @@ fn format_uptime(elapsed: Duration) -> String {
 }
 
 fn main() {
-    // 0. 检查是否为按需 UAC 提权校时子进程模式（--sync-ntp <server>）
+    // 0. 检查是否为按需 UAC 提权子进程模式（--sync-ntp 或 --apply-elevated-update）
     let args: Vec<String> = std::env::args().collect();
     if let Some(pos) = args.iter().position(|a| a == "--sync-ntp") {
         let server = args
@@ -1994,6 +2013,16 @@ fn main() {
             .unwrap_or("ntp.aliyun.com");
         let code = ntp::run_elevated_cli_mode(server);
         std::process::exit(code);
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--apply-elevated-update") {
+        if let (Some(src), Some(dst)) = (args.get(pos + 1), args.get(pos + 2)) {
+            let code = win_sys::run_elevated_update_apply_mode(
+                std::path::Path::new(src),
+                std::path::Path::new(dst),
+            );
+            std::process::exit(code);
+        }
+        std::process::exit(1);
     }
 
     // 1. 单实例互斥锁检查（FR-24 / AC-09），支持自动更新重启前主动释放
@@ -2004,6 +2033,12 @@ fn main() {
         }
         Err(_) => None,
     }));
+
+    let cleanup_temp_arg = args
+        .iter()
+        .position(|a| a == "--cleanup-temp")
+        .and_then(|pos| args.get(pos + 1).cloned());
+    win_sys::spawn_cleanup_stale_update_files(cleanup_temp_arg);
 
     // 2. 加载或初始化本地结构化配置（3.1 / 4.2），并初始化按大小自动轮转的调试日志器
     let config_store = ConfigStore::resolve();
@@ -2331,6 +2366,7 @@ fn main() {
         let uw_weak = update_win.as_weak();
         let u_tx = update_tx.clone();
         let perf_tx = perf_stop_tx.clone();
+        let wc_rc = Rc::clone(&web_console);
         let audio_clone = audio.clone();
         let guard_rc = Rc::clone(&single_instance_guard);
         main_win.on_download_update(move || {
@@ -2340,6 +2376,7 @@ fn main() {
                     &uw,
                     &u_tx,
                     &perf_tx,
+                    &wc_rc,
                     &audio_clone,
                     &guard_rc,
                 );
@@ -2876,6 +2913,7 @@ fn main() {
         let uw_weak = update_win.as_weak();
         let u_tx = update_tx.clone();
         let perf_tx = perf_stop_tx.clone();
+        let wc_rc = Rc::clone(&web_console);
         let audio_clone = audio.clone();
         let guard_rc = Rc::clone(&single_instance_guard);
         about_win.on_download_update(move || {
@@ -2885,6 +2923,7 @@ fn main() {
                     &uw,
                     &u_tx,
                     &perf_tx,
+                    &wc_rc,
                     &audio_clone,
                     &guard_rc,
                 );
@@ -2896,6 +2935,7 @@ fn main() {
         let uw_weak = update_win.as_weak();
         let u_tx = update_tx.clone();
         let perf_tx = perf_stop_tx.clone();
+        let wc_rc = Rc::clone(&web_console);
         let audio_clone = audio.clone();
         let guard_rc = Rc::clone(&single_instance_guard);
         update_win.on_auto_update_clicked(move || {
@@ -2905,6 +2945,7 @@ fn main() {
                     &uw,
                     &u_tx,
                     &perf_tx,
+                    &wc_rc,
                     &audio_clone,
                     &guard_rc,
                 );
@@ -3228,6 +3269,7 @@ fn main() {
                                 &uw,
                                 &u_tx_tick,
                                 &perf_stop_tick,
+                                &wc_tick,
                                 &audio_clone,
                                 &guard_tick,
                             );
