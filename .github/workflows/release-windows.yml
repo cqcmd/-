@@ -83,7 +83,8 @@ jobs:
             package_type = "portable"
             notes        = $notes
           } | ConvertTo-Json -Depth 4
-          [System.IO.File]::WriteAllText("windows-native/dist/version.json", $manifest, (New-Object System.Text.UTF8Encoding($false)))
+          $manifestPath = Join-Path $PWD "windows-native/dist/version.json"
+          [System.IO.File]::WriteAllText($manifestPath, $manifest, (New-Object System.Text.UTF8Encoding($false)))
 
           "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
