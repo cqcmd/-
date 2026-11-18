@@ -1,3 +1,4 @@
+use crate::config::CustomAlarm;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -18,11 +19,13 @@ pub struct WebSnapshot {
     pub current_date: String,
     pub mute_mode: bool,
     pub is_quiet_now: bool,
+    pub is_audio_playing: bool,
     pub quiet_summary: String,
     pub next_event_title: String,
     pub next_event_time: String,
     pub next_event_countdown: String,
     pub chime_minutes: String,
+    pub enabled_alarms_count: usize,
     pub tts_engine: String,
     pub tts_engine_index: i32,
     pub edge_tts_voice: String,
@@ -41,7 +44,6 @@ pub struct WebSnapshot {
     pub config_path: String,
     pub log_path: String,
     pub today_calendar_preview: String,
-    pub holiday_feed_status: String,
     pub update_checking: bool,
     pub has_update: bool,
     pub update_version: String,
@@ -54,29 +56,22 @@ pub struct WebSnapshot {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct WebConfigView {
-    pub chime_minutes_str: String,
+    pub hourly_chime_enabled: bool,
+    pub half_hour_chime_enabled: bool,
+    pub custom_chime_minutes_str: String,
     pub chime_repeat_count: u8,
     pub chime_play_sound: bool,
     pub chime_tts_enabled: bool,
     pub chime_tts_template: String,
     pub holiday_enabled: bool,
     pub holiday_greeting_template: String,
-    pub holiday_custom_rules: String,
-    pub holiday_data_source_url: String,
     pub holiday_custom_audio_path: String,
     pub quiet_enabled: bool,
     pub quiet_start_hour: u8,
     pub quiet_start_minute: u8,
     pub quiet_end_hour: u8,
     pub quiet_end_minute: u8,
-    pub meal_enabled: bool,
-    pub meal_hour: u8,
-    pub meal_minute: u8,
-    pub meal_repeat_count: u8,
-    pub meal_play_chime_before_custom: bool,
-    pub meal_custom_audio_path: String,
-    pub meal_tts_enabled: bool,
-    pub meal_tts_text: String,
+    pub alarms: Vec<CustomAlarm>,
     pub tts_engine_index: i32,
     pub edge_voice_index: i32,
     pub tts_rate: i8,
@@ -92,29 +87,22 @@ pub struct WebConfigView {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct WebConfigPatch {
-    pub chime_minutes_str: Option<String>,
+    pub hourly_chime_enabled: Option<bool>,
+    pub half_hour_chime_enabled: Option<bool>,
+    pub custom_chime_minutes_str: Option<String>,
     pub chime_repeat_count: Option<u8>,
     pub chime_play_sound: Option<bool>,
     pub chime_tts_enabled: Option<bool>,
     pub chime_tts_template: Option<String>,
     pub holiday_enabled: Option<bool>,
     pub holiday_greeting_template: Option<String>,
-    pub holiday_custom_rules: Option<String>,
-    pub holiday_data_source_url: Option<String>,
     pub holiday_custom_audio_path: Option<String>,
     pub quiet_enabled: Option<bool>,
     pub quiet_start_hour: Option<u8>,
     pub quiet_start_minute: Option<u8>,
     pub quiet_end_hour: Option<u8>,
     pub quiet_end_minute: Option<u8>,
-    pub meal_enabled: Option<bool>,
-    pub meal_hour: Option<u8>,
-    pub meal_minute: Option<u8>,
-    pub meal_repeat_count: Option<u8>,
-    pub meal_play_chime_before_custom: Option<bool>,
-    pub meal_custom_audio_path: Option<String>,
-    pub meal_tts_enabled: Option<bool>,
-    pub meal_tts_text: Option<String>,
+    pub alarms: Option<Vec<CustomAlarm>>,
     pub tts_engine_index: Option<i32>,
     pub edge_voice_index: Option<i32>,
     pub tts_rate: Option<i8>,
@@ -138,6 +126,13 @@ struct VoicePreviewPayload {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
+struct TestAlarmPayload {
+    alarm_id: Option<u64>,
+    alarm: Option<CustomAlarm>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
 struct VolumePayload {
     volume: u8,
 }
@@ -157,12 +152,16 @@ struct NtpPayload {
 #[derive(Debug, Clone)]
 pub enum WebAction {
     TestChime,
+    StopAudio,
     TestVoice {
         tts_engine_index: Option<i32>,
         edge_voice_index: Option<i32>,
         tts_rate: Option<i8>,
     },
-    TestMeal,
+    TestAlarm {
+        alarm_id: Option<u64>,
+        inline_alarm: Option<CustomAlarm>,
+    },
     ToggleMute,
     SyncNtp {
         server: Option<String>,
@@ -170,7 +169,6 @@ pub enum WebAction {
     SetVolume(u8),
     SetTheme(i32),
     TrimMemory(Sender<Result<String, String>>),
-    RefreshHolidays(Sender<Result<String, String>>),
     CheckUpdate,
     ApplyUpdate,
     OpenLogs,
@@ -300,7 +298,7 @@ fn parse_content_length(headers_str: &str) -> usize {
         if let Some((k, v)) = line.split_once(':') {
             if k.trim().eq_ignore_ascii_case("content-length") {
                 if let Ok(len) = v.trim().parse::<usize>() {
-                    return len.min(128 * 1024);
+                    return len.min(256 * 1024);
                 }
             }
         }
@@ -588,6 +586,11 @@ fn handle_http_client(
             let body = json_ok("已触发测试报时");
             write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &body);
         }
+        ("POST", "/api/action/stop-audio") => {
+            let _ = action_tx.send(WebAction::StopAudio);
+            let body = json_ok("已停止当前音频或语音播报");
+            write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &body);
+        }
         ("POST", "/api/action/test-voice") => {
             let payload = serde_json::from_slice::<VoicePreviewPayload>(&req.body).unwrap_or_default();
             let _ = action_tx.send(WebAction::TestVoice {
@@ -598,9 +601,13 @@ fn handle_http_client(
             let body = json_ok("已触发音色试听");
             write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &body);
         }
-        ("POST", "/api/action/test-meal") => {
-            let _ = action_tx.send(WebAction::TestMeal);
-            let body = json_ok("已触发餐饮/定时提醒测试");
+        ("POST", "/api/action/test-alarm") => {
+            let payload = serde_json::from_slice::<TestAlarmPayload>(&req.body).unwrap_or_default();
+            let _ = action_tx.send(WebAction::TestAlarm {
+                alarm_id: payload.alarm_id,
+                inline_alarm: payload.alarm,
+            });
+            let body = json_ok("已触发自定义闹钟试听");
             write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &body);
         }
         ("POST", "/api/action/toggle-mute") => {
@@ -639,9 +646,6 @@ fn handle_http_client(
         }
         ("POST", "/api/action/trim-memory") => {
             send_sync_action(&mut stream, action_tx, WebAction::TrimMemory);
-        }
-        ("POST", "/api/action/refresh-holidays") => {
-            send_sync_action(&mut stream, action_tx, WebAction::RefreshHolidays);
         }
         ("POST", "/api/action/check-update") => {
             let _ = action_tx.send(WebAction::CheckUpdate);
@@ -684,7 +688,7 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>半整点提醒 · 本地运维控制台</title>
+<title>半整点提醒 · 本地管理控制台</title>
 <style>
   :root{
     --bg:#F5F1E8;--card:#FCFBF7;--surface2:#F3EDE0;--border:#E2DAC6;
@@ -703,7 +707,7 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
   }
   *{box-sizing:border-box}
   body{margin:0;padding:20px 16px 40px;font-family:"Microsoft YaHei UI",system-ui,sans-serif;background:var(--bg);color:var(--text);transition:background .15s,color .15s}
-  .wrap{max-width:960px;margin:0 auto;display:grid;gap:14px}
+  .wrap{max-width:980px;margin:0 auto;display:grid;gap:14px}
   .topbar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px}
   .brand{display:flex;align-items:baseline;gap:10px}
   .brand h1{margin:0;font-size:20px;font-weight:700}
@@ -713,33 +717,40 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
   .nav button.active{background:var(--card);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.08)}
   .panel{display:none;gap:14px}
   .panel.active{display:grid}
-  .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+  .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px}
   .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px 18px;display:grid;gap:12px}
-  .card-title{font-size:14px;font-weight:700;color:var(--text);display:flex;justify-content:space-between;align-items:center}
+  .card-title{font-size:14px;font-weight:700;color:var(--text);display:flex;justify-content:space-between;align-items:center;gap:8px}
   .clock{font-family:Consolas,monospace;font-size:38px;font-weight:700;letter-spacing:1px;line-height:1.1}
   .row{display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:13px}
   .muted{color:var(--muted);font-size:12px}
   .mono{font-family:Consolas,monospace}
-  .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+  .btn-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
   button{border:1px solid var(--border);background:var(--card);color:var(--text);padding:8px 13px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer}
   button:hover{border-color:var(--accent)}
   button:disabled{opacity:.55;cursor:not-allowed}
   button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+  button.danger{color:var(--err)}
   button.chip{padding:5px 10px;font-size:12px;border-radius:6px;background:var(--surface2)}
   button.chip.on{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
   .field{display:grid;gap:5px}
   .field label{font-size:12px;color:var(--sub);font-weight:600;display:flex;justify-content:space-between;align-items:center}
-  input[type="text"],input[type="password"],input[type="number"],input[type="time"],select,textarea{
+  input[type="text"],input[type="password"],input[type="number"],input[type="time"],input[type="date"],select,textarea{
     width:100%;padding:8px 10px;border-radius:7px;border:1px solid var(--border);
     background:var(--surface2);color:var(--text);font-size:13px;font-family:inherit;
   }
-  textarea{resize:vertical;min-height:66px;font-family:Consolas,monospace;font-size:12px}
   .switch{display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;user-select:none}
   .switch input{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
   .kv-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:10px}
   .metric{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
   .metric .k{font-size:11px;color:var(--muted)}
   .metric .v{font-size:16px;font-weight:700;font-family:Consolas,monospace;margin-top:2px}
+  .alarm-list{display:grid;gap:8px}
+  .alarm-item{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+  .alarm-item-left{display:flex;align-items:center;gap:12px;min-width:220px;flex:1}
+  .alarm-time{font-family:Consolas,monospace;font-size:20px;font-weight:700}
+  .alarm-editor{background:var(--surface2);border:1.5px solid var(--accent);border-radius:9px;padding:14px;display:grid;gap:10px}
+  .wd-row{display:flex;flex-wrap:wrap;gap:6px}
+  .wd-row label{display:flex;align-items:center;gap:4px;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--card);font-size:12px;cursor:pointer}
   .toast-bar{position:sticky;bottom:12px;z-index:20;padding:10px 14px;border-radius:8px;border:1px solid var(--border);background:var(--card);font-size:13px;display:flex;justify-content:space-between;align-items:center;box-shadow:0 4px 16px rgba(0,0,0,.1)}
   .log-box{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:10px;height:360px;overflow:auto;font-family:Consolas,monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-all}
   .log-warn{color:var(--warn)} .log-err{color:var(--err);font-weight:700} .log-info{color:var(--sub)} .log-dbg{color:var(--muted)}
@@ -750,12 +761,12 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
 <div class="wrap">
   <div class="topbar">
     <div class="brand">
-      <h1>半整点提醒 · 本地运维控制台</h1>
+      <h1>半整点提醒 · 本地管理控制台</h1>
       <span class="ver" id="ver">--</span>
     </div>
     <div class="nav">
       <button class="active" onclick="switchTab('overview',this)">总览与控制</button>
-      <button onclick="switchTab('settings',this)">报时与语音配置</button>
+      <button onclick="switchTab('settings',this)">报时与自定义闹钟</button>
       <button onclick="switchTab('updates',this)">版本与更新</button>
       <button onclick="switchTab('logs',this)">运行日志</button>
     </div>
@@ -784,11 +795,11 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
 
     <div class="grid2">
       <div class="card">
-        <div class="card-title">快捷调度与实时控制</div>
+        <div class="card-title">快捷控制与实时播报</div>
         <div class="btn-row">
           <button class="primary" onclick="postAction('/api/action/test-chime')">立即测试报时</button>
+          <button onclick="postAction('/api/action/stop-audio')" id="stopAudioBtn">停止当前播报</button>
           <button onclick="postAction('/api/action/test-voice',{})">试听当前音色</button>
-          <button onclick="postAction('/api/action/test-meal')">测试餐饮提醒</button>
           <button onclick="postAction('/api/action/toggle-mute')" id="muteBtn">切换静音</button>
           <button onclick="postAction('/api/action/sync-ntp',{})" id="ntpBtn">立即 NTP 校时</button>
         </div>
@@ -809,7 +820,7 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
 
       <div class="card">
         <div class="card-title">
-          <span>运行状态与性能监测</span>
+          <span>运行状态与资源占用</span>
           <button class="chip" onclick="postAction('/api/action/trim-memory')">释放内存</button>
         </div>
         <div class="kv-grid">
@@ -818,6 +829,7 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
           <div class="metric"><div class="k">本进程 / 整机 CPU</div><div class="v" id="mCpu">-- / --</div></div>
           <div class="metric"><div class="k">运行时长</div><div class="v" id="mUp">--</div></div>
         </div>
+        <div class="row"><span class="muted">报时分钟 / 已启用闹钟</span><span id="chimeAlarmStat">--</span></div>
         <div class="row"><span class="muted">当前语音</span><span id="curVoice">--</span></div>
         <div class="row"><span class="muted">校时状态</span><span id="ntpStatus">--</span></div>
         <div class="row"><span class="muted">配置文件</span><span class="mono muted" id="cfgPath" style="text-align:right;word-break:break-all">--</span></div>
@@ -825,36 +837,36 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
     </div>
   </div>
 
-  <!-- Tab 2: 报时与语音配置 -->
+  <!-- Tab 2: 报时、节假日与自定义闹钟配置 -->
   <div id="tab-settings" class="panel">
     <div class="grid2">
       <div class="card">
-        <div class="card-title">半/整点报时规则</div>
+        <div class="card-title">定时报时功能开关</div>
+        <label class="switch"><input type="checkbox" id="cfgHourlyEnabled"> 启用整点报时（每小时 :00）</label>
+        <label class="switch"><input type="checkbox" id="cfgHalfHourEnabled"> 启用半点报时（每小时 :30）</label>
         <div class="field">
-          <label>
-            <span>报时分钟（0–59，逗号分隔）</span>
-            <span class="btn-row">
-              <button type="button" class="chip" onclick="setMinutesPreset('0')">整点</button>
-              <button type="button" class="chip" onclick="setMinutesPreset('0, 30')">半整点</button>
-              <button type="button" class="chip" onclick="setMinutesPreset('0, 15, 30, 45')">每15分</button>
-            </span>
-          </label>
-          <input type="text" id="cfgMinutes" placeholder="0, 30">
+          <label><span>额外报时分钟（可选，0–59 逗号分隔，留空仅按上方勾选）</span></label>
+          <input type="text" id="cfgExtraMinutes" placeholder="例如 15, 45">
         </div>
         <div class="grid2" style="gap:10px">
           <div class="field"><label><span>重复播报次数 (1–10)</span></label><input type="number" id="cfgChimeRepeat" min="1" max="10"></div>
           <div class="field"><label><span>语音播报语速 (-5 ~ +5)</span></label><input type="number" id="cfgTtsRate" min="-5" max="5"></div>
         </div>
-        <label class="switch"><input type="checkbox" id="cfgPlaySound"> 报时播放内置清脆提示音</label>
-        <label class="switch"><input type="checkbox" id="cfgChimeTts"> 报时启用语音播报真实时间 / 自定义词</label>
+        <label class="switch"><input type="checkbox" id="cfgPlaySound"> 报时播放内置提示音</label>
+        <label class="switch"><input type="checkbox" id="cfgChimeTts"> 整/半点启用文字转语音播报</label>
         <div class="field">
-          <label><span>报时语音模板（支持 {TIME} / {TIME12} / {PERIOD}）</span></label>
+          <label><span>报时语音模板（支持 {TIME} / {TIME12} / {PERIOD} / {HH}:{MM}）</span></label>
           <input type="text" id="cfgChimeTpl" placeholder="现在时间，{TIME}">
         </div>
+        <hr>
+        <div class="card-title">节假日自动播报（本地离线识别）</div>
+        <label class="switch"><input type="checkbox" id="cfgHolidayEnabled"> 启用节假日自动播报（内置 2010–2040 公历/农历节日）</label>
+        <div class="field"><label><span>问候语模板（支持 {HOLIDAY} / {GREETING} / {LUNAR} / {TIME}）</span></label><input type="text" id="cfgHolidayTpl"></div>
+        <div class="field"><label><span>节庆专属音频路径（可选 WAV/MP3/FLAC/OGG）</span></label><input type="text" id="cfgHolidayAudio" placeholder="留空则使用内置提示音"></div>
       </div>
 
       <div class="card">
-        <div class="card-title">语音引擎与在线音色</div>
+        <div class="card-title">语音引擎与系统设置</div>
         <div class="field">
           <label><span>语音合成引擎</span></label>
           <select id="cfgTtsEngine">
@@ -877,8 +889,8 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
         </div>
         <div class="muted" id="cfgVoiceStatus">提示：点击试听将立即打断上一段试听并播放所选音色。</div>
         <hr>
-        <div class="card-title" style="margin-top:2px">静默时段与系统设置</div>
-        <label class="switch"><input type="checkbox" id="cfgQuietEnabled"> 启用夜间/特定静默免打扰时段</label>
+        <div class="card-title">静默时段与开机自启</div>
+        <label class="switch"><input type="checkbox" id="cfgQuietEnabled"> 启用夜间/特定静默免打扰时段（仅暂停报时，闹钟默认不受影响）</label>
         <div class="grid2" style="gap:10px">
           <div class="field"><label><span>静默开始时间</span></label><input type="time" id="cfgQuietStart"></div>
           <div class="field"><label><span>静默结束时间</span></label><input type="time" id="cfgQuietEnd"></div>
@@ -886,31 +898,84 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
         <div class="field"><label><span>NTP 校时服务器</span></label><input type="text" id="cfgNtpServer" placeholder="ntp.aliyun.com"></div>
         <label class="switch"><input type="checkbox" id="cfgAutoStart"> 开机自动启动并最小化到托盘</label>
       </div>
+    </div>
 
-      <div class="card">
-        <div class="card-title">餐饮 / 定时任务提醒</div>
-        <label class="switch"><input type="checkbox" id="cfgMealEnabled"> 启用每日定时餐饮/换班提醒</label>
-        <div class="grid2" style="gap:10px">
-          <div class="field"><label><span>提醒时间</span></label><input type="time" id="cfgMealTime"></div>
-          <div class="field"><label><span>播放次数 (1–10)</span></label><input type="number" id="cfgMealRepeat" min="1" max="10"></div>
+    <!-- 自定义闹钟管理卡片 -->
+    <div class="card">
+      <div class="card-title">
+        <span>自定义闹钟管理（多周期 · 文字转语音 · 自定义音频）</span>
+        <div class="btn-row">
+          <button type="button" class="chip" onclick="addPresetAlarm('water')">+ 喝水提醒</button>
+          <button type="button" class="chip" onclick="addPresetAlarm('stand')">+ 起身活动</button>
+          <button type="button" class="chip" onclick="addPresetAlarm('offwork')">+ 下班打卡</button>
+          <button type="button" class="primary" onclick="openAlarmEditor(-1)">+ 新建闹钟</button>
         </div>
-        <label class="switch"><input type="checkbox" id="cfgMealChimeBefore"> 播报前先响内置提示音</label>
-        <label class="switch"><input type="checkbox" id="cfgMealTtsEnabled"> 启用定时文字转语音播报</label>
-        <div class="field"><label><span>提醒播报文本</span></label><input type="text" id="cfgMealText"></div>
-        <div class="field"><label><span>本机自定义音频路径（WAV/MP3/FLAC/OGG，可留空）</span></label><input type="text" id="cfgMealAudio" placeholder="例如 D:\Audio\meal.mp3"></div>
       </div>
 
-      <div class="card">
+      <div id="alarmEditorBox" class="alarm-editor" style="display:none">
         <div class="card-title">
-          <span>节假日 / 周年庆专属播报</span>
-          <button type="button" class="chip" onclick="postAction('/api/action/refresh-holidays')">刷新假日源</button>
+          <span id="alarmEditorTitle">新建闹钟</span>
+          <div class="btn-row">
+            <button type="button" class="chip" onclick="testEditingAlarm()">试听此闹钟</button>
+            <button type="button" class="chip" onclick="closeAlarmEditor()">取消编辑</button>
+            <button type="button" class="primary" onclick="commitAlarmEditor()">应用到列表</button>
+          </div>
         </div>
-        <label class="switch"><input type="checkbox" id="cfgHolidayEnabled"> 启用农历/节假日专属问候语</label>
-        <div class="field"><label><span>问候语模板（支持 {HOLIDAY} / {GREETING} / {LUNAR} / {TIME}）</span></label><input type="text" id="cfgHolidayTpl"></div>
-        <div class="field"><label><span>自定义节日规则（每行一条，如 11-14=周年庆|欢迎光临 或 L01-01=新春快乐）</span></label><textarea id="cfgHolidayRules"></textarea></div>
-        <div class="field"><label><span>外部节假日 JSON 数据源 URL / 本机路径</span></label><input type="text" id="cfgHolidayUrl" placeholder="可留空，使用内置公历/农历节日表"></div>
-        <div class="muted" id="cfgHolidayStatus">外部源状态：--</div>
+        <div class="grid2" style="gap:10px">
+          <div class="field"><label><span>闹钟名称</span></label><input type="text" id="aeLabel" placeholder="例如：喝水提醒"></div>
+          <div class="grid2" style="gap:10px">
+            <div class="field"><label><span>响铃时间</span></label><input type="time" id="aeTime" value="10:00"></div>
+            <div class="field"><label><span>播放次数 (1–10)</span></label><input type="number" id="aeRepeat" min="1" max="10" value="1"></div>
+          </div>
+        </div>
+        <div class="grid2" style="gap:10px">
+          <div class="field">
+            <label><span>重复周期</span></label>
+            <select id="aeMode" onchange="onAlarmModeChange()">
+              <option value="once">仅一次（响铃后自动关闭）</option>
+              <option value="daily">每天</option>
+              <option value="workdays">工作日（周一至周五）</option>
+              <option value="weekends">周末（周六、周日）</option>
+              <option value="weekly">自定义星期</option>
+              <option value="interval_days">每隔 N 天</option>
+            </select>
+          </div>
+          <div class="field" id="aeOnceWrap" style="display:none">
+            <label><span>单次目标日期（留空自动推算）</span></label>
+            <input type="date" id="aeOnceDate">
+          </div>
+          <div class="field" id="aeIntervalWrap" style="display:none">
+            <label><span>每隔天数 (1–365) / 起始日期</span></label>
+            <div style="display:flex;gap:8px">
+              <input type="number" id="aeIntervalDays" min="1" max="365" value="2" style="max-width:96px">
+              <input type="date" id="aeAnchorDate">
+            </div>
+          </div>
+        </div>
+        <div id="aeWeeklyWrap" class="field" style="display:none">
+          <label><span>选择每周响铃日期</span></label>
+          <div class="wd-row">
+            <label><input type="checkbox" id="aeWd0"> 周一</label>
+            <label><input type="checkbox" id="aeWd1"> 周二</label>
+            <label><input type="checkbox" id="aeWd2"> 周三</label>
+            <label><input type="checkbox" id="aeWd3"> 周四</label>
+            <label><input type="checkbox" id="aeWd4"> 周五</label>
+            <label><input type="checkbox" id="aeWd5"> 周六</label>
+            <label><input type="checkbox" id="aeWd6"> 周日</label>
+          </div>
+        </div>
+        <div class="btn-row">
+          <label class="switch"><input type="checkbox" id="aePlayChime" checked> 响铃前播放内置提示音</label>
+          <label class="switch"><input type="checkbox" id="aeTtsEnabled" checked> 启用文字转语音播报</label>
+          <label class="switch"><input type="checkbox" id="aeRespectQuiet"> 静默时段内跳过此闹钟</label>
+        </div>
+        <div class="grid2" style="gap:10px">
+          <div class="field"><label><span>语音播报文字（支持 {TIME} / {LABEL} / {TIME12}）</span></label><input type="text" id="aeTtsText" placeholder="现在时间，{TIME}，{LABEL}"></div>
+          <div class="field"><label><span>本机自定义音频路径（WAV/MP3/FLAC/OGG，可选）</span></label><input type="text" id="aeCustomAudio" placeholder="例如 D:\Audio\alarm.mp3"></div>
+        </div>
       </div>
+
+      <div id="alarmListBox" class="alarm-list"></div>
     </div>
 
     <div class="card">
@@ -948,14 +1013,13 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
     </div>
 
     <div class="card">
-      <div class="card-title">更新源与私有仓库访问授权（可选）</div>
+      <div class="card-title">更新源与镜像配置（可选）</div>
       <div class="muted">
-        说明：若 GitHub 仓库设为 <strong>Public（公开）</strong>，无需任何 Token 即可直连更新。
-        若仓库保持 <strong>Private（私有）</strong>，GitHub 对未授权请求会返回 <strong>404</strong>，此时请填入只读 GitHub PAT（仅需 Contents: Read 权限）或改用局域网 / 公开直链地址。
+        说明：默认优先使用 <strong>Gitee 国内直连源（<code>djjz/HalfHourChime</code>）</strong>，国内无需代理即可连接更新；若 Gitee 临时不可用，程序会自动回退至 <strong>GitHub 备用源（<code>cqcmd/HalfHourChime</code>）</strong>。
       </div>
       <div class="field">
-        <label><span>更新源清单地址（支持 GitHub Releases / 局域网共享 / Google Drive / version.json）</span></label>
-        <input type="text" id="cfgUpdUrl" placeholder="https://github.com/cqcmd/-/releases/latest">
+        <label><span>更新源清单地址（支持 Gitee / GitHub Releases / 局域网共享 / version.json）</span></label>
+        <input type="text" id="cfgUpdUrl" placeholder="https://gitee.com/djjz/HalfHourChime/releases/latest">
       </div>
       <div class="grid2" style="gap:10px">
         <div class="field">
@@ -1003,7 +1067,7 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
   </div>
 
   <div class="toast-bar">
-    <span id="toastText">本地运维控制台已就绪</span>
+    <span id="toastText">本地管理控制台已就绪</span>
     <span class="muted mono" id="connState">已连接 127.0.0.1:3000</span>
   </div>
 </div>
@@ -1011,9 +1075,14 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
 <script>
 let activeTab = 'overview';
 let volumeDebounce = null;
-let lastLoadedConfig = null;
+let draftAlarms = [];
+let editingAlarmIdx = -2; // -2: closed, -1: new, >=0: existing index
 
 function pad2(n){ return String(Math.max(0, Number(n)||0)).padStart(2,'0'); }
+function todayStr(){
+  const d = new Date();
+  return d.getFullYear() + '-' + pad2(d.getMonth()+1) + '-' + pad2(d.getDate());
+}
 function showToast(msg, isErr){
   const el = document.getElementById('toastText');
   el.textContent = msg;
@@ -1059,10 +1128,6 @@ function setTheme(idx){
   postAction('/api/action/set-theme', { theme_index: idx });
 }
 
-function setMinutesPreset(val){
-  document.getElementById('cfgMinutes').value = val;
-}
-
 function previewSelectedVoice(){
   postAction('/api/action/test-voice', {
     tts_engine_index: Number(document.getElementById('cfgTtsEngine').value),
@@ -1071,12 +1136,210 @@ function previewSelectedVoice(){
   });
 }
 
+function describeAlarmCycle(a){
+  const m = a.repeat_mode || 'daily';
+  if(m === 'once') return '仅一次' + (a.once_date ? ' ('+a.once_date+')' : '');
+  if(m === 'daily') return '每天';
+  if(m === 'workdays') return '工作日 (周一至五)';
+  if(m === 'weekends') return '周末 (周六/日)';
+  if(m === 'weekly'){
+    const names = ['一','二','三','四','五','六','日'];
+    const arr = (a.weekdays||[]).map((on,i)=>on?names[i]:null).filter(Boolean);
+    return arr.length ? '每周 ' + arr.join(' ') : '每周 (未选)';
+  }
+  if(m === 'interval_days') return '每 ' + Math.max(1, Number(a.interval_days)||1) + ' 天';
+  return '每天';
+}
+
+function describeAlarmAudio(a){
+  const parts = [];
+  if(a.play_chime_before) parts.push('提示音');
+  if((a.custom_audio_path||'').trim()) parts.push('自定义音频');
+  if(a.tts_enabled) parts.push('文字转语音');
+  return parts.length ? parts.join(' + ') : '仅提示';
+}
+
+function escapeHtml(s){
+  return String(s||'').replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+function renderAlarms(){
+  const box = document.getElementById('alarmListBox');
+  if(!draftAlarms.length){
+    box.innerHTML = '<div class="muted" style="padding:10px 0">暂无自定义闹钟，可点击上方“+ 新建闹钟”或快速添加模板。</div>';
+    return;
+  }
+  box.innerHTML = draftAlarms.map((a, idx)=>`
+    <div class="alarm-item">
+      <div class="alarm-item-left">
+        <input type="checkbox" ${a.enabled ? 'checked' : ''} onchange="toggleAlarmEnabled(${idx}, this.checked)">
+        <span class="alarm-time">${pad2(a.hour)}:${pad2(a.minute)}</span>
+        <div>
+          <div style="font-weight:700">${escapeHtml(a.label)}</div>
+          <div class="muted">${escapeHtml(describeAlarmCycle(a))} · ${escapeHtml(describeAlarmAudio(a))}</div>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button type="button" class="chip" onclick="testSavedOrDraftAlarm(${idx})">试听</button>
+        <button type="button" class="chip" onclick="openAlarmEditor(${idx})">编辑</button>
+        <button type="button" class="chip danger" onclick="deleteAlarm(${idx})">删除</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+function toggleAlarmEnabled(idx, checked){
+  if(draftAlarms[idx]) draftAlarms[idx].enabled = !!checked;
+}
+
+function deleteAlarm(idx){
+  draftAlarms.splice(idx, 1);
+  if(editingAlarmIdx === idx) closeAlarmEditor();
+  else if(editingAlarmIdx > idx) editingAlarmIdx -= 1;
+  renderAlarms();
+}
+
+function nextLocalAlarmId(){
+  return draftAlarms.reduce((m,a)=>Math.max(m, Number(a.id)||0), 0) + 1;
+}
+
+function addPresetAlarm(kind){
+  const id = nextLocalAlarmId();
+  let item;
+  if(kind === 'water'){
+    item = {
+      id, label:'喝水提醒', enabled:true, hour:10, minute:30,
+      repeat_mode:'daily', weekdays:[true,true,true,true,true,true,true],
+      interval_days:1, anchor_date:'', once_date:'', repeat_count:1,
+      play_chime_before:true, tts_enabled:true, tts_text:'现在时间，{TIME}，请喝一杯水休息一下',
+      custom_audio_path:'', respect_quiet_hours:false
+    };
+  }else if(kind === 'stand'){
+    item = {
+      id, label:'起身活动', enabled:true, hour:15, minute:0,
+      repeat_mode:'workdays', weekdays:[true,true,true,true,true,false,false],
+      interval_days:1, anchor_date:'', once_date:'', repeat_count:1,
+      play_chime_before:true, tts_enabled:true, tts_text:'现在时间，{TIME}，久坐辛苦了，起来活动几分钟吧',
+      custom_audio_path:'', respect_quiet_hours:false
+    };
+  }else{
+    item = {
+      id, label:'下班打卡提醒', enabled:true, hour:18, minute:0,
+      repeat_mode:'workdays', weekdays:[true,true,true,true,true,false,false],
+      interval_days:1, anchor_date:'', once_date:'', repeat_count:2,
+      play_chime_before:true, tts_enabled:true, tts_text:'现在时间，{TIME}，请记得下班打卡',
+      custom_audio_path:'', respect_quiet_hours:false
+    };
+  }
+  draftAlarms.push(item);
+  renderAlarms();
+  openAlarmEditor(draftAlarms.length - 1);
+}
+
+function onAlarmModeChange(){
+  const m = document.getElementById('aeMode').value;
+  document.getElementById('aeOnceWrap').style.display = m === 'once' ? 'grid' : 'none';
+  document.getElementById('aeWeeklyWrap').style.display = m === 'weekly' ? 'grid' : 'none';
+  document.getElementById('aeIntervalWrap').style.display = m === 'interval_days' ? 'grid' : 'none';
+}
+
+function openAlarmEditor(idx){
+  editingAlarmIdx = idx;
+  const a = idx >= 0 && draftAlarms[idx] ? draftAlarms[idx] : {
+    id: nextLocalAlarmId(),
+    label: '日常提醒',
+    enabled: true,
+    hour: 9,
+    minute: 0,
+    repeat_mode: 'daily',
+    weekdays: [true,true,true,true,true,false,false],
+    interval_days: 2,
+    anchor_date: todayStr(),
+    once_date: '',
+    repeat_count: 1,
+    play_chime_before: true,
+    tts_enabled: true,
+    tts_text: '现在时间，{TIME}，{LABEL}',
+    custom_audio_path: '',
+    respect_quiet_hours: false,
+  };
+  document.getElementById('alarmEditorTitle').textContent = idx < 0 ? '新建自定义闹钟' : '编辑自定义闹钟';
+  document.getElementById('aeLabel').value = a.label || '';
+  document.getElementById('aeTime').value = pad2(a.hour) + ':' + pad2(a.minute);
+  document.getElementById('aeRepeat').value = a.repeat_count ?? 1;
+  document.getElementById('aeMode').value = a.repeat_mode || 'daily';
+  document.getElementById('aeOnceDate').value = a.once_date || '';
+  document.getElementById('aeIntervalDays').value = a.interval_days || 2;
+  document.getElementById('aeAnchorDate').value = a.anchor_date || todayStr();
+  const wds = a.weekdays || [true,true,true,true,true,false,false];
+  for(let i=0;i<7;i++) document.getElementById('aeWd'+i).checked = !!wds[i];
+  document.getElementById('aePlayChime').checked = !!a.play_chime_before;
+  document.getElementById('aeTtsEnabled').checked = !!a.tts_enabled;
+  document.getElementById('aeTtsText').value = a.tts_text || '';
+  document.getElementById('aeCustomAudio').value = a.custom_audio_path || '';
+  document.getElementById('aeRespectQuiet').checked = !!a.respect_quiet_hours;
+  onAlarmModeChange();
+  document.getElementById('alarmEditorBox').style.display = 'grid';
+}
+
+function closeAlarmEditor(){
+  editingAlarmIdx = -2;
+  document.getElementById('alarmEditorBox').style.display = 'none';
+}
+
+function readAlarmFromEditor(){
+  const [h, m] = parseTimeStr(document.getElementById('aeTime').value, 9, 0);
+  const base = (editingAlarmIdx >= 0 && draftAlarms[editingAlarmIdx]) ? draftAlarms[editingAlarmIdx] : null;
+  const weekdays = [];
+  for(let i=0;i<7;i++) weekdays.push(document.getElementById('aeWd'+i).checked);
+  return {
+    id: base ? base.id : nextLocalAlarmId(),
+    label: document.getElementById('aeLabel').value.trim() || ('闹钟 ' + pad2(h) + ':' + pad2(m)),
+    enabled: base ? !!base.enabled : true,
+    hour: h,
+    minute: m,
+    repeat_mode: document.getElementById('aeMode').value,
+    weekdays,
+    interval_days: Math.min(365, Math.max(1, Number(document.getElementById('aeIntervalDays').value || 1))),
+    anchor_date: document.getElementById('aeAnchorDate').value.trim(),
+    once_date: document.getElementById('aeOnceDate').value.trim(),
+    repeat_count: Math.min(10, Math.max(1, Number(document.getElementById('aeRepeat').value || 1))),
+    play_chime_before: document.getElementById('aePlayChime').checked,
+    tts_enabled: document.getElementById('aeTtsEnabled').checked,
+    tts_text: document.getElementById('aeTtsText').value.trim(),
+    custom_audio_path: document.getElementById('aeCustomAudio').value.trim(),
+    respect_quiet_hours: document.getElementById('aeRespectQuiet').checked,
+  };
+}
+
+function commitAlarmEditor(){
+  const item = readAlarmFromEditor();
+  if(editingAlarmIdx >= 0 && draftAlarms[editingAlarmIdx]){
+    draftAlarms[editingAlarmIdx] = item;
+  }else{
+    draftAlarms.push(item);
+  }
+  closeAlarmEditor();
+  renderAlarms();
+  showToast('已更新闹钟列表，请点击下方“保存全部配置并立即生效”写入磁盘', false);
+}
+
+function testEditingAlarm(){
+  postAction('/api/action/test-alarm', { alarm: readAlarmFromEditor() });
+}
+
+function testSavedOrDraftAlarm(idx){
+  const a = draftAlarms[idx];
+  if(a) postAction('/api/action/test-alarm', { alarm: a });
+}
+
 async function loadConfigFromServer(){
   try{
     const r = await fetch('/api/config');
     const c = await r.json();
-    lastLoadedConfig = c;
-    document.getElementById('cfgMinutes').value = c.chime_minutes_str || '0, 30';
+    document.getElementById('cfgHourlyEnabled').checked = !!c.hourly_chime_enabled;
+    document.getElementById('cfgHalfHourEnabled').checked = !!c.half_hour_chime_enabled;
+    document.getElementById('cfgExtraMinutes').value = c.custom_chime_minutes_str || '';
     document.getElementById('cfgChimeRepeat').value = c.chime_repeat_count ?? 1;
     document.getElementById('cfgTtsRate').value = c.tts_rate ?? 0;
     document.getElementById('cfgPlaySound').checked = !!c.chime_play_sound;
@@ -1089,17 +1352,13 @@ async function loadConfigFromServer(){
     document.getElementById('cfgQuietEnd').value = pad2(c.quiet_end_hour)+':'+pad2(c.quiet_end_minute);
     document.getElementById('cfgNtpServer').value = c.ntp_server || 'ntp.aliyun.com';
     document.getElementById('cfgAutoStart').checked = !!c.auto_start;
-    document.getElementById('cfgMealEnabled').checked = !!c.meal_enabled;
-    document.getElementById('cfgMealTime').value = pad2(c.meal_hour)+':'+pad2(c.meal_minute);
-    document.getElementById('cfgMealRepeat').value = c.meal_repeat_count ?? 1;
-    document.getElementById('cfgMealChimeBefore').checked = !!c.meal_play_chime_before_custom;
-    document.getElementById('cfgMealTtsEnabled').checked = !!c.meal_tts_enabled;
-    document.getElementById('cfgMealText').value = c.meal_tts_text || '';
-    document.getElementById('cfgMealAudio').value = c.meal_custom_audio_path || '';
     document.getElementById('cfgHolidayEnabled').checked = !!c.holiday_enabled;
     document.getElementById('cfgHolidayTpl').value = c.holiday_greeting_template || '';
-    document.getElementById('cfgHolidayRules').value = c.holiday_custom_rules || '';
-    document.getElementById('cfgHolidayUrl').value = c.holiday_data_source_url || '';
+    document.getElementById('cfgHolidayAudio').value = c.holiday_custom_audio_path || '';
+
+    draftAlarms = Array.isArray(c.alarms) ? JSON.parse(JSON.stringify(c.alarms)) : [];
+    closeAlarmEditor();
+    renderAlarms();
 
     document.getElementById('cfgUpdUrl').value = c.update_check_url || '';
     document.getElementById('cfgUpdInterval').value = c.update_check_interval_hours ?? 6;
@@ -1120,11 +1379,19 @@ function parseTimeStr(val, defH, defM){
 }
 
 async function saveAllConfig(){
+  if(editingAlarmIdx !== -2){
+    const item = readAlarmFromEditor();
+    if(editingAlarmIdx >= 0 && draftAlarms[editingAlarmIdx]) draftAlarms[editingAlarmIdx] = item;
+    else draftAlarms.push(item);
+    closeAlarmEditor();
+    renderAlarms();
+  }
   const [qsH, qsM] = parseTimeStr(document.getElementById('cfgQuietStart').value, 0, 0);
   const [qeH, qeM] = parseTimeStr(document.getElementById('cfgQuietEnd').value, 8, 0);
-  const [mH, mM] = parseTimeStr(document.getElementById('cfgMealTime').value, 12, 0);
   const payload = {
-    chime_minutes_str: document.getElementById('cfgMinutes').value,
+    hourly_chime_enabled: document.getElementById('cfgHourlyEnabled').checked,
+    half_hour_chime_enabled: document.getElementById('cfgHalfHourEnabled').checked,
+    custom_chime_minutes_str: document.getElementById('cfgExtraMinutes').value,
     chime_repeat_count: Number(document.getElementById('cfgChimeRepeat').value || 1),
     tts_rate: Number(document.getElementById('cfgTtsRate').value || 0),
     chime_play_sound: document.getElementById('cfgPlaySound').checked,
@@ -1137,17 +1404,10 @@ async function saveAllConfig(){
     quiet_end_hour: qeH, quiet_end_minute: qeM,
     ntp_server: document.getElementById('cfgNtpServer').value,
     auto_start: document.getElementById('cfgAutoStart').checked,
-    meal_enabled: document.getElementById('cfgMealEnabled').checked,
-    meal_hour: mH, meal_minute: mM,
-    meal_repeat_count: Number(document.getElementById('cfgMealRepeat').value || 1),
-    meal_play_chime_before_custom: document.getElementById('cfgMealChimeBefore').checked,
-    meal_tts_enabled: document.getElementById('cfgMealTtsEnabled').checked,
-    meal_tts_text: document.getElementById('cfgMealText').value,
-    meal_custom_audio_path: document.getElementById('cfgMealAudio').value,
     holiday_enabled: document.getElementById('cfgHolidayEnabled').checked,
     holiday_greeting_template: document.getElementById('cfgHolidayTpl').value,
-    holiday_custom_rules: document.getElementById('cfgHolidayRules').value,
-    holiday_data_source_url: document.getElementById('cfgHolidayUrl').value,
+    holiday_custom_audio_path: document.getElementById('cfgHolidayAudio').value,
+    alarms: draftAlarms,
   };
   await postAction('/api/config', payload);
   await loadConfigFromServer();
@@ -1192,12 +1452,14 @@ async function refreshStatus(){
     document.getElementById('countdown').textContent = d.next_event_countdown || '--';
 
     document.getElementById('muteBtn').textContent = d.mute_mode ? '取消静音模式' : '开启静音模式';
+    document.getElementById('stopAudioBtn').textContent = d.is_audio_playing ? '停止当前播报 (正在播放)' : '停止当前播报';
     document.getElementById('ntpBtn').disabled = !!d.is_syncing;
     const slider = document.getElementById('liveVol');
     if(document.activeElement !== slider && d.volume !== undefined){
       slider.value = d.volume;
       document.getElementById('volLabel').textContent = d.volume + '%';
     }
+    document.getElementById('chimeAlarmStat').textContent = (d.chime_minutes || '--') + ' · 闹钟 ' + (d.enabled_alarms_count ?? 0) + ' 个';
     document.getElementById('curVoice').textContent = (d.tts_engine||'') + (d.edge_tts_voice ? ' · '+d.edge_tts_voice : '');
     document.getElementById('ntpStatus').textContent = d.ntp_status || '--';
     document.getElementById('cfgPath').textContent = d.config_path || '--';
@@ -1208,9 +1470,6 @@ async function refreshStatus(){
     if(d.tts_preview_status){
       document.getElementById('ttsStatusLine').textContent = '语音状态：' + d.tts_preview_status;
       document.getElementById('cfgVoiceStatus').textContent = d.tts_preview_status;
-    }
-    if(d.holiday_feed_status){
-      document.getElementById('cfgHolidayStatus').textContent = '外部源状态：' + d.holiday_feed_status;
     }
 
     document.getElementById('btnCheckUpd').disabled = !!d.update_checking;

@@ -92,12 +92,19 @@ fn main() {
         };
 
     println!("cargo:rerun-if-env-changed=GITHUB_REPOSITORY");
+    println!("cargo:rerun-if-env-changed=DEFAULT_UPDATE_CHECK_URL");
     let repo = std::env::var("GITHUB_REPOSITORY")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && s.contains('/'))
-        .unwrap_or_else(|| "cqcmd/-".to_string());
-    let default_update_url = format!("https://github.com/{repo}/releases/latest");
+        .unwrap_or_else(|| "cqcmd/HalfHourChime".to_string());
+    let default_github_url = format!("https://github.com/{repo}/releases/latest");
+    let default_update_url = std::env::var("DEFAULT_UPDATE_CHECK_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://gitee.com/djjz/HalfHourChime/releases/latest".to_string());
+    println!("cargo:rustc-env=DEFAULT_GITHUB_RELEASE_URL={default_github_url}");
     println!("cargo:rustc-env=DEFAULT_UPDATE_CHECK_URL={default_update_url}");
     println!("cargo:rustc-env=APP_BUILD_VERSION={next_version}");
 

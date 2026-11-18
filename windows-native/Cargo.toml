@@ -16,7 +16,7 @@ path = "src/main.rs"
 slint = { version = "1.8", default-features = false, features = ["backend-winit", "renderer-femtovg", "renderer-software", "compat-1-2", "raw-window-handle-06"] }
 raw-window-handle = "0.6"
 
-# 本地音频解码与实时音量控制（支持内置 WAV 及自定义 WAV/MP3/FLAC/OGG 餐饮音频）
+# 本地音频解码与实时音量控制（支持内置 WAV 及自定义 WAV/MP3/FLAC/OGG 音频）
 rodio = { version = "0.19", default-features = false, features = ["wav", "symphonia-mp3", "flac", "vorbis"] }
 
 # Windows 系统托盘与原生右键菜单

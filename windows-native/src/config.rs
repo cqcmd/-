@@ -1,3 +1,4 @@
+use chrono::{Datelike, Duration, Local, NaiveDate, Timelike};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,7 +7,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeMode {
-    /// 暗夜曜石（面向网吧/电竞酒店夜间值守）
+    /// 暗夜曜石（低亮度深色风格，适合夜间或暗光环境）
     ObsidianDark,
     /// 晨曦云母（Win11 极简浅色风格）
     Win11Light,
@@ -45,7 +46,7 @@ impl ThemeMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TtsEngine {
-    /// Windows 原生 SAPI5 离线引擎（无需联网，内网隔离环境可选）
+    /// Windows 原生 SAPI5 离线引擎（无需联网，纯本地可用）
     Sapi5,
     /// Microsoft Edge TTS 在线神经网络语音（默认，网络异常或受限时自动回退至本地 SAPI5）
     #[default]
@@ -95,35 +96,335 @@ pub fn edge_voice_to_index(voice: &str) -> i32 {
     }
 }
 
-/// 本地持久化配置结构（对应 SRS 4.1 数据项）
+/// 自定义闹钟重复周期模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AlarmRepeatMode {
+    /// 仅一次（到达目标时间触发后自动关闭，避免次日重复响铃）
+    Once,
+    /// 每天
+    #[default]
+    Daily,
+    /// 工作日（周一至周五）
+    Workdays,
+    /// 周末（周六、周日）
+    Weekends,
+    /// 自定义星期（周一至周日自由勾选）
+    Weekly,
+    /// 每隔 N 天（从起始锚点日期开始按固定天间隔循环）
+    IntervalDays,
+}
+
+impl AlarmRepeatMode {
+    pub fn to_index(self) -> i32 {
+        match self {
+            AlarmRepeatMode::Once => 0,
+            AlarmRepeatMode::Daily => 1,
+            AlarmRepeatMode::Workdays => 2,
+            AlarmRepeatMode::Weekends => 3,
+            AlarmRepeatMode::Weekly => 4,
+            AlarmRepeatMode::IntervalDays => 5,
+        }
+    }
+
+    pub fn from_index(idx: i32) -> Self {
+        match idx {
+            0 => AlarmRepeatMode::Once,
+            1 => AlarmRepeatMode::Daily,
+            2 => AlarmRepeatMode::Workdays,
+            3 => AlarmRepeatMode::Weekends,
+            4 => AlarmRepeatMode::Weekly,
+            5 => AlarmRepeatMode::IntervalDays,
+            _ => AlarmRepeatMode::Daily,
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            AlarmRepeatMode::Once => "仅一次",
+            AlarmRepeatMode::Daily => "每天",
+            AlarmRepeatMode::Workdays => "工作日",
+            AlarmRepeatMode::Weekends => "周末",
+            AlarmRepeatMode::Weekly => "自定义星期",
+            AlarmRepeatMode::IntervalDays => "每隔 N 天",
+        }
+    }
+}
+
+/// 自定义定时闹钟条目（支持多种时间周期、提示音、自定义音频与文字转语音）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CustomAlarm {
+    pub id: u64,
+    pub label: String,
+    pub enabled: bool,
+    pub hour: u8,
+    pub minute: u8,
+    pub repeat_mode: AlarmRepeatMode,
+    /// 自定义星期勾选：[周一, 周二, 周三, 周四, 周五, 周六, 周日]
+    pub weekdays: [bool; 7],
+    /// 每隔 N 天（1..=365，仅 repeat_mode == IntervalDays 时有效）
+    pub interval_days: u16,
+    /// 间隔起始日期 "YYYY-MM-DD"（仅 repeat_mode == IntervalDays 时作为起点）
+    pub anchor_date: String,
+    /// 单次闹钟目标日期 "YYYY-MM-DD"（仅 repeat_mode == Once 时有效）
+    pub once_date: String,
+    /// 播放重复次数（1..=10）
+    pub repeat_count: u8,
+    /// 播报音频或语音前是否先播放提示音
+    pub play_chime_before: bool,
+    /// 是否启用文字转语音播报
+    pub tts_enabled: bool,
+    /// 文字转语音内容（支持 {TIME} / {TIME12} / {PERIOD} / {LABEL} / {HH}:{MM}）
+    pub tts_text: String,
+    /// 可选本机自定义音频路径（WAV / MP3 / OGG / FLAC）
+    pub custom_audio_path: String,
+    /// 是否受静默免打扰时段约束（默认 false，防止早晨/重要闹钟被夜间静默跳过）
+    pub respect_quiet_hours: bool,
+}
+
+impl Default for CustomAlarm {
+    fn default() -> Self {
+        Self {
+            id: 1,
+            label: "日常提醒".to_string(),
+            enabled: true,
+            hour: 9,
+            minute: 0,
+            repeat_mode: AlarmRepeatMode::Daily,
+            weekdays: [true, true, true, true, true, false, false],
+            interval_days: 2,
+            anchor_date: String::new(),
+            once_date: String::new(),
+            repeat_count: 1,
+            play_chime_before: true,
+            tts_enabled: true,
+            tts_text: "现在时间，{TIME}，{LABEL}".to_string(),
+            custom_audio_path: String::new(),
+            respect_quiet_hours: false,
+        }
+    }
+}
+
+impl CustomAlarm {
+    pub fn format_time(&self) -> String {
+        format!("{:02}:{:02}", self.hour.min(23), self.minute.min(59))
+    }
+
+    pub fn format_cycle_summary(&self) -> String {
+        match self.repeat_mode {
+            AlarmRepeatMode::Once => {
+                if self.once_date.trim().is_empty() {
+                    "仅一次".to_string()
+                } else {
+                    let short = self
+                        .once_date
+                        .split('-')
+                        .skip(1)
+                        .collect::<Vec<_>>()
+                        .join("-");
+                    if short.is_empty() {
+                        "仅一次".to_string()
+                    } else {
+                        format!("仅一次 ({short})")
+                    }
+                }
+            }
+            AlarmRepeatMode::Daily => "每天".to_string(),
+            AlarmRepeatMode::Workdays => "工作日 (周一至五)".to_string(),
+            AlarmRepeatMode::Weekends => "周末 (周六/日)".to_string(),
+            AlarmRepeatMode::Weekly => {
+                const NAMES: [&str; 7] = ["一", "二", "三", "四", "五", "六", "日"];
+                let picked: Vec<&str> = self
+                    .weekdays
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &on)| if on { Some(NAMES[i]) } else { None })
+                    .collect();
+                if picked.is_empty() {
+                    "每周 (未选)".to_string()
+                } else {
+                    format!("每周 {}", picked.join(" "))
+                }
+            }
+            AlarmRepeatMode::IntervalDays => {
+                let n = self.interval_days.max(1);
+                if n == 1 {
+                    "每 1 天".to_string()
+                } else {
+                    format!("每 {n} 天")
+                }
+            }
+        }
+    }
+
+    pub fn format_audio_badge(&self) -> String {
+        let mut parts = Vec::new();
+        if self.play_chime_before {
+            parts.push("提示音");
+        }
+        if !self.custom_audio_path.trim().is_empty() {
+            parts.push("自定义音频");
+        }
+        if self.tts_enabled {
+            parts.push("文字转语音");
+        }
+        if parts.is_empty() {
+            "仅提示".to_string()
+        } else {
+            parts.join(" + ")
+        }
+    }
+
+    /// 规范化单次闹钟目标日期与间隔闹钟起始锚点（在用户保存或创建时调用）
+    pub fn ensure_anchor_and_once_dates(&mut self, today: NaiveDate, now_hour: u32, now_minute: u32) {
+        if self.repeat_mode == AlarmRepeatMode::IntervalDays {
+            let valid_anchor = NaiveDate::parse_from_str(self.anchor_date.trim(), "%Y-%m-%d").is_ok();
+            if !valid_anchor {
+                self.anchor_date = today.format("%Y-%m-%d").to_string();
+            }
+        }
+        if self.repeat_mode == AlarmRepeatMode::Once {
+            let parsed = NaiveDate::parse_from_str(self.once_date.trim(), "%Y-%m-%d").ok();
+            let need_recompute = match parsed {
+                None => true,
+                Some(d) => {
+                    d < today
+                        || (d == today
+                            && (u32::from(self.hour) * 60 + u32::from(self.minute))
+                                <= (now_hour * 60 + now_minute))
+                }
+            };
+            if need_recompute {
+                let target_mins = u32::from(self.hour) * 60 + u32::from(self.minute);
+                let cur_mins = now_hour * 60 + now_minute;
+                let target_date = if target_mins > cur_mins {
+                    today
+                } else {
+                    today + Duration::days(1)
+                };
+                self.once_date = target_date.format("%Y-%m-%d").to_string();
+            }
+        }
+    }
+
+    /// 判断该闹钟在指定公历日期是否应当触发
+    pub fn should_ring_on_date(&self, date: NaiveDate) -> bool {
+        match self.repeat_mode {
+            AlarmRepeatMode::Once => {
+                if let Ok(target) = NaiveDate::parse_from_str(self.once_date.trim(), "%Y-%m-%d") {
+                    date == target
+                } else {
+                    true
+                }
+            }
+            AlarmRepeatMode::Daily => true,
+            AlarmRepeatMode::Workdays => date.weekday().num_days_from_monday() < 5,
+            AlarmRepeatMode::Weekends => date.weekday().num_days_from_monday() >= 5,
+            AlarmRepeatMode::Weekly => {
+                let idx = date.weekday().num_days_from_monday() as usize;
+                self.weekdays.get(idx).copied().unwrap_or(false)
+            }
+            AlarmRepeatMode::IntervalDays => {
+                let interval = i64::from(self.interval_days.max(1));
+                if let Ok(anchor) = NaiveDate::parse_from_str(self.anchor_date.trim(), "%Y-%m-%d") {
+                    let diff = (date - anchor).num_days();
+                    diff >= 0 && (diff % interval) == 0
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
+    pub fn validate(&mut self) -> Result<(), String> {
+        self.label = self.label.trim().to_string();
+        if self.label.is_empty() {
+            self.label = format!("闹钟 {}", self.format_time());
+        }
+        if self.hour > 23 || self.minute > 59 {
+            return Err(format!(
+                "闹钟「{}」的时间无效（小时 0–23，分钟 0–59）。",
+                self.label
+            ));
+        }
+        if !(1..=10).contains(&self.repeat_count) {
+            return Err(format!(
+                "闹钟「{}」的重复播放次数必须在 1–10 次之间。",
+                self.label
+            ));
+        }
+        if self.repeat_mode == AlarmRepeatMode::Weekly && !self.weekdays.iter().any(|&on| on) {
+            return Err(format!(
+                "闹钟「{}」选择了自定义星期，请至少勾选周一至周日中的一天。",
+                self.label
+            ));
+        }
+        if self.repeat_mode == AlarmRepeatMode::IntervalDays
+            && !(1..=365).contains(&self.interval_days)
+        {
+            return Err(format!(
+                "闹钟「{}」的间隔天数必须在 1–365 天之间。",
+                self.label
+            ));
+        }
+
+        self.tts_text = self.tts_text.trim().to_string();
+        self.custom_audio_path = self.custom_audio_path.trim().to_string();
+        self.anchor_date = self.anchor_date.trim().to_string();
+        self.once_date = self.once_date.trim().to_string();
+
+        if self.enabled {
+            if self.tts_enabled && self.tts_text.is_empty() {
+                return Err(format!(
+                    "闹钟「{}」已开启文字转语音播报，请填写播报文字内容。",
+                    self.label
+                ));
+            }
+            if !self.play_chime_before
+                && !self.tts_enabled
+                && self.custom_audio_path.is_empty()
+            {
+                return Err(format!(
+                    "闹钟「{}」请至少启用“提示音”、“文字转语音”或“自定义音频”中的一项。",
+                    self.label
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// 本地持久化配置结构（通用型桌面报时与自定义闹钟工具）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AppConfig {
-    /// 报时分钟集合（0..=59），默认 [0, 30]
-    pub chime_minutes: Vec<u8>,
+    /// 功能勾选框：启用整点报时（每小时 :00），默认 true
+    pub hourly_chime_enabled: bool,
+    /// 功能勾选框：启用半点报时（每小时 :30），默认 true
+    pub half_hour_chime_enabled: bool,
+    /// 可选额外自定义报时分钟（除 0 与 30 之外的 0..=59 分钟），默认空
+    pub custom_chime_minutes: Vec<u8>,
     /// 单次报时重复播放次数（1..=10），默认 1
     pub chime_repeat_count: u8,
-    /// 半/整点报时是否播放内置提示音，默认 true
+    /// 整/半点报时是否播放内置提示音，默认 true
     pub chime_play_sound: bool,
-    /// 半/整点报时是否启用语音播报真实时间/自定义文字，默认 false
+    /// 整/半点报时是否启用语音播报真实时间/自定义文字，默认 false
     pub chime_tts_enabled: bool,
-    /// 半/整点语音播报模板（支持 {TIME}、{TIME12}、{PERIOD}、{HH}、{MM}）
+    /// 整/半点语音播报模板（支持 {TIME}、{TIME12}、{PERIOD}、{HH}、{MM}）
     pub chime_tts_template: String,
 
-    /// 是否启用农历/节假日特定报时音与问候语模式（提升电竞/网吧节庆交互体验），默认 false
+    /// 功能勾选框：启用内置公历/农历节假日自动播报（命中节日时切换问候语与提示音），默认 false
     pub holiday_enabled: bool,
     /// 节假日专属报时音文件路径（支持 WAV/MP3/OGG/FLAC，为空时沿用内置提示音）
     pub holiday_custom_audio_path: String,
     /// 节假日问候语播报模板（支持 {HOLIDAY}、{GREETING}、{LUNAR}、{TIME} 等变量）
     pub holiday_greeting_template: String,
-    /// 自定义节假日规则文本（如 "11-14=电竞周年庆|全场畅饮福利" 或 "L01-01=新春狂欢日"）
-    pub holiday_custom_rules: String,
-    /// 外部节假日 JSON 数据接口或本地清单路径（支持 http(s)://、file:// 或本地/共享路径）
-    pub holiday_data_source_url: String,
 
-    /// 托盘快捷全局静音模式（开启后暂不触发定时报时与餐饮提醒播报），默认 false
+    /// 托盘快捷全局静音模式（开启后暂不触发所有定时报时与闹钟播报），默认 false
     pub mute_mode: bool,
-    /// 是否启用静默时段，默认 false
+    /// 是否启用静默免打扰时段，默认 false
     pub quiet_enabled: bool,
     /// 静默开始时间（时、分），预设 00:00
     pub quiet_start_hour: u8,
@@ -132,21 +433,8 @@ pub struct AppConfig {
     pub quiet_end_hour: u8,
     pub quiet_end_minute: u8,
 
-    /// 是否启用餐饮/定时提醒，默认 false
-    pub meal_enabled: bool,
-    /// 餐饮提醒时间（时、分），预设 12:00
-    pub meal_hour: u8,
-    pub meal_minute: u8,
-    /// 餐饮提醒重复播放次数（1..=10），默认 1
-    pub meal_repeat_count: u8,
-    /// 餐饮提醒自定义音频文件路径（为空则仅播报内置提示音）
-    pub meal_custom_audio_path: String,
-    /// 播报自定义餐饮音频或语音时是否先播放内置提示音，默认 true
-    pub meal_play_chime_before_custom: bool,
-    /// 餐饮/定时提醒是否启用自定义文字转语音播报，默认 false
-    pub meal_tts_enabled: bool,
-    /// 餐饮/定时提醒自定义语音播报内容（支持 {TIME}、{PERIOD} 等变量）
-    pub meal_tts_text: String,
+    /// 自定义闹钟列表（支持多组闹钟、时间周期、提示音与文字转语音）
+    pub alarms: Vec<CustomAlarm>,
 
     /// 语音合成引擎（SAPI5 离线 / Microsoft Edge TTS 在线）
     pub tts_engine: TtsEngine,
@@ -166,7 +454,7 @@ pub struct AppConfig {
 
     /// 是否开启后台定期版本检查，默认 true
     pub update_check_enabled: bool,
-    /// 更新清单接口地址（JSON 格式：version, download_url, notes）
+    /// 更新清单接口地址（默认 Gitee 国内直连源，支持 GitHub 备用回退）
     pub update_check_url: String,
     /// 更新检查间隔（小时，1..=168），默认 6 小时
     pub update_check_interval_hours: u16,
@@ -180,7 +468,9 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            chime_minutes: vec![0, 30],
+            hourly_chime_enabled: true,
+            half_hour_chime_enabled: true,
+            custom_chime_minutes: Vec::new(),
             chime_repeat_count: 1,
             chime_play_sound: true,
             chime_tts_enabled: false,
@@ -188,22 +478,13 @@ impl Default for AppConfig {
             holiday_enabled: false,
             holiday_custom_audio_path: String::new(),
             holiday_greeting_template: "今天是{HOLIDAY}，{GREETING}现在时间，{TIME}".to_string(),
-            holiday_custom_rules: String::new(),
-            holiday_data_source_url: String::new(),
             mute_mode: false,
             quiet_enabled: false,
             quiet_start_hour: 0,
             quiet_start_minute: 0,
             quiet_end_hour: 8,
             quiet_end_minute: 0,
-            meal_enabled: false,
-            meal_hour: 12,
-            meal_minute: 0,
-            meal_repeat_count: 1,
-            meal_custom_audio_path: String::new(),
-            meal_play_chime_before_custom: true,
-            meal_tts_enabled: false,
-            meal_tts_text: "现在时间，{TIME}，请注意休息用餐".to_string(),
+            alarms: Vec::new(),
             tts_engine: TtsEngine::EdgeTts,
             edge_tts_voice: DEFAULT_EDGE_TTS_VOICE.to_string(),
             tts_rate: 0,
@@ -212,7 +493,7 @@ impl Default for AppConfig {
             auto_start: false,
             theme: ThemeMode::WarmLounge,
             update_check_enabled: true,
-            update_check_url: crate::version::DEFAULT_GITHUB_RELEASE_URL.to_string(),
+            update_check_url: crate::version::DEFAULT_UPDATE_URL.to_string(),
             update_check_interval_hours: 6,
             update_github_token: String::new(),
             web_console_enabled: false,
@@ -221,14 +502,43 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// 解析并校验逗号/中文逗号分隔的报时分钟字符串，例如 "0, 30" 或 "0，15，30，45"
+    /// 解析逗号/中文逗号分隔的额外报时分钟（允许为空；0 与 30 请通过勾选框控制，此处自动去重兼容）
+    pub fn parse_optional_extra_minutes(input: &str) -> Result<Vec<u8>, String> {
+        let normalized = input.replace('，', ",").replace('、', ",");
+        let trimmed = normalized.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut result = Vec::new();
+        for token in trimmed.split(',') {
+            let part = token.trim();
+            if part.is_empty() {
+                return Err("额外报时分钟格式有误：检测到多余的逗号分隔符。".to_string());
+            }
+            let val: u16 = part
+                .parse()
+                .map_err(|_| format!("“{part}”不是有效的整数，请输入 0–59 之间的数字。"))?;
+            if val > 59 {
+                return Err(format!("分钟数值 {val} 超出范围，有效范围为 0–59。"));
+            }
+            let minute = val as u8;
+            if minute != 0 && minute != 30 && !result.contains(&minute) {
+                result.push(minute);
+            }
+        }
+        result.sort_unstable();
+        Ok(result)
+    }
+
+    /// 兼容解析：如在测试或脚本中一次性传入 "0, 15, 30"，同步映射整点/半点与额外分钟
+    #[allow(dead_code)]
     pub fn parse_chime_minutes(input: &str) -> Result<Vec<u8>, String> {
         let normalized = input.replace('，', ",").replace('、', ",");
         let trimmed = normalized.trim();
         if trimmed.is_empty() {
-            return Err("报时分钟不能为空，请至少填写一个 0–59 的整数（如 0, 30）。".to_string());
+            return Ok(Vec::new());
         }
-
         let mut result = Vec::new();
         for token in trimmed.split(',') {
             let part = token.trim();
@@ -246,37 +556,96 @@ impl AppConfig {
                 result.push(minute);
             }
         }
-
         result.sort_unstable();
         Ok(result)
     }
 
-    pub fn format_chime_minutes(&self) -> String {
-        self.chime_minutes
+    /// 计算当前启用的全部报时分钟集合（由整点、半点勾选框及可选额外分钟共同组成）
+    pub fn effective_chime_minutes(&self) -> Vec<u8> {
+        let mut mins = Vec::new();
+        if self.hourly_chime_enabled {
+            mins.push(0);
+        }
+        if self.half_hour_chime_enabled {
+            mins.push(30);
+        }
+        for &m in &self.custom_chime_minutes {
+            if m <= 59 && !mins.contains(&m) {
+                mins.push(m);
+            }
+        }
+        mins.sort_unstable();
+        mins
+    }
+
+    pub fn format_custom_chime_minutes(&self) -> String {
+        self.custom_chime_minutes
             .iter()
+            .filter(|&&m| m != 0 && m != 30)
             .map(|m| m.to_string())
             .collect::<Vec<_>>()
             .join(", ")
     }
 
-    /// 对整份配置做严格合法性校验与规范化（FR-21 / 3.5）
-    pub fn validate(&mut self) -> Result<(), String> {
-        if self.chime_minutes.is_empty() {
-            return Err("报时分钟集合不能为空。".to_string());
+    pub fn format_chime_minutes(&self) -> String {
+        let mins = self.effective_chime_minutes();
+        if mins.is_empty() {
+            "未启用整/半点报时".to_string()
+        } else {
+            mins.iter()
+                .map(|m| format!(":{m:02}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         }
-        for &m in &self.chime_minutes {
+    }
+
+    /// 主窗次级操作栏可读摘要（例如："整点 + 半点 · 节假日 · 2 个闹钟"）
+    pub fn format_chime_summary(&self) -> String {
+        let mut parts = Vec::new();
+        match (self.hourly_chime_enabled, self.half_hour_chime_enabled) {
+            (true, true) => parts.push("整点 + 半点报时".to_string()),
+            (true, false) => parts.push("仅整点报时".to_string()),
+            (false, true) => parts.push("仅半点报时".to_string()),
+            (false, false) => {}
+        }
+        if !self.custom_chime_minutes.is_empty() {
+            parts.push(format!(
+                "额外分钟 {}",
+                self.format_custom_chime_minutes()
+            ));
+        }
+        if self.holiday_enabled {
+            parts.push("节假日播报".to_string());
+        }
+        let enabled_alarms = self.alarms.iter().filter(|a| a.enabled).count();
+        if enabled_alarms > 0 {
+            parts.push(format!("闹钟 {enabled_alarms} 个"));
+        }
+        if parts.is_empty() {
+            "暂无启用的报时或闹钟".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
+
+    pub fn next_alarm_id(&self) -> u64 {
+        self.alarms.iter().map(|a| a.id).max().unwrap_or(0) + 1
+    }
+
+    /// 对整份配置做严格合法性校验与规范化
+    pub fn validate(&mut self) -> Result<(), String> {
+        for &m in &self.custom_chime_minutes {
             if m > 59 {
-                return Err(format!("报时分钟 {m} 无效，应在 0–59 之间。"));
+                return Err(format!("额外报时分钟 {m} 无效，应在 0–59 之间。"));
             }
         }
-        self.chime_minutes.sort_unstable();
-        self.chime_minutes.dedup();
+        self.custom_chime_minutes
+            .retain(|&m| m != 0 && m != 30);
+        self.custom_chime_minutes.sort_unstable();
+        self.custom_chime_minutes.dedup();
 
         if !(1..=10).contains(&self.chime_repeat_count) {
             return Err("报时播放次数必须在 1–10 次之间。".to_string());
-        }
-        if !(1..=10).contains(&self.meal_repeat_count) {
-            return Err("餐饮提醒播放次数必须在 1–10 次之间。".to_string());
         }
 
         if self.quiet_start_hour > 23 || self.quiet_start_minute > 59 {
@@ -292,9 +661,6 @@ impl AppConfig {
             return Err("静默开始时间与结束时间不能完全相同。".to_string());
         }
 
-        if self.meal_hour > 23 || self.meal_minute > 59 {
-            return Err("餐饮提醒时间无效（小时 0–23，分钟 0–59）。".to_string());
-        }
         if self.volume > 100 {
             self.volume = 100;
         }
@@ -308,10 +674,7 @@ impl AppConfig {
         }
         self.ntp_server = server;
 
-        let mut update_url = self.update_check_url.trim().to_string();
-        if update_url.is_empty() {
-            update_url = crate::version::DEFAULT_GITHUB_RELEASE_URL.to_string();
-        }
+        let update_url = crate::version::migrate_legacy_update_url(&self.update_check_url);
         let is_valid_update_target = update_url.starts_with("https://")
             || update_url.starts_with("http://")
             || update_url.starts_with("file://")
@@ -335,49 +698,63 @@ impl AppConfig {
             return Err("更新检查周期必须在 1–168 小时之间。".to_string());
         }
 
-        self.meal_custom_audio_path = self.meal_custom_audio_path.trim().to_string();
         self.chime_tts_template = self.chime_tts_template.trim().to_string();
         self.holiday_custom_audio_path = self.holiday_custom_audio_path.trim().to_string();
         self.holiday_greeting_template = self.holiday_greeting_template.trim().to_string();
-        self.holiday_custom_rules = self.holiday_custom_rules.trim().to_string();
-        self.holiday_data_source_url = self.holiday_data_source_url.trim().to_string();
-        self.meal_tts_text = self.meal_tts_text.trim().to_string();
         self.edge_tts_voice = self.edge_tts_voice.trim().to_string();
         if self.edge_tts_voice.is_empty() {
             self.edge_tts_voice = DEFAULT_EDGE_TTS_VOICE.to_string();
         }
         self.tts_rate = self.tts_rate.clamp(-5, 5);
 
-        let holiday_url = &self.holiday_data_source_url;
-        let is_valid_holiday_src = holiday_url.is_empty()
-            || holiday_url.starts_with("https://")
-            || holiday_url.starts_with("http://")
-            || holiday_url.starts_with("file://")
-            || holiday_url.starts_with("\\\\")
-            || holiday_url
-                .as_bytes()
-                .get(1)
-                .map(|&b| b == b':')
-                .unwrap_or(false);
-        if !is_valid_holiday_src {
-            return Err(
-                "节假日数据源须为 http(s):// 接口地址、局域网共享路径或本地 JSON 文件路径"
-                    .to_string(),
-            );
+        let has_any_chime = !self.effective_chime_minutes().is_empty();
+        if has_any_chime && !self.chime_play_sound && !self.chime_tts_enabled && !self.holiday_enabled
+        {
+            return Err("已启用整/半点报时，请至少勾选“内置提示音”或“语音播报真实时间”中的一项。".to_string());
+        }
+        if has_any_chime && self.chime_tts_enabled && self.chime_tts_template.is_empty() {
+            return Err("已开启语音报时，请填写播报文字模板（例如：现在时间，{TIME}）。".to_string());
         }
 
-        if !self.chime_play_sound && !self.chime_tts_enabled && !self.holiday_enabled {
-            return Err("半/整点报时须至少启用“提示音”或“语音播报”中的一项。".to_string());
-        }
-        if self.chime_tts_enabled && self.chime_tts_template.is_empty() {
-            return Err("已开启半/整点语音播报，请填写播报文字模板（例如：现在时间，{TIME}）。".to_string());
-        }
-        if self.meal_enabled && self.meal_tts_enabled && self.meal_tts_text.is_empty() {
-            return Err("已开启定时提醒文字转语音，请填写播报文字内容。".to_string());
+        // 确保每个自定义闹钟拥有唯一正整数 ID 与合法字段
+        let mut next_id = self.alarms.iter().map(|a| a.id).max().unwrap_or(0) + 1;
+        let mut seen_ids = Vec::with_capacity(self.alarms.len());
+        let now = Local::now();
+        for alarm in &mut self.alarms {
+            if alarm.id == 0 || seen_ids.contains(&alarm.id) {
+                alarm.id = next_id;
+                next_id += 1;
+            }
+            seen_ids.push(alarm.id);
+            alarm.validate()?;
+            if alarm.repeat_mode == AlarmRepeatMode::IntervalDays && alarm.anchor_date.is_empty() {
+                alarm.anchor_date = now.date_naive().format("%Y-%m-%d").to_string();
+            }
+            if alarm.repeat_mode == AlarmRepeatMode::Once && alarm.once_date.is_empty() {
+                alarm.ensure_anchor_and_once_dates(now.date_naive(), now.hour(), now.minute());
+            }
         }
 
         Ok(())
     }
+}
+
+/// 兼容旧版本 config.json 的轻量迁移动态视图（无声迁移 chime_minutes / 启用中的餐饮提醒）
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct LegacyConfigHint {
+    hourly_chime_enabled: Option<bool>,
+    half_hour_chime_enabled: Option<bool>,
+    chime_minutes: Option<Vec<u8>>,
+    alarms: Option<Vec<CustomAlarm>>,
+    meal_enabled: Option<bool>,
+    meal_hour: Option<u8>,
+    meal_minute: Option<u8>,
+    meal_repeat_count: Option<u8>,
+    meal_custom_audio_path: Option<String>,
+    meal_play_chime_before_custom: Option<bool>,
+    meal_tts_enabled: Option<bool>,
+    meal_tts_text: Option<String>,
 }
 
 fn number_to_zh(n: u32) -> String {
@@ -458,6 +835,17 @@ pub fn render_tts_template(template: &str, hour: u32, minute: u32) -> String {
         .replace("{M}", &minute.to_string())
 }
 
+/// 渲染闹钟语音播报文本：支持 {LABEL} 与全部时间占位符
+pub fn render_alarm_tts_template(
+    template: &str,
+    label: &str,
+    hour: u32,
+    minute: u32,
+) -> String {
+    let expanded = template.trim().replace("{LABEL}", label.trim());
+    render_tts_template(&expanded, hour, minute)
+}
+
 /// 渲染节假日问候语模板：支持 {HOLIDAY}、{GREETING}、{LUNAR} 及全部时间变量
 pub fn render_holiday_template(
     template: &str,
@@ -490,7 +878,7 @@ impl ConfigStore {
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(exe_dir) = exe_path.parent() {
                 let portable_path = exe_dir.join("config.json");
-                // 若已存在便携配置且可读，或者当前目录可写，则采用便携模式（方便网吧批量拷盘）
+                // 若已存在便携配置且可读，或者当前目录可写，则采用便携模式（方便随身携带与迁移）
                 if portable_path.exists() || Self::is_dir_writable(exe_dir) {
                     return Self { path: portable_path };
                 }
@@ -518,7 +906,7 @@ impl ConfigStore {
         }
     }
 
-    /// 加载配置：文件不存在则生成默认配置；文件损坏则备份后安全恢复默认值（4.2 / 5.4）
+    /// 加载配置：文件不存在则生成默认配置；文件损坏则备份后安全恢复默认值；旧版配置自动无感迁移
     pub fn load_or_init(&self) -> (AppConfig, Option<String>) {
         if !self.path.exists() {
             let cfg = AppConfig::default();
@@ -529,6 +917,54 @@ impl ConfigStore {
         match fs::read_to_string(&self.path) {
             Ok(raw) => match serde_json::from_str::<AppConfig>(&raw) {
                 Ok(mut cfg) => {
+                    let raw_update_url = cfg.update_check_url.clone();
+                    let mut migrated = false;
+
+                    if let Ok(hint) = serde_json::from_str::<LegacyConfigHint>(&raw) {
+                        if hint.hourly_chime_enabled.is_none()
+                            && hint.half_hour_chime_enabled.is_none()
+                        {
+                            if let Some(old_mins) = hint.chime_minutes {
+                                cfg.hourly_chime_enabled = old_mins.contains(&0);
+                                cfg.half_hour_chime_enabled = old_mins.contains(&30);
+                                cfg.custom_chime_minutes = old_mins
+                                    .into_iter()
+                                    .filter(|&m| m != 0 && m != 30 && m <= 59)
+                                    .collect();
+                                migrated = true;
+                            }
+                        }
+
+                        if hint.alarms.is_none() && hint.meal_enabled == Some(true) {
+                            let text = hint
+                                .meal_tts_text
+                                .unwrap_or_else(|| "现在时间，{TIME}，请注意休息".to_string());
+                            let custom_audio = hint.meal_custom_audio_path.unwrap_or_default();
+                            let tts_enabled = hint.meal_tts_enabled.unwrap_or(false);
+                            let play_before = hint.meal_play_chime_before_custom.unwrap_or(true);
+                            cfg.alarms.push(CustomAlarm {
+                                id: 1,
+                                label: "定时提醒".to_string(),
+                                enabled: true,
+                                hour: hint.meal_hour.unwrap_or(12).min(23),
+                                minute: hint.meal_minute.unwrap_or(0).min(59),
+                                repeat_mode: AlarmRepeatMode::Daily,
+                                weekdays: [true; 7],
+                                interval_days: 1,
+                                anchor_date: String::new(),
+                                once_date: String::new(),
+                                repeat_count: hint.meal_repeat_count.unwrap_or(1).clamp(1, 10),
+                                play_chime_before: play_before
+                                    || (!tts_enabled && custom_audio.trim().is_empty()),
+                                tts_enabled,
+                                tts_text: text,
+                                custom_audio_path: custom_audio,
+                                respect_quiet_hours: false,
+                            });
+                            migrated = true;
+                        }
+                    }
+
                     if let Err(err) = cfg.validate() {
                         let fallback = AppConfig::default();
                         self.backup_corrupted();
@@ -537,6 +973,9 @@ impl ConfigStore {
                             fallback,
                             Some(format!("配置文件字段异常（{err}），已备份并恢复默认设置")),
                         );
+                    }
+                    if migrated || cfg.update_check_url != raw_update_url {
+                        let _ = self.save(&cfg);
                     }
                     (cfg, None)
                 }
@@ -578,7 +1017,6 @@ impl ConfigStore {
         fs::write(&tmp_path, json.as_bytes())
             .map_err(|e| format!("写入临时配置文件失败：{e}"))?;
 
-        // Windows 下若目标文件存在，fs::rename 可在现代 Rust std 下原子替换（若报错则先移除再重命名）
         if fs::rename(&tmp_path, &self.path).is_err() {
             let _ = fs::remove_file(&self.path);
             fs::rename(&tmp_path, &self.path)
@@ -596,14 +1034,16 @@ mod tests {
     fn test_parse_chime_minutes_valid() {
         let parsed = AppConfig::parse_chime_minutes("30, 0，30, 15").unwrap();
         assert_eq!(parsed, vec![0, 15, 30]);
+        let extra = AppConfig::parse_optional_extra_minutes("0, 15, 30，45").unwrap();
+        assert_eq!(extra, vec![15, 45]);
+        assert!(AppConfig::parse_optional_extra_minutes("").unwrap().is_empty());
     }
 
     #[test]
     fn test_parse_chime_minutes_invalid() {
-        assert!(AppConfig::parse_chime_minutes("").is_err());
-        assert!(AppConfig::parse_chime_minutes("60").is_err());
-        assert!(AppConfig::parse_chime_minutes("0,,30").is_err());
-        assert!(AppConfig::parse_chime_minutes("abc").is_err());
+        assert!(AppConfig::parse_optional_extra_minutes("60").is_err());
+        assert!(AppConfig::parse_optional_extra_minutes("0,,30").is_err());
+        assert!(AppConfig::parse_optional_extra_minutes("abc").is_err());
     }
 
     #[test]
@@ -632,14 +1072,22 @@ mod tests {
             "现在时间，两点零五分"
         );
         assert_eq!(
-            render_tts_template("现在是{TIME12}（{HH}:{MM}）", 14, 30),
-            "现在是下午两点三十分（14:30）"
+            render_alarm_tts_template("现在时间，{TIME}，{LABEL}", "喝水休息", 15, 0),
+            "现在时间，十五点整，喝水休息"
         );
     }
 
     #[test]
-    fn test_validate_tts_rules() {
+    fn test_validate_chime_checkboxes_and_alarms() {
+        // 允许全部取消整/半点勾选（纯自定义闹钟模式）
         let mut cfg = AppConfig::default();
+        cfg.hourly_chime_enabled = false;
+        cfg.half_hour_chime_enabled = false;
+        cfg.chime_play_sound = false;
+        assert!(cfg.validate().is_ok());
+
+        // 启用整点或半点时，提示音/语音不可同时关闭
+        cfg.hourly_chime_enabled = true;
         cfg.chime_play_sound = false;
         cfg.chime_tts_enabled = false;
         assert!(cfg.validate().is_err());
@@ -651,9 +1099,15 @@ mod tests {
         cfg.chime_tts_template = "现在时间，{TIME}".to_string();
         assert!(cfg.validate().is_ok());
 
-        cfg.meal_enabled = true;
-        cfg.meal_tts_enabled = true;
-        cfg.meal_tts_text = "".to_string();
+        // 闹钟校验：开启 TTS 但文本为空应拦截
+        cfg.alarms.push(CustomAlarm {
+            id: 1,
+            label: "喝水".to_string(),
+            enabled: true,
+            tts_enabled: true,
+            tts_text: "".to_string(),
+            ..CustomAlarm::default()
+        });
         assert!(cfg.validate().is_err());
     }
 

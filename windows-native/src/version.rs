@@ -7,9 +7,16 @@ pub const APP_PKG_VERSION: &str = match option_env!("APP_BUILD_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
-pub const DEFAULT_GITHUB_RELEASE_URL: &str = match option_env!("DEFAULT_UPDATE_CHECK_URL") {
+pub const DEFAULT_GITEE_RELEASE_URL: &str = "https://gitee.com/djjz/HalfHourChime/releases/latest";
+pub const DEFAULT_GITEE_API_LATEST_URL: &str =
+    "https://gitee.com/api/v5/repos/djjz/HalfHourChime/releases/latest";
+pub const DEFAULT_GITHUB_RELEASE_URL: &str = match option_env!("DEFAULT_GITHUB_RELEASE_URL") {
     Some(v) => v,
-    None => "https://github.com/cqcmd/-/releases/latest",
+    None => "https://github.com/cqcmd/HalfHourChime/releases/latest",
+};
+pub const DEFAULT_UPDATE_URL: &str = match option_env!("DEFAULT_UPDATE_CHECK_URL") {
+    Some(v) => v,
+    None => DEFAULT_GITEE_RELEASE_URL,
 };
 
 /// 三段式 + 日期版本号模型（本地构建每段 0–9 满 10 进位；远端对比兼容无日期或更大数字段）
@@ -157,11 +164,72 @@ struct GitReleaseResponse {
     assets: Vec<GitReleaseAsset>,
 }
 
+/// 自动将空地址或已更名的旧仓库地址（cqcmd/-）迁移为当前默认更新源（Gitee 国内直连源）
+pub fn migrate_legacy_update_url(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_UPDATE_URL.to_string();
+    }
+    if let Some((owner, repo)) = extract_github_owner_repo(trimmed) {
+        if owner.eq_ignore_ascii_case("cqcmd") && repo == "-" {
+            return DEFAULT_UPDATE_URL.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// 判断更新地址是否指向本项目官方 GitHub 仓库（用于无代理受限时自动回退至 Gitee 镜像）
+pub fn is_official_github_release_url(url: &str) -> bool {
+    extract_github_owner_repo(url).is_some_and(|(owner, repo)| {
+        owner.eq_ignore_ascii_case("cqcmd")
+            && (repo.eq_ignore_ascii_case("HalfHourChime") || repo == "-")
+    })
+}
+
+/// 判断更新地址是否指向本项目官方 Gitee 仓库（用于在 Gitee 异常时自动回退至 GitHub 源）
+pub fn is_official_gitee_release_url(url: &str) -> bool {
+    extract_gitee_owner_repo(url).is_some_and(|(owner, repo)| {
+        owner.eq_ignore_ascii_case("djjz") && repo.eq_ignore_ascii_case("HalfHourChime")
+    })
+}
+
+fn normalize_release_tag(tag_or_version: &str) -> Option<String> {
+    let raw = tag_or_version.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let normalized = raw.replace('+', "-");
+    let tag = if normalized.starts_with('v') || normalized.starts_with('V') {
+        format!("v{}", &normalized[1..])
+    } else {
+        format!("v{normalized}")
+    };
+    Some(tag)
+}
+
+/// 根据版本号或 Tag 构造 Gitee 官方镜像源对应版本的安装包直链
+pub fn build_gitee_mirror_exe_url(tag_or_version: &str) -> Option<String> {
+    let tag = normalize_release_tag(tag_or_version)?;
+    Some(format!(
+        "https://gitee.com/djjz/HalfHourChime/releases/download/{tag}/HalfHourChime.exe"
+    ))
+}
+
+/// 根据版本号或 Tag 构造 GitHub 官方源对应版本的安装包直链
+pub fn build_github_mirror_exe_url(tag_or_version: &str) -> Option<String> {
+    let tag = normalize_release_tag(tag_or_version)?;
+    Some(format!(
+        "https://github.com/cqcmd/HalfHourChime/releases/download/{tag}/HalfHourChime.exe"
+    ))
+}
+
 /// 识别并标准化更新检查地址：
 /// - 支持 `https://github.com/owner/repo/releases/latest` 自动转为 GitHub Releases API
+/// - 支持 `https://gitee.com/owner/repo/releases/latest` 自动转为 Gitee OpenAPI v5 Releases
 /// - 支持 `https://drive.google.com/file/d/<id>/view` 自动转为直链下载
 pub fn normalize_update_check_url(input: &str) -> String {
-    let trimmed = input.trim();
+    let migrated = migrate_legacy_update_url(input);
+    let trimmed = migrated.trim();
     if trimmed.is_empty() {
         return String::new();
     }
@@ -172,6 +240,10 @@ pub fn normalize_update_check_url(input: &str) -> String {
 
     if let Some((owner, repo)) = extract_github_owner_repo(trimmed) {
         return format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
+    }
+
+    if let Some((owner, repo)) = extract_gitee_owner_repo(trimmed) {
+        return format!("https://gitee.com/api/v5/repos/{owner}/{repo}/releases/latest");
     }
 
     trimmed.to_string()
@@ -248,6 +320,48 @@ pub fn extract_github_owner_repo(url: &str) -> Option<(String, String)> {
     None
 }
 
+pub fn extract_gitee_owner_repo(url: &str) -> Option<(String, String)> {
+    let trimmed = url.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix("https://gitee.com/api/v5/repos/")
+        .or_else(|| trimmed.strip_prefix("http://gitee.com/api/v5/repos/"))
+    {
+        let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 2 {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+
+    let rest = trimmed
+        .strip_prefix("https://gitee.com/")
+        .or_else(|| trimmed.strip_prefix("http://gitee.com/"))?;
+    let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let owner = parts[0];
+    let repo = parts[1].trim_end_matches(".git");
+    if parts.len() == 2 || parts[2].eq_ignore_ascii_case("releases") {
+        return Some((owner.to_string(), repo.to_string()));
+    }
+    None
+}
+
+fn asset_effective_name_lower(asset: &GitReleaseAsset) -> String {
+    let trimmed_name = asset.name.trim();
+    if !trimmed_name.is_empty() {
+        return trimmed_name.to_ascii_lowercase();
+    }
+    asset
+        .browser_download_url
+        .split('?')
+        .next()
+        .and_then(|p| p.rsplit('/').next())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
 fn convert_git_release(rel: GitReleaseResponse) -> Option<RemoteVersionManifest> {
     let version = if !rel.tag_name.trim().is_empty() {
         rel.tag_name.trim().to_string()
@@ -262,18 +376,18 @@ fn convert_git_release(rel: GitReleaseResponse) -> Option<RemoteVersionManifest>
         .assets
         .iter()
         .find(|a| {
-            let n = a.name.to_ascii_lowercase();
+            let n = asset_effective_name_lower(a);
             n.ends_with(".exe") && n.contains("halfhourchime")
         })
         .or_else(|| {
             rel.assets
                 .iter()
-                .find(|a| a.name.to_ascii_lowercase().ends_with(".exe"))
+                .find(|a| asset_effective_name_lower(a).ends_with(".exe"))
         })
         .or_else(|| {
             rel.assets
                 .iter()
-                .find(|a| a.name.to_ascii_lowercase().ends_with(".msi"))
+                .find(|a| asset_effective_name_lower(a).ends_with(".msi"))
         })
         .or_else(|| rel.assets.first());
 
@@ -435,10 +549,39 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_github_and_drive_urls() {
+    fn test_normalize_github_gitee_and_drive_urls() {
         assert_eq!(
             normalize_update_check_url("https://github.com/foo/bar/releases/latest"),
             "https://api.github.com/repos/foo/bar/releases/latest"
+        );
+        assert_eq!(
+            normalize_update_check_url("https://github.com/cqcmd/-/releases/latest"),
+            "https://gitee.com/api/v5/repos/djjz/HalfHourChime/releases/latest"
+        );
+        assert_eq!(
+            normalize_update_check_url("https://gitee.com/djjz/HalfHourChime/releases/latest"),
+            "https://gitee.com/api/v5/repos/djjz/HalfHourChime/releases/latest"
+        );
+        assert_eq!(
+            extract_gitee_owner_repo("https://gitee.com/djjz/HalfHourChime"),
+            Some(("djjz".to_string(), "HalfHourChime".to_string()))
+        );
+        assert!(is_official_gitee_release_url(
+            "https://gitee.com/djjz/HalfHourChime/releases/latest"
+        ));
+        assert!(is_official_github_release_url(
+            "https://github.com/cqcmd/HalfHourChime/releases/latest"
+        ));
+        assert!(is_official_github_release_url(
+            "https://api.github.com/repos/cqcmd/-/releases/latest"
+        ));
+        assert_eq!(
+            build_gitee_mirror_exe_url("v2.0.5+20261117").as_deref(),
+            Some("https://gitee.com/djjz/HalfHourChime/releases/download/v2.0.5-20261117/HalfHourChime.exe")
+        );
+        assert_eq!(
+            build_github_mirror_exe_url("v2.0.5+20261117").as_deref(),
+            Some("https://github.com/cqcmd/HalfHourChime/releases/download/v2.0.5-20261117/HalfHourChime.exe")
         );
         assert_eq!(
             extract_github_owner_repo("https://api.github.com/repos/cqcmd/-/releases/latest"),

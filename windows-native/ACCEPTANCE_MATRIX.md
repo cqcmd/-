@@ -4,7 +4,7 @@
 | --- | --- | --- | --- |
 | AC-01 | 报时准确 | `scheduler.rs` 采用 `250ms` 节拍检测分钟变化与槽位防重入，误差 $< 0.25\text{s}$ | FR-01..03 |
 | AC-02 | 静默生效 | `Scheduler::is_quiet_at` 覆盖同日与跨日区间（如 `23:00–07:00`），主窗明确显示“静默中” | FR-04..06 |
-| AC-03 | 餐饮提醒 | 独立 `meal_enabled` 开关与 `meal_hour:meal_minute` 匹配，播放内置 `meal.wav` | FR-07..08 |
+| AC-03 | 自定义闹钟 | `config.rs`/`scheduler.rs` 支持多组 `CustomAlarm`（仅一次/每天/工作日/周末/每周/每N天）、TTS 模板、Alert 弹窗与 5 分钟稍后提醒 | FR-07..08 |
 | AC-04 | 音量实时 | `SettingsWindow` 拖动 `VolumeSlider` 实时触发 `AudioEngine::set_live_volume` 生效 | FR-09..10 |
 | AC-05 | 校时可用 | `ntp.rs` 通过 UDP RFC 4330 取时并调用 `SetSystemTime`（必要时触发按需 UAC 提权） | FR-11..13 |
 | AC-06 | 托盘交互 | `win_sys.rs` 提供 6 项托盘右键菜单；双击唤出主窗；主窗关闭隐藏不退出；仅“退出”终止 | FR-14..17 |

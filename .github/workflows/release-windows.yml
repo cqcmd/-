@@ -275,7 +275,8 @@ jobs:
             "- **编译平台**：Windows x86_64（MSVC 静态链接，零外部运行库依赖）",
             "- **体积优化**：$packInfo",
             "- **交付文件**：``HalfHourChime.exe``（双击即用）与 ``version.json``",
-            "- **自动更新接口**：``https://github.com/$env:GITHUB_REPOSITORY/releases/latest``"
+            "- **自动更新默认源（国内直连）**：``https://gitee.com/djjz/HalfHourChime/releases/latest``",
+            "- **自动更新备用源**：``https://github.com/$env:GITHUB_REPOSITORY/releases/latest``"
           )
           $releaseBody = $releaseLines -join "`n"
           $notesPath = Join-Path $PWD "windows-native/dist/release_notes.md"
@@ -304,3 +305,153 @@ jobs:
           files: |
             windows-native/dist/HalfHourChime.exe
             windows-native/dist/version.json
+
+      - name: Sync repository and Release to Gitee mirror
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+        shell: pwsh
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $token = "$env:GITEE_TOKEN".Trim()
+          $owner = "$env:GITEE_OWNER".Trim()
+          $repo = "$env:GITEE_REPO".Trim()
+          if ([string]::IsNullOrWhiteSpace($token) -or [string]::IsNullOrWhiteSpace($owner) -or [string]::IsNullOrWhiteSpace($repo)) {
+            Write-Host "GITEE_TOKEN / GITEE_OWNER / GITEE_REPO 未全部配置，跳过 Gitee 镜像同步。"
+            exit 0
+          }
+          Write-Host "::add-mask::$token"
+
+          function Mask-Token([string]$text) {
+            if ([string]::IsNullOrWhiteSpace($text)) { return "" }
+            return $text.Replace($token, "***")
+          }
+
+          $ver = "${{ steps.meta.outputs.version }}".Trim()
+          $tag = "${{ steps.meta.outputs.tag }}".Trim()
+          $branch = if ($env:GITHUB_REF_TYPE -eq "branch" -and -not [string]::IsNullOrWhiteSpace($env:GITHUB_REF_NAME)) {
+            $env:GITHUB_REF_NAME.Trim()
+          } else {
+            "main"
+          }
+
+          # 1. 确保本地存在发布 Tag，并将代码分支与 Tag 镜像推送到 Gitee
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          $ErrorActionPreference = "Continue"
+          $tagExists = git rev-parse -q --verify "refs/tags/$tag" 2>$null
+          $ErrorActionPreference = "Stop"
+          if (-not $tagExists) {
+            git tag -f "$tag"
+          }
+
+          $remoteUrl = "https://${owner}:${token}@gitee.com/${owner}/${repo}.git"
+          $ErrorActionPreference = "Continue"
+          $pushBranchOut = git -c credential.helper= push --force $remoteUrl "HEAD:refs/heads/$branch" 2>&1
+          $pushBranchCode = $LASTEXITCODE
+          $pushTagOut = git -c credential.helper= push --force $remoteUrl "refs/tags/${tag}:refs/tags/${tag}" 2>&1
+          $pushTagCode = $LASTEXITCODE
+          $ErrorActionPreference = "Stop"
+
+          if ($pushBranchCode -ne 0) {
+            throw ("推送代码分支到 Gitee 失败: " + (Mask-Token ($pushBranchOut | Out-String)))
+          }
+          if ($pushTagCode -ne 0) {
+            throw ("推送版本 Tag 到 Gitee 失败: " + (Mask-Token ($pushTagOut | Out-String)))
+          }
+          Write-Host "已同步代码分支 ($branch) 与 Tag ($tag) 到 https://gitee.com/$owner/$repo"
+
+          # 2. 生成指向 Gitee 下载直链的 version.json
+          $origManifest = Get-Content "windows-native/dist/version.json" -Raw -Encoding utf8 | ConvertFrom-Json
+          $giteeDir = "windows-native/dist/gitee"
+          New-Item -ItemType Directory -Force -Path $giteeDir | Out-Null
+          $giteeManifest = [ordered]@{
+            version      = $origManifest.version
+            download_url = "https://gitee.com/$owner/$repo/releases/download/$tag/HalfHourChime.exe"
+            package_type = $origManifest.package_type
+            notes        = $origManifest.notes
+          } | ConvertTo-Json -Depth 4
+          $giteeManifestPath = Join-Path $PWD "$giteeDir/version.json"
+          [System.IO.File]::WriteAllText($giteeManifestPath, $giteeManifest, (New-Object System.Text.UTF8Encoding($false)))
+
+          # 3. 创建或更新 Gitee Release
+          $releaseName = "半整点提醒 v$ver"
+          $releaseBody = (Get-Content "windows-native/dist/release_notes.md" -Raw -Encoding utf8) + "`n- **国内镜像源**：``https://gitee.com/$owner/$repo/releases/latest``"
+          $apiBase = "https://gitee.com/api/v5/repos/$owner/$repo/releases"
+          $encodedTag = [System.Uri]::EscapeDataString($tag)
+
+          $releaseId = $null
+          try {
+            $existing = Invoke-RestMethod -Method Get -Uri "$apiBase/tags/${encodedTag}?access_token=$token"
+            if ($existing -and $existing.id) {
+              $releaseId = $existing.id
+            }
+          } catch {
+            $releaseId = $null
+          }
+
+          if ($releaseId) {
+            $patchBody = @{
+              access_token = $token
+              tag_name     = $tag
+              name         = $releaseName
+              body         = $releaseBody
+              prerelease   = $false
+            } | ConvertTo-Json -Depth 4
+            $patchBytes = [System.Text.Encoding]::UTF8.GetBytes($patchBody)
+            try {
+              $updated = Invoke-RestMethod -Method Patch -Uri "$apiBase/$releaseId" -ContentType "application/json; charset=utf-8" -Body $patchBytes
+              Write-Host "已更新现有 Gitee Release (id=$releaseId)"
+            } catch {
+              throw ("更新 Gitee Release 失败: " + (Mask-Token $_.Exception.Message))
+            }
+
+            try {
+              $existingFiles = Invoke-RestMethod -Method Get -Uri "$apiBase/$releaseId/attach_files?access_token=$token"
+              foreach ($f in @($existingFiles)) {
+                if ($f.name -in @("HalfHourChime.exe", "version.json")) {
+                  Invoke-RestMethod -Method Delete -Uri "$apiBase/$releaseId/attach_files/$($f.id)?access_token=$token" | Out-Null
+                }
+              }
+            } catch {
+              Write-Host "清理旧 Gitee 附件时跳过：$($_.Exception.Message)"
+            }
+          } else {
+            $createBody = @{
+              access_token     = $token
+              tag_name         = $tag
+              name             = $releaseName
+              body             = $releaseBody
+              prerelease       = $false
+              target_commitish = $branch
+            } | ConvertTo-Json -Depth 4
+            $createBytes = [System.Text.Encoding]::UTF8.GetBytes($createBody)
+            try {
+              $created = Invoke-RestMethod -Method Post -Uri $apiBase -ContentType "application/json; charset=utf-8" -Body $createBytes
+              $releaseId = $created.id
+              Write-Host "已创建 Gitee Release (id=$releaseId, tag=$tag)"
+            } catch {
+              throw ("创建 Gitee Release 失败: " + (Mask-Token $_.Exception.Message))
+            }
+          }
+
+          if (-not $releaseId) {
+            throw "未能获取 Gitee Release ID，无法上传附件。"
+          }
+
+          # 4. 上传 HalfHourChime.exe 与 version.json 到 Gitee Release
+          $exeDistPath = Join-Path $PWD "windows-native/dist/HalfHourChime.exe"
+          foreach ($assetPath in @($exeDistPath, $giteeManifestPath)) {
+            $respRaw = & curl.exe -sS -w "`n%{http_code}" -F "access_token=$token" -F "file=@$assetPath" "$apiBase/$releaseId/attach_files"
+            $curlCode = $LASTEXITCODE
+            $lines = @("$respRaw" -split "`r?`n")
+            $httpCode = if ($lines.Count -gt 0) { $lines[-1].Trim() } else { "000" }
+            if ($curlCode -ne 0 -or -not ($httpCode -match '^2\d\d$')) {
+              $bodyText = if ($lines.Count -gt 1) { ($lines[0..($lines.Count - 2)] -join "`n") } else { "" }
+              throw ("上传 Gitee Release 附件 $([System.IO.Path]::GetFileName($assetPath)) 失败 (curl=$curlCode, http=$httpCode): " + (Mask-Token $bodyText))
+            }
+            Write-Host "已上传附件到 Gitee Release：$([System.IO.Path]::GetFileName($assetPath))"
+          }
+

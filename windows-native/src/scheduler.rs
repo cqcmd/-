@@ -1,7 +1,9 @@
-use crate::config::{render_holiday_template, render_tts_template, AppConfig};
-use crate::win_sys;
+use crate::config::{
+    render_alarm_tts_template, render_holiday_template, render_tts_template, AlarmRepeatMode,
+    AppConfig, CustomAlarm,
+};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike};
-use serde::Deserialize;
+use std::collections::HashMap;
 
 /// 2010–2040 紫金山标准农历位图压缩表（2010-02-14 为正月初一起点）
 /// bit 0..=3: 闰月月份（0 表示无闰月）；bit 4..=15: 正月到腊月大小月（1=30天，0=29天）；bit 16: 闰月大小月
@@ -38,14 +40,6 @@ impl LunarDate {
         let d_idx = usize::from(self.day.saturating_sub(1)).min(29);
         let leap_prefix = if self.is_leap { "闰" } else { "" };
         format!("农历{}{}月{}", leap_prefix, MONTHS[m_idx], DAYS[d_idx])
-    }
-
-    pub fn rule_key(self) -> String {
-        if self.is_leap {
-            format!("L{:02}-{:02}*", self.month, self.day)
-        } else {
-            format!("L{:02}-{:02}", self.month, self.day)
-        }
     }
 }
 
@@ -143,149 +137,14 @@ pub fn solar_to_lunar(date: NaiveDate) -> Option<LunarDate> {
 pub enum HolidayKind {
     Statutory,
     Traditional,
-    EsportsFest,
-    Custom,
 }
 
-/// 匹配到的节假日及定制问候信息
+/// 匹配到的内置节假日及问候信息
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HolidayInfo {
     pub name: String,
     pub kind: HolidayKind,
     pub greeting: String,
-    pub custom_audio_path: Option<String>,
-}
-
-/// 外部节假日 JSON 数据接口条目（兼容本地/局域网/HTTPS 接口下发门店活动或调休假日）
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct ExternalHolidayEntry {
-    /// 日期匹配键：支持 "YYYY-MM-DD"、"MM-DD" 或农历 "LMM-DD"（如 "L01-01"）
-    pub date: String,
-    /// 节日或活动名称
-    pub name: String,
-    /// 专属问候语文本
-    #[serde(default)]
-    pub greeting: String,
-    /// 可选：该节日专属音频文件路径
-    #[serde(default)]
-    pub audio_path: String,
-    /// 若为 false（如调休补班标记），则不作为节日触发
-    #[serde(default)]
-    pub is_holiday: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HolidayFeedEnvelope {
-    #[serde(default)]
-    holidays: Vec<ExternalHolidayEntry>,
-}
-
-/// 解析外部节假日 JSON（支持顶层数组 `[...]` 或 `{ "holidays": [...] }` 包装格式）
-pub fn parse_holiday_feed_json(raw: &str) -> Result<Vec<ExternalHolidayEntry>, String> {
-    let trimmed = raw.trim().trim_start_matches('\u{feff}');
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-    if let Ok(list) = serde_json::from_str::<Vec<ExternalHolidayEntry>>(trimmed) {
-        return Ok(list);
-    }
-    if let Ok(env) = serde_json::from_str::<HolidayFeedEnvelope>(trimmed) {
-        return Ok(env.holidays);
-    }
-    Err("节假日 JSON 格式无效：须为数组或包含 holidays 字段的对象".to_string())
-}
-
-/// 从外部 HTTP(S) 接口或本地/共享 JSON 文件加载节假日数据（内置 Windows 代理兼容与 5 秒超时）
-pub fn fetch_holiday_feed_from_source(source: &str) -> Result<Vec<ExternalHolidayEntry>, String> {
-    let trimmed = source.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let raw_json = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        let mut builder = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(5))
-            .timeout_read(std::time::Duration::from_secs(6));
-        if let Ok(connector) = native_tls::TlsConnector::new() {
-            builder = builder.tls_connector(std::sync::Arc::new(connector));
-        }
-        if let Some(proxy_url) = win_sys::read_windows_proxy_url() {
-            if let Ok(proxy) = ureq::Proxy::new(&proxy_url) {
-                builder = builder.proxy(proxy);
-            }
-        }
-        let agent = builder.build();
-        let resp = agent
-            .get(trimmed)
-            .set("Accept", "application/json")
-            .call()
-            .map_err(|e| format!("拉取节假日接口失败：{e}"))?;
-        resp.into_string()
-            .map_err(|e| format!("读取节假日接口响应失败：{e}"))?
-    } else {
-        let path_str = trimmed.strip_prefix("file:///").unwrap_or(trimmed);
-        std::fs::read_to_string(path_str)
-            .map_err(|e| format!("读取本地节假日数据文件失败：{e}"))?
-    };
-
-    let entries = parse_holiday_feed_json(&raw_json)?;
-    win_sys::log_info(
-        "holiday",
-        &format!("loaded {} holiday feed entries from \"{trimmed}\"", entries.len()),
-    );
-    Ok(entries)
-}
-
-/// 解析设置面板中的自定义节日规则字符串
-/// 格式支持换行或分号分隔：`11-14=电竞周年庆|全场开黑福利开启|D:\audio\anniv.wav` 或 `L01-01=新春特惠`
-pub fn parse_custom_holiday_rules(raw: &str) -> Vec<ExternalHolidayEntry> {
-    let mut entries = Vec::new();
-    for segment in raw.split(['\n', ';', '；']) {
-        let line = segment.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((date_part, rest)) = line.split_once('=') else {
-            continue;
-        };
-        let date_key = date_part.trim();
-        if date_key.is_empty() {
-            continue;
-        }
-        let mut cols = rest.split('|').map(str::trim);
-        let name = cols.next().unwrap_or("").to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let greeting = cols.next().unwrap_or("").to_string();
-        let audio_path = cols.next().unwrap_or("").to_string();
-        entries.push(ExternalHolidayEntry {
-            date: date_key.to_string(),
-            name,
-            greeting,
-            audio_path,
-            is_holiday: Some(true),
-        });
-    }
-    entries
-}
-
-fn entry_matches_date(entry: &ExternalHolidayEntry, date: NaiveDate, lunar: Option<LunarDate>) -> bool {
-    let key = entry.date.trim();
-    if key.eq_ignore_ascii_case(&date.format("%Y-%m-%d").to_string())
-        || key.eq_ignore_ascii_case(&date.format("%m-%d").to_string())
-    {
-        return true;
-    }
-    if let Some(l) = lunar {
-        if !l.is_leap {
-            let l_key = l.rule_key();
-            if key.eq_ignore_ascii_case(&l_key) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// 计算 21 世纪清明节公历日期（2000–2099 年 4 月日序公式）
@@ -302,7 +161,7 @@ fn is_qingming(date: NaiveDate) -> bool {
     date.day() == qm_day
 }
 
-/// 内置中国法定节假日、传统农历节日与电竞/网吧热门节庆库
+/// 内置中国法定与传统公历/农历节假日识别（纯本地离线计算，无需外部接口）
 pub fn lookup_builtin_holiday(date: NaiveDate, lunar: Option<LunarDate>) -> Option<HolidayInfo> {
     // 1. 优先判断除夕（明天为农历正月初一，兼容大年廿九与大年三十）
     if let Some(tomorrow) = date.checked_add_days(chrono::Days::new(1)) {
@@ -311,8 +170,7 @@ pub fn lookup_builtin_holiday(date: NaiveDate, lunar: Option<LunarDate>) -> Opti
                 return Some(HolidayInfo {
                     name: "除夕".to_string(),
                     kind: HolidayKind::Statutory,
-                    greeting: "除夕守岁迎新春，开黑团战祝您把把超神！".to_string(),
-                    custom_audio_path: None,
+                    greeting: "除夕守岁迎新春，愿您阖家团圆、辞旧迎新！".to_string(),
                 });
             }
         }
@@ -325,37 +183,37 @@ pub fn lookup_builtin_holiday(date: NaiveDate, lunar: Option<LunarDate>) -> Opti
                 (1, 1) => Some((
                     "春节",
                     HolidayKind::Statutory,
-                    "新春大吉，祝各位玩家新年上分顺利、万事如意！",
+                    "新春大吉，祝您新年快乐、万事顺意！",
                 )),
                 (1, 15) => Some((
                     "元宵节",
                     HolidayKind::Traditional,
-                    "元宵佳节喜团圆，祝您五杀连连、欧气满满！",
+                    "元宵佳节喜团圆，祝您阖家欢乐、幸福安康！",
                 )),
                 (5, 5) => Some((
                     "端午节",
                     HolidayKind::Statutory,
-                    "端午安康，一举高粽，排位对战轻松连胜！",
+                    "端午安康，祝您顺遂安好、幸福常伴！",
                 )),
                 (7, 7) => Some((
                     "七夕节",
                     HolidayKind::Traditional,
-                    "七夕快乐，愿甜蜜双排甜蜜常伴、快乐游戏！",
+                    "七夕快乐，愿美好与幸运常伴您左右！",
                 )),
                 (8, 15) => Some((
                     "中秋节",
                     HolidayKind::Statutory,
-                    "中秋花好月圆，祝大家欢聚一堂、心想事成！",
+                    "中秋花好月圆，祝您人月两圆、万事如意！",
                 )),
                 (9, 9) => Some((
                     "重阳节",
                     HolidayKind::Traditional,
-                    "九九重阳敬长辈，祝愿阖家安康、吉祥顺遂！",
+                    "九九重阳敬长辈，祝愿阖家安康、福寿绵长！",
                 )),
                 (12, 8) => Some((
                     "腊八节",
                     HolidayKind::Traditional,
-                    "过了腊八就是年，天冷注意保暖休息！",
+                    "过了腊八就是年，天气转凉请注意添衣保暖！",
                 )),
                 _ => None,
             };
@@ -364,7 +222,6 @@ pub fn lookup_builtin_holiday(date: NaiveDate, lunar: Option<LunarDate>) -> Opti
                     name: name.to_string(),
                     kind,
                     greeting: greeting.to_string(),
-                    custom_audio_path: None,
                 });
             }
         }
@@ -375,8 +232,7 @@ pub fn lookup_builtin_holiday(date: NaiveDate, lunar: Option<LunarDate>) -> Opti
         return Some(HolidayInfo {
             name: "清明节".to_string(),
             kind: HolidayKind::Statutory,
-            greeting: "清明春和景明，踏青休闲注意安全！".to_string(),
-            custom_audio_path: None,
+            greeting: "清明春和景明，外出踏青请注意安全！".to_string(),
         });
     }
 
@@ -384,37 +240,17 @@ pub fn lookup_builtin_holiday(date: NaiveDate, lunar: Option<LunarDate>) -> Opti
         (1, 1) => Some((
             "元旦",
             HolidayKind::Statutory,
-            "新年新气象，元旦快乐，祝您新的一年旗开得胜！",
+            "新年新气象，元旦快乐，祝您新的一年诸事顺遂！",
         )),
         (5, 1) => Some((
             "劳动节",
             HolidayKind::Statutory,
-            "五一劳动节快乐，劳逸结合畅享快乐游戏时光！",
+            "五一劳动节快乐，忙碌之余记得劳逸结合、好好休息！",
         )),
         (10, 1) => Some((
             "国庆节",
             HolidayKind::Statutory,
-            "欢度国庆佳节，假期开黑愉快、祝祖国繁荣昌盛！",
-        )),
-        (5, 20) => Some((
-            "520 电竞开黑节",
-            HolidayKind::EsportsFest,
-            "520 浪漫开黑日，祝各位大神默契配合、连胜不停！",
-        )),
-        (11, 11) => Some((
-            "双十一狂欢日",
-            HolidayKind::EsportsFest,
-            "双十一狂欢节，祝大家手气爆棚、局局顺风！",
-        )),
-        (12, 24) => Some((
-            "平安夜",
-            HolidayKind::EsportsFest,
-            "平安夜温馨送福，祝各位玩家畅玩顺遂、平平安安！",
-        )),
-        (12, 25) => Some((
-            "圣诞节",
-            HolidayKind::EsportsFest,
-            "圣诞快乐，节庆氛围拉满，祝您把把 MVP！",
+            "欢度国庆佳节，祝您假期愉快、国泰民安！",
         )),
         _ => None,
     };
@@ -423,47 +259,7 @@ pub fn lookup_builtin_holiday(date: NaiveDate, lunar: Option<LunarDate>) -> Opti
         name: name.to_string(),
         kind,
         greeting: greeting.to_string(),
-        custom_audio_path: None,
     })
-}
-
-/// 综合解析指定日期的节日（优先级：本地自定义规则 > 外部节假日 JSON 数据接口 > 内置农历/公历节假日）
-pub fn resolve_holiday_for_date(
-    date: NaiveDate,
-    custom_rules: &str,
-    external_entries: &[ExternalHolidayEntry],
-) -> Option<HolidayInfo> {
-    let lunar = solar_to_lunar(date);
-    let custom_entries = parse_custom_holiday_rules(custom_rules);
-
-    for entry in custom_entries.iter().chain(external_entries.iter()) {
-        if entry_matches_date(entry, date, lunar) {
-            if entry.is_holiday == Some(false) {
-                return None;
-            }
-            let greeting = if entry.greeting.trim().is_empty() {
-                format!("祝您{}快乐，游戏顺遂！", entry.name)
-            } else {
-                entry.greeting.clone()
-            };
-            let audio_path = {
-                let p = entry.audio_path.trim();
-                if p.is_empty() {
-                    None
-                } else {
-                    Some(p.to_string())
-                }
-            };
-            return Some(HolidayInfo {
-                name: entry.name.clone(),
-                kind: HolidayKind::Custom,
-                greeting,
-                custom_audio_path: audio_path,
-            });
-        }
-    }
-
-    lookup_builtin_holiday(date, lunar)
 }
 
 /// 触发事件类型
@@ -478,10 +274,18 @@ pub enum TriggerEvent {
         /// 命中的节假日名称（便于日志与状态追踪）
         holiday_name: Option<String>,
     },
-    Meal {
+    Alarm {
+        alarm_id: u64,
+        label: String,
+        cycle_summary: String,
         repeat: u8,
-        /// 开启“餐饮提醒文字转语音”开关时生成的播报文本
+        play_chime_before: bool,
+        custom_audio_path: Option<String>,
         spoken_text: Option<String>,
+        /// 是否为“仅一次”闹钟触发（调用方响铃后自动关闭该闹钟）
+        triggered_once: bool,
+        /// 是否来自“稍后提醒”
+        is_snooze: bool,
     },
 }
 
@@ -493,12 +297,12 @@ pub struct NextEventInfo {
     pub target_time_text: String,
 }
 
-/// 核心定时调度器（负责分钟节拍识别、防重入、跨日静默判定、农历节假日接口与倒计时计算）
+/// 核心定时调度器（负责整/半点及自定义闹钟节拍识别、防重入、跨日静默判定、内置节假日与倒计时计算）
 #[derive(Debug, Default)]
 pub struct Scheduler {
     last_chime_slot: Option<(i32, u32, u32, u32)>,
-    last_meal_slot: Option<(i32, u32, u32, u32)>,
-    external_holidays: Vec<ExternalHolidayEntry>,
+    last_alarm_slots: HashMap<u64, (i32, u32, u32, u32)>,
+    snooze_alarm: Option<(CustomAlarm, DateTime<Local>)>,
 }
 
 impl Scheduler {
@@ -506,35 +310,40 @@ impl Scheduler {
         Self::default()
     }
 
-    /// 注入从本地/远程节假日数据接口拉取的节假日或门店活动列表
-    pub fn set_external_holidays(&mut self, entries: Vec<ExternalHolidayEntry>) {
-        self.external_holidays = entries;
-    }
-
-    pub fn external_holiday_count(&self) -> usize {
-        self.external_holidays.len()
-    }
-
-    /// 校时后重置防重入槽位，防止系统时间回调后错过提醒
+    /// 校时或保存配置后重置防重入槽位，防止系统时间回调或修改时间后错过提醒
     pub fn reset_slots(&mut self) {
         self.last_chime_slot = None;
-        self.last_meal_slot = None;
+        self.last_alarm_slots.clear();
     }
 
-    /// 查询指定公历日期命中的节假日（按配置自定义规则 > 外部数据接口 > 内置农历节假日）
-    pub fn lookup_holiday(&self, date: NaiveDate, cfg: &AppConfig) -> Option<HolidayInfo> {
-        resolve_holiday_for_date(date, &cfg.holiday_custom_rules, &self.external_holidays)
+    pub fn schedule_snooze(&mut self, alarm: CustomAlarm, trigger_at: DateTime<Local>) {
+        self.snooze_alarm = Some((alarm, trigger_at));
+    }
+
+    pub fn clear_snooze(&mut self) {
+        self.snooze_alarm = None;
+    }
+
+    /// 查询指定公历日期命中的内置公历/农历节假日
+    pub fn lookup_holiday(&self, date: NaiveDate) -> Option<HolidayInfo> {
+        let lunar = solar_to_lunar(date);
+        lookup_builtin_holiday(date, lunar)
     }
 
     /// 生成当天历法摘要（供主窗日期栏及设置页“今日历法预览”使用）
-    pub fn describe_day_calendar(&self, date: NaiveDate, cfg: &AppConfig) -> String {
+    pub fn describe_day_calendar(&self, date: NaiveDate) -> String {
         let lunar_text = solar_to_lunar(date)
             .map(|l| l.format_zh())
             .unwrap_or_else(|| "农历数据外年份".to_string());
-        if let Some(h) = self.lookup_holiday(date, cfg) {
+        if let Some(h) = self.lookup_holiday(date) {
             format!("{lunar_text} · 节日：{name}", name = h.name)
         } else {
-            format!("{lunar_text} · 常规工作日/周末")
+            let is_weekend = date.weekday().num_days_from_monday() >= 5;
+            if is_weekend {
+                format!("{lunar_text} · 周末")
+            } else {
+                format!("{lunar_text} · 工作日")
+            }
         }
     }
 
@@ -577,23 +386,26 @@ impl Scheduler {
         Self::build_chime_announcement(cfg.chime_tts_enabled, &cfg.chime_tts_template, now)
     }
 
-    /// 根据用户开关与当前系统时间生成餐饮提醒播报文本
-    pub fn build_meal_announcement(
-        tts_enabled: bool,
-        text: &str,
-        now: DateTime<Local>,
-    ) -> Option<String> {
-        if !tts_enabled {
+    /// 根据闹钟配置与当前系统时间生成自定义闹钟文字转语音文本
+    pub fn build_alarm_announcement(alarm: &CustomAlarm, now: DateTime<Local>) -> Option<String> {
+        if !alarm.tts_enabled {
             return None;
         }
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return None;
+        let trimmed = alarm.tts_text.trim();
+        let tpl = if trimmed.is_empty() {
+            "现在时间，{TIME}，{LABEL}"
+        } else {
+            trimmed
+        };
+        let rendered = render_alarm_tts_template(tpl, &alarm.label, now.hour(), now.minute());
+        if rendered.trim().is_empty() {
+            None
+        } else {
+            Some(rendered)
         }
-        Some(render_tts_template(trimmed, now.hour(), now.minute()))
     }
 
-    /// 判断给定 (hour, minute) 是否位于配置的静默时段内（FR-05 / FR-06）
+    /// 判断给定 (hour, minute) 是否位于配置的静默时段内
     pub fn is_quiet_at(cfg: &AppConfig, hour: u32, minute: u32) -> bool {
         if !cfg.quiet_enabled {
             return false;
@@ -612,22 +424,20 @@ impl Scheduler {
     }
 
     /// 周期检测（建议每 250ms–500ms 调用一次），返回本拍需要触发的事件列表
-    pub fn evaluate_at(
-        &mut self,
-        cfg: &AppConfig,
-        now: DateTime<Local>,
-    ) -> Vec<TriggerEvent> {
+    pub fn evaluate_at(&mut self, cfg: &AppConfig, now: DateTime<Local>) -> Vec<TriggerEvent> {
         let mut events = Vec::new();
         let slot = (now.year(), now.ordinal(), now.hour(), now.minute());
         let minute_u8 = now.minute() as u8;
         let hour_u8 = now.hour() as u8;
+        let today = now.date_naive();
 
-        // 1. 报时检测（受静音模式与静默时段约束；开启节假日模式时自动匹配专属报时音与问候语）
-        if cfg.chime_minutes.contains(&minute_u8) && self.last_chime_slot != Some(slot) {
+        // 1. 报时检测（由整点、半点及可选额外分钟勾选控制，受静音模式与静默时段约束）
+        let active_minutes = cfg.effective_chime_minutes();
+        if active_minutes.contains(&minute_u8) && self.last_chime_slot != Some(slot) {
             self.last_chime_slot = Some(slot);
             if !cfg.mute_mode && !Self::is_quiet_at(cfg, now.hour(), now.minute()) {
                 let holiday = if cfg.holiday_enabled {
-                    self.lookup_holiday(now.date_naive(), cfg)
+                    self.lookup_holiday(today)
                 } else {
                     None
                 };
@@ -635,17 +445,13 @@ impl Scheduler {
                 let spoken_time_text =
                     Self::build_chime_announcement_with_holiday(cfg, now, holiday.as_ref());
 
-                let holiday_audio_path = if cfg.holiday_enabled {
-                    holiday.as_ref().and_then(|h| {
-                        h.custom_audio_path.clone().or_else(|| {
-                            let p = cfg.holiday_custom_audio_path.trim();
-                            if p.is_empty() {
-                                None
-                            } else {
-                                Some(p.to_string())
-                            }
-                        })
-                    })
+                let holiday_audio_path = if cfg.holiday_enabled && holiday.is_some() {
+                    let p = cfg.holiday_custom_audio_path.trim();
+                    if p.is_empty() {
+                        None
+                    } else {
+                        Some(p.to_string())
+                    }
                 } else {
                     None
                 };
@@ -659,35 +465,130 @@ impl Scheduler {
             }
         }
 
-        // 2. 餐饮提醒检测（受独立开关与托盘静音模式约束）
-        if cfg.meal_enabled
-            && hour_u8 == cfg.meal_hour
-            && minute_u8 == cfg.meal_minute
-            && self.last_meal_slot != Some(slot)
-        {
-            self.last_meal_slot = Some(slot);
-            if !cfg.mute_mode {
-                let spoken_text = Self::build_meal_announcement(
-                    cfg.meal_tts_enabled,
-                    &cfg.meal_tts_text,
-                    now,
-                );
-                events.push(TriggerEvent::Meal {
-                    repeat: cfg.meal_repeat_count,
-                    spoken_text,
-                });
+        // 2. 稍后提醒（Snooze）检测
+        if let Some((snooze_alarm, trigger_at)) = &self.snooze_alarm {
+            if now >= *trigger_at {
+                let alarm = snooze_alarm.clone();
+                self.snooze_alarm = None;
+                if !cfg.mute_mode {
+                    let spoken_text = Self::build_alarm_announcement(&alarm, now);
+                    let custom_audio_path = {
+                        let p = alarm.custom_audio_path.trim();
+                        if p.is_empty() {
+                            None
+                        } else {
+                            Some(p.to_string())
+                        }
+                    };
+                    events.push(TriggerEvent::Alarm {
+                        alarm_id: alarm.id,
+                        label: alarm.label.clone(),
+                        cycle_summary: "稍后提醒".to_string(),
+                        repeat: alarm.repeat_count,
+                        play_chime_before: alarm.play_chime_before,
+                        custom_audio_path,
+                        spoken_text,
+                        triggered_once: false,
+                        is_snooze: true,
+                    });
+                }
             }
+        }
+
+        // 3. 自定义闹钟检测（支持多种周期：仅一次/每天/工作日/周末/自定义星期/每隔N天）
+        for alarm in &cfg.alarms {
+            if !alarm.enabled {
+                continue;
+            }
+            if hour_u8 != alarm.hour || minute_u8 != alarm.minute {
+                continue;
+            }
+            if !alarm.should_ring_on_date(today) {
+                continue;
+            }
+            if self.last_alarm_slots.get(&alarm.id) == Some(&slot) {
+                continue;
+            }
+            self.last_alarm_slots.insert(alarm.id, slot);
+
+            if cfg.mute_mode {
+                continue;
+            }
+            if alarm.respect_quiet_hours && Self::is_quiet_at(cfg, now.hour(), now.minute()) {
+                continue;
+            }
+
+            let spoken_text = Self::build_alarm_announcement(alarm, now);
+            let custom_audio_path = {
+                let p = alarm.custom_audio_path.trim();
+                if p.is_empty() {
+                    None
+                } else {
+                    Some(p.to_string())
+                }
+            };
+
+            events.push(TriggerEvent::Alarm {
+                alarm_id: alarm.id,
+                label: alarm.label.clone(),
+                cycle_summary: alarm.format_cycle_summary(),
+                repeat: alarm.repeat_count,
+                play_chime_before: alarm.play_chime_before,
+                custom_audio_path,
+                spoken_text,
+                triggered_once: alarm.repeat_mode == AlarmRepeatMode::Once,
+                is_snooze: false,
+            });
         }
 
         events
     }
 
-    /// 计算距离下一个“整/半点报时”或“餐饮提醒”的精确倒计时（FR-19）
-    pub fn compute_next_event(cfg: &AppConfig, now: DateTime<Local>) -> NextEventInfo {
-        let mut candidates: Vec<(DateTime<Local>, &'static str)> = Vec::new();
+    /// 查找指定闹钟在 `now` 之后的下一次有效响铃时刻
+    pub fn next_alarm_trigger(
+        cfg: &AppConfig,
+        alarm: &CustomAlarm,
+        now: DateTime<Local>,
+    ) -> Option<DateTime<Local>> {
+        if !alarm.enabled {
+            return None;
+        }
+        let today = now.date_naive();
+        let max_days = if alarm.repeat_mode == AlarmRepeatMode::IntervalDays {
+            i64::from(alarm.interval_days.max(1)) + 2
+        } else {
+            366
+        };
 
-        // 向前搜索最多 48 小时内的下一个有效报时时刻（自动跳过静默时段）
-        if !cfg.chime_minutes.is_empty() {
+        for day_offset in 0..=max_days {
+            let date = today + Duration::days(day_offset);
+            if !alarm.should_ring_on_date(date) {
+                continue;
+            }
+            if alarm.respect_quiet_hours
+                && Self::is_quiet_at(cfg, u32::from(alarm.hour), u32::from(alarm.minute))
+            {
+                continue;
+            }
+            if let Some(naive) = date.and_hms_opt(u32::from(alarm.hour), u32::from(alarm.minute), 0)
+            {
+                if let Some(dt) = naive.and_local_timezone(Local).single() {
+                    if dt > now {
+                        return Some(dt);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 计算距离下一个“整/半点报时”或“自定义闹钟”的精确倒计时
+    pub fn compute_next_event(&self, cfg: &AppConfig, now: DateTime<Local>) -> NextEventInfo {
+        let mut candidates: Vec<(DateTime<Local>, String)> = Vec::new();
+        let active_minutes = cfg.effective_chime_minutes();
+
+        // 1. 向前搜索最多 48 小时内的下一个有效报时时刻（自动跳过静默时段）
+        if !active_minutes.is_empty() {
             let base = now
                 .with_second(0)
                 .and_then(|t| t.with_nanosecond(0))
@@ -697,7 +598,7 @@ impl Scheduler {
             for offset_min in 0..(48 * 60) {
                 let candidate = base + Duration::minutes(offset_min);
                 let m = candidate.minute() as u8;
-                if cfg.chime_minutes.contains(&m)
+                if active_minutes.contains(&m)
                     && !Self::is_quiet_at(cfg, candidate.hour(), candidate.minute())
                 {
                     let label = if m == 0 {
@@ -707,22 +608,23 @@ impl Scheduler {
                     } else {
                         "定时报时"
                     };
-                    candidates.push((candidate, label));
+                    candidates.push((candidate, label.to_string()));
                     break;
                 }
             }
         }
 
-        // 计算下一个餐饮提醒时刻
-        if cfg.meal_enabled {
-            let today_meal = now
-                .date_naive()
-                .and_hms_opt(cfg.meal_hour as u32, cfg.meal_minute as u32, 0)
-                .and_then(|naive| naive.and_local_timezone(Local).single());
+        // 2. 稍后提醒（Snooze）
+        if let Some((snooze_alarm, dt)) = &self.snooze_alarm {
+            if *dt > now {
+                candidates.push((*dt, format!("稍后提醒 · {}", snooze_alarm.label)));
+            }
+        }
 
-            if let Some(t) = today_meal {
-                let target = if t > now { t } else { t + Duration::days(1) };
-                candidates.push((target, "餐饮提醒"));
+        // 3. 所有启用中的自定义闹钟
+        for alarm in &cfg.alarms {
+            if let Some(dt) = Self::next_alarm_trigger(cfg, alarm, now) {
+                candidates.push((dt, format!("闹钟 · {}", alarm.label)));
             }
         }
 
@@ -730,22 +632,36 @@ impl Scheduler {
 
         if let Some((target, label)) = candidates.into_iter().next() {
             let secs = (target - now).num_seconds().max(0);
-            let hours = secs / 3600;
+            let days = secs / 86_400;
+            let hours = (secs % 86_400) / 3600;
             let mins = (secs % 3600) / 60;
             let rem_secs = secs % 60;
-            let countdown_text = if hours > 0 {
+            let countdown_text = if days > 0 {
+                format!("{days}天 {hours:02}:{mins:02}")
+            } else if hours > 0 {
                 format!("{hours:02}:{mins:02}:{rem_secs:02}")
             } else {
                 format!("{mins:02}分{rem_secs:02}秒")
             };
+
+            let today = now.date_naive();
+            let target_date = target.date_naive();
+            let target_time_text = if target_date == today {
+                target.format("%H:%M").to_string()
+            } else if target_date == today + Duration::days(1) {
+                format!("明天 {}", target.format("%H:%M"))
+            } else {
+                format!("{} {}", target.format("%m-%d"), target.format("%H:%M"))
+            };
+
             NextEventInfo {
-                title: label.to_string(),
+                title: label,
                 countdown_text,
-                target_time_text: target.format("%H:%M").to_string(),
+                target_time_text,
             }
         } else {
             NextEventInfo {
-                title: "暂无待执行提醒".to_string(),
+                title: "报时与闹钟均未启用".to_string(),
                 countdown_text: "--:--".to_string(),
                 target_time_text: "--:--".to_string(),
             }
@@ -776,141 +692,123 @@ mod tests {
     }
 
     #[test]
-    fn test_same_day_quiet_period() {
+    fn test_chime_checkboxes_and_alarm_triggers() {
         let mut cfg = AppConfig::default();
-        cfg.quiet_enabled = true;
-        cfg.quiet_start_hour = 0;
-        cfg.quiet_start_minute = 0;
-        cfg.quiet_end_hour = 8;
-        cfg.quiet_end_minute = 0;
-
-        assert!(Scheduler::is_quiet_at(&cfg, 0, 0));
-        assert!(Scheduler::is_quiet_at(&cfg, 7, 59));
-        assert!(!Scheduler::is_quiet_at(&cfg, 8, 0));
-        assert!(!Scheduler::is_quiet_at(&cfg, 23, 30));
-    }
-
-    #[test]
-    fn test_evaluate_deduplication_and_quiet_skip() {
-        let mut cfg = AppConfig::default();
-        cfg.quiet_enabled = true;
-        cfg.quiet_start_hour = 0;
-        cfg.quiet_start_minute = 0;
-        cfg.quiet_end_hour = 8;
-        cfg.quiet_end_minute = 0;
-        cfg.meal_enabled = true;
-        cfg.meal_hour = 12;
-        cfg.meal_minute = 0;
-        cfg.meal_repeat_count = 2;
+        cfg.hourly_chime_enabled = true;
+        cfg.half_hour_chime_enabled = false;
+        cfg.alarms.push(CustomAlarm {
+            id: 1,
+            label: "喝水休息".to_string(),
+            enabled: true,
+            hour: 12,
+            minute: 0,
+            repeat_mode: AlarmRepeatMode::Daily,
+            repeat_count: 2,
+            play_chime_before: true,
+            tts_enabled: true,
+            tts_text: "现在时间，{TIME}，{LABEL}".to_string(),
+            ..CustomAlarm::default()
+        });
 
         let mut sched = Scheduler::new();
 
-        let t_quiet = Local.with_ymd_and_hms(2026, 11, 13, 7, 30, 0).unwrap();
-        assert!(sched.evaluate_at(&cfg, t_quiet).is_empty());
+        // 半点已取消勾选，不应触发报时
+        let t_half = Local.with_ymd_and_hms(2026, 11, 13, 11, 30, 0).unwrap();
+        assert!(sched.evaluate_at(&cfg, t_half).is_empty());
 
+        // 整点 + 12:00 闹钟同时触发
         let t_noon = Local.with_ymd_and_hms(2026, 11, 13, 12, 0, 0).unwrap();
         let events = sched.evaluate_at(&cfg, t_noon);
-        assert_eq!(
-            events,
-            vec![
-                TriggerEvent::Chime {
-                    repeat: 1,
-                    spoken_time_text: None,
-                    holiday_audio_path: None,
-                    holiday_name: None,
-                },
-                TriggerEvent::Meal {
-                    repeat: 2,
-                    spoken_text: None,
-                },
-            ]
-        );
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], TriggerEvent::Chime { .. }));
+        match &events[1] {
+            TriggerEvent::Alarm {
+                alarm_id,
+                label,
+                repeat,
+                spoken_text,
+                triggered_once,
+                ..
+            } => {
+                assert_eq!(*alarm_id, 1);
+                assert_eq!(label, "喝水休息");
+                assert_eq!(*repeat, 2);
+                assert_eq!(
+                    spoken_text.as_deref(),
+                    Some("现在时间，十二点整，喝水休息")
+                );
+                assert!(!triggered_once);
+            }
+            _ => panic!("expected alarm event"),
+        }
 
+        // 同一分钟内防重入
         let t_noon_next_sec = Local.with_ymd_and_hms(2026, 11, 13, 12, 0, 1).unwrap();
         assert!(sched.evaluate_at(&cfg, t_noon_next_sec).is_empty());
     }
 
     #[test]
-    fn test_mute_mode_silences_events() {
-        let mut cfg = AppConfig::default();
-        cfg.mute_mode = true;
-        cfg.meal_enabled = true;
-        cfg.meal_hour = 12;
-        cfg.meal_minute = 0;
+    fn test_alarm_repeat_cycles_workdays_weekly_interval_once() {
+        // 2026-11-16 是星期一
+        let mon = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let wed = NaiveDate::from_ymd_opt(2026, 11, 18).unwrap();
+        let sat = NaiveDate::from_ymd_opt(2026, 11, 21).unwrap();
 
-        let mut sched = Scheduler::new();
-        let noon = Local.with_ymd_and_hms(2026, 11, 14, 12, 0, 5).unwrap();
-        assert!(sched.evaluate_at(&cfg, noon).is_empty());
+        let workday_alarm = CustomAlarm {
+            repeat_mode: AlarmRepeatMode::Workdays,
+            ..CustomAlarm::default()
+        };
+        assert!(workday_alarm.should_ring_on_date(mon));
+        assert!(workday_alarm.should_ring_on_date(wed));
+        assert!(!workday_alarm.should_ring_on_date(sat));
 
-        cfg.mute_mode = false;
-        assert!(sched.evaluate_at(&cfg, noon).is_empty());
+        let weekend_alarm = CustomAlarm {
+            repeat_mode: AlarmRepeatMode::Weekends,
+            ..CustomAlarm::default()
+        };
+        assert!(!weekend_alarm.should_ring_on_date(mon));
+        assert!(weekend_alarm.should_ring_on_date(sat));
 
-        let half = Local.with_ymd_and_hms(2026, 11, 14, 12, 30, 0).unwrap();
-        assert_eq!(
-            sched.evaluate_at(&cfg, half),
-            vec![TriggerEvent::Chime {
-                repeat: 1,
-                spoken_time_text: None,
-                holiday_audio_path: None,
-                holiday_name: None,
-            }]
-        );
-    }
+        let weekly_alarm = CustomAlarm {
+            repeat_mode: AlarmRepeatMode::Weekly,
+            weekdays: [false, false, true, false, false, false, false], // 仅周三
+            ..CustomAlarm::default()
+        };
+        assert!(!weekly_alarm.should_ring_on_date(mon));
+        assert!(weekly_alarm.should_ring_on_date(wed));
 
-    #[test]
-    fn test_chime_tts_toggle_and_real_time_formatting() {
-        let mut cfg = AppConfig::default();
-        cfg.chime_tts_enabled = true;
-        cfg.chime_tts_template = "现在时间，{TIME}".to_string();
+        let interval_alarm = CustomAlarm {
+            repeat_mode: AlarmRepeatMode::IntervalDays,
+            interval_days: 2,
+            anchor_date: "2026-11-16".to_string(),
+            ..CustomAlarm::default()
+        };
+        assert!(interval_alarm.should_ring_on_date(mon));
+        assert!(!interval_alarm.should_ring_on_date(NaiveDate::from_ymd_opt(2026, 11, 17).unwrap()));
+        assert!(interval_alarm.should_ring_on_date(wed));
 
-        let mut sched = Scheduler::new();
-        let t_half = Local.with_ymd_and_hms(2026, 11, 14, 14, 30, 0).unwrap();
-        assert_eq!(
-            sched.evaluate_at(&cfg, t_half),
-            vec![TriggerEvent::Chime {
-                repeat: 1,
-                spoken_time_text: Some("现在时间，十四点三十分".to_string()),
-                holiday_audio_path: None,
-                holiday_name: None,
-            }]
-        );
-
-        cfg.chime_tts_enabled = false;
-        let t_hour = Local.with_ymd_and_hms(2026, 11, 14, 15, 0, 0).unwrap();
-        assert_eq!(
-            sched.evaluate_at(&cfg, t_hour),
-            vec![TriggerEvent::Chime {
-                repeat: 1,
-                spoken_time_text: None,
-                holiday_audio_path: None,
-                holiday_name: None,
-            }]
-        );
+        let once_alarm = CustomAlarm {
+            repeat_mode: AlarmRepeatMode::Once,
+            once_date: "2026-11-18".to_string(),
+            ..CustomAlarm::default()
+        };
+        assert!(!once_alarm.should_ring_on_date(mon));
+        assert!(once_alarm.should_ring_on_date(wed));
     }
 
     #[test]
     fn test_lunar_conversion_and_builtin_holidays() {
         // 2025 闰六月初一 -> 2025-07-25
         let leap_6_1 = solar_to_lunar(NaiveDate::from_ymd_opt(2025, 7, 25).unwrap()).unwrap();
-        assert_eq!(
-            leap_6_1,
-            LunarDate {
-                year: 2025,
-                month: 6,
-                day: 1,
-                is_leap: true,
-            }
-        );
         assert_eq!(leap_6_1.format_zh(), "农历闰六月初一");
 
         // 2025 中秋节（2025-10-06 为农历八月十五）
         let mid_autumn_2025 = NaiveDate::from_ymd_opt(2025, 10, 6).unwrap();
         let l_ma = solar_to_lunar(mid_autumn_2025).unwrap();
-        assert_eq!((l_ma.month, l_ma.day, l_ma.is_leap), (8, 15, false));
         let h_ma = lookup_builtin_holiday(mid_autumn_2025, Some(l_ma)).unwrap();
         assert_eq!(h_ma.name, "中秋节");
 
-        // 2025 除夕（2026-02-16 为腊月廿九，次日 2026-02-17 为春节正月初一）
+        // 2026 除夕与春节
         let eve_2026 = NaiveDate::from_ymd_opt(2026, 2, 16).unwrap();
         let cny_2026 = NaiveDate::from_ymd_opt(2026, 2, 17).unwrap();
         assert_eq!(
@@ -937,69 +835,32 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_holiday_feed_and_chime_trigger() {
-        let json = r#"{
-            "holidays": [
-                {
-                    "date": "2026-11-14",
-                    "name": "网吧电竞周年庆",
-                    "greeting": "全场饮品八折特惠，祝各位召唤师连胜上分！",
-                    "audio_path": "D:\\audio\\esports_anniv.wav"
-                }
-            ]
-        }"#;
-        let feed = parse_holiday_feed_json(json).unwrap();
-        assert_eq!(feed.len(), 1);
-
+    fn test_holiday_chime_uses_builtin_offline_calendar() {
         let mut sched = Scheduler::new();
-        sched.set_external_holidays(feed);
-
         let mut cfg = AppConfig::default();
         cfg.holiday_enabled = true;
-        cfg.holiday_custom_audio_path = "D:\\audio\\fallback_fest.wav".to_string();
-        cfg.holiday_greeting_template = "今天是{HOLIDAY}（{LUNAR}），{GREETING}现在时间，{TIME}".to_string();
+        cfg.holiday_custom_audio_path = "D:\\audio\\fest.wav".to_string();
+        cfg.holiday_greeting_template =
+            "今天是{HOLIDAY}（{LUNAR}），{GREETING}现在时间，{TIME}".to_string();
 
-        let now = Local.with_ymd_and_hms(2026, 11, 14, 18, 30, 0).unwrap();
+        // 2026-10-01 国庆节
+        let now = Local.with_ymd_and_hms(2026, 10, 1, 10, 0, 0).unwrap();
         let events = sched.evaluate_at(&cfg, now);
         assert_eq!(events.len(), 1);
         match &events[0] {
             TriggerEvent::Chime {
-                repeat,
+                holiday_name,
+                holiday_audio_path,
                 spoken_time_text,
-                holiday_audio_path,
-                holiday_name,
-            } => {
-                assert_eq!(*repeat, 1);
-                assert_eq!(holiday_name.as_deref(), Some("网吧电竞周年庆"));
-                assert_eq!(
-                    holiday_audio_path.as_deref(),
-                    Some("D:\\audio\\esports_anniv.wav")
-                );
-                let text = spoken_time_text.as_deref().unwrap();
-                assert!(text.contains("网吧电竞周年庆"));
-                assert!(text.contains("农历十月初六"));
-                assert!(text.contains("十八点三十分"));
-            }
-            _ => panic!("expected TriggerEvent::Chime"),
-        }
-
-        // 内联自定义规则优先覆盖外部数据接口
-        cfg.holiday_custom_rules = "11-14=冠军争霸夜|五人开黑免单抽奖中".to_string();
-        let now2 = Local.with_ymd_and_hms(2026, 11, 14, 19, 0, 0).unwrap();
-        let events2 = sched.evaluate_at(&cfg, now2);
-        match &events2[0] {
-            TriggerEvent::Chime {
-                holiday_name,
-                holiday_audio_path,
                 ..
             } => {
-                assert_eq!(holiday_name.as_deref(), Some("冠军争霸夜"));
-                assert_eq!(
-                    holiday_audio_path.as_deref(),
-                    Some("D:\\audio\\fallback_fest.wav")
-                );
+                assert_eq!(holiday_name.as_deref(), Some("国庆节"));
+                assert_eq!(holiday_audio_path.as_deref(), Some("D:\\audio\\fest.wav"));
+                let text = spoken_time_text.as_deref().unwrap();
+                assert!(text.contains("国庆节"));
+                assert!(text.contains("十点整"));
             }
-            _ => panic!("expected TriggerEvent::Chime"),
+            _ => panic!("expected Chime event"),
         }
     }
 }

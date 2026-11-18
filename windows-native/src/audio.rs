@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::{BufReader, Cursor, ErrorKind};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -31,8 +31,35 @@ const EDGE_TTS_MAX_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const EDGE_TTS_MAX_AUDIO_BYTES: usize = 4 * 1024 * 1024;
 
 static EDGE_CLOCK_SKEW_SECS: AtomicI64 = AtomicI64::new(0);
+static EDGE_TTS_CONSECUTIVE_FAILS: AtomicU32 = AtomicU32::new(0);
+static EDGE_TTS_COOLDOWN_UNTIL_SECS: AtomicU64 = AtomicU64::new(0);
 
-/// 提示音与自定义音频默认淡入/淡出时长（避免网吧公放或耳机环境下起止突兀）
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 计算 Edge TTS 网络异常后的自动熔断冷却时长（秒）：首次 3 分钟，连续 2 次及以上 15 分钟
+pub fn compute_edge_tts_cooldown_secs(consecutive_fails: u32) -> u64 {
+    if consecutive_fails <= 1 {
+        180
+    } else {
+        900
+    }
+}
+
+/// 若当前仍处于 Edge TTS 熔断冷却期内，返回剩余秒数
+pub fn remaining_edge_tts_cooldown_secs(now_secs: u64, cooldown_until_secs: u64) -> Option<u64> {
+    if cooldown_until_secs > now_secs {
+        Some(cooldown_until_secs - now_secs)
+    } else {
+        None
+    }
+}
+
+/// 提示音与自定义音频默认淡入/淡出时长（避免外放或耳机环境下起止突兀）
 const AUDIO_FADE_IN_MS: u64 = 180;
 const AUDIO_FADE_OUT_MS: u64 = 240;
 /// 语音流默认淡入/淡出时长（短包络去爆音且不吞字头字尾）
@@ -41,7 +68,7 @@ const SPEECH_FADE_OUT_MS: u64 = 130;
 /// 打断切换旧音频时的平滑渐隐时长
 const AUDIO_SWITCH_FADE_MS: u64 = 80;
 
-/// 触发餐饮提醒时对其他应用背景音乐的压低策略（压低至原音量的 25%，最低保留 5%）
+/// 触发自定义闹钟时对其他应用背景音乐的压低策略（压低至原音量的 25%，最低保留 5%）
 const AUDIO_DUCK_TARGET_RATIO: f32 = 0.25;
 const AUDIO_DUCK_MIN_ACTIVE_VOL: f32 = 0.06;
 const AUDIO_DUCK_FLOOR_VOL: f32 = 0.05;
@@ -62,7 +89,7 @@ enum SequenceKind {
         edge_voice: String,
         tts_rate: i8,
     },
-    Meal {
+    Alarm {
         repeat: u8,
         custom_path: Option<String>,
         chime_with_custom: bool,
@@ -80,7 +107,7 @@ enum AudioCommand {
         custom_path: Option<String>,
         reply: SyncSender<Option<Arc<Sink>>>,
     },
-    PlayMealAudio {
+    PlayAlarmAudio {
         volume: u8,
         include_built_in: bool,
         custom_path: Option<String>,
@@ -163,7 +190,7 @@ fn smooth_cosine_ramp(t: f32) -> f32 {
     0.5 * (1.0 - (PI * x).cos())
 }
 
-/// 根据背景音频会话原始音量计算餐饮提醒期间的目标压低音量；若本就接近静音则返回 None 跳过处理
+/// 根据背景音频会话原始音量计算闹钟播报期间的目标压低音量；若本就接近静音则返回 None 跳过处理
 pub fn compute_ducked_volume(original_volume: f32) -> Option<f32> {
     if !original_volume.is_finite() || original_volume <= AUDIO_DUCK_MIN_ACTIVE_VOL {
         return None;
@@ -339,7 +366,7 @@ fn fade_out_and_stop_sink(sink: Arc<Sink>, fade_ms: u64) {
 }
 
 /// Windows WASAPI 背景音乐自动压低（Audio Ducking）RAII 守卫：
-/// 触发餐饮提醒时自动识别并平滑压低其他活跃应用音频会话，播报结束或被中断时平滑恢复原音量
+/// 触发自定义闹钟时自动识别并平滑压低其他活跃应用音频会话，播报结束或被中断时平滑恢复原音量
 struct BackgroundAudioDuckGuard {
     gen_id: u64,
     gen_seq: Arc<AtomicU64>,
@@ -509,7 +536,7 @@ mod windows_duck {
             win_sys::log_info(
                 "audio",
                 &format!(
-                    "ducked {} active background audio session(s) for meal reminder",
+                    "ducked {} active background audio session(s) for alarm reminder",
                     collected.len()
                 ),
             );
@@ -592,7 +619,7 @@ fn append_custom_audio(sink: &Sink, path: &str) -> bool {
             Err(err) => {
                 win_sys::log_warn(
                     "audio",
-                    &format!("decode custom meal audio \"{trimmed}\" failed: {err}"),
+                    &format!("decode custom alarm audio \"{trimmed}\" failed: {err}"),
                 );
                 false
             }
@@ -600,7 +627,7 @@ fn append_custom_audio(sink: &Sink, path: &str) -> bool {
         Err(err) => {
             win_sys::log_warn(
                 "audio",
-                &format!("open custom meal audio \"{trimmed}\" failed: {err}"),
+                &format!("open custom alarm audio \"{trimmed}\" failed: {err}"),
             );
             false
         }
@@ -1249,20 +1276,53 @@ fn speak_with_engine(
         let cache_key = format!("{voice}|{tts_rate}|{text}");
         let cached = tts_cache.lock().ok().and_then(|c| c.get(&cache_key));
 
+        let now_secs = current_unix_secs();
+        let cooldown_until = EDGE_TTS_COOLDOWN_UNTIL_SECS.load(Ordering::Relaxed);
+        let skip_network = cached.is_none()
+            && remaining_edge_tts_cooldown_secs(now_secs, cooldown_until).is_some();
+
         let mp3_result = match cached {
             Some(bytes) => Ok(bytes),
+            None if skip_network => {
+                let rem = remaining_edge_tts_cooldown_secs(now_secs, cooldown_until).unwrap_or(0);
+                win_sys::log_debug(
+                    "tts",
+                    &format!("Edge TTS in network cooldown ({rem}s remaining), skipping directly to local SAPI5"),
+                );
+                Err(format!("网络熔断冷却中（剩余 {rem} 秒）"))
+            }
             None => {
                 emit_tts_status(
                     tts_status_tx,
                     gen_id,
                     format!("正在连接 Edge TTS 在线音色（{voice_label}）..."),
                 );
-                synthesize_edge_tts_mp3(text, voice, tts_rate, gen_id, gen_seq).map(|bytes| {
-                    if let Ok(mut c) = tts_cache.lock() {
-                        c.insert(cache_key, bytes.clone());
+                match synthesize_edge_tts_mp3(text, voice, tts_rate, gen_id, gen_seq) {
+                    Ok(bytes) => {
+                        EDGE_TTS_CONSECUTIVE_FAILS.store(0, Ordering::Relaxed);
+                        EDGE_TTS_COOLDOWN_UNTIL_SECS.store(0, Ordering::Relaxed);
+                        if let Ok(mut c) = tts_cache.lock() {
+                            c.insert(cache_key, bytes.clone());
+                        }
+                        Ok(bytes)
                     }
-                    bytes
-                })
+                    Err(err) => {
+                        if err != "cancelled" && gen_seq.load(Ordering::SeqCst) == gen_id {
+                            let fails =
+                                EDGE_TTS_CONSECUTIVE_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                            let cooldown_secs = compute_edge_tts_cooldown_secs(fails);
+                            let until = current_unix_secs().saturating_add(cooldown_secs);
+                            EDGE_TTS_COOLDOWN_UNTIL_SECS.store(until, Ordering::Relaxed);
+                            win_sys::log_warn(
+                                "tts",
+                                &format!(
+                                    "Edge TTS failed (consecutive={fails}, cooldown={cooldown_secs}s): {err}"
+                                ),
+                            );
+                        }
+                        Err(err)
+                    }
+                }
             }
         };
 
@@ -1300,14 +1360,20 @@ fn speak_with_engine(
                 if err == "cancelled" || gen_seq.load(Ordering::SeqCst) != gen_id {
                     return false;
                 }
-                win_sys::log_warn(
-                    "tts",
-                    &format!("Edge TTS unavailable ({err}), falling back to local SAPI5"),
-                );
+                if !skip_network {
+                    win_sys::log_warn(
+                        "tts",
+                        &format!("Edge TTS unavailable ({err}), falling back to local SAPI5"),
+                    );
+                }
                 emit_tts_status(
                     tts_status_tx,
                     gen_id,
-                    format!("Edge TTS 连接受限，已自动回退本地 SAPI5（{err}）"),
+                    if skip_network {
+                        "Edge TTS 处于网络冷却期，已零延迟切换本地 SAPI5".to_string()
+                    } else {
+                        format!("Edge TTS 连接受限，已自动回退本地 SAPI5（{err}）")
+                    },
                 );
             }
         }
@@ -1409,7 +1475,7 @@ impl AudioEngine {
                             };
                             let _ = reply.send(created);
                         }
-                        AudioCommand::PlayMealAudio {
+                        AudioCommand::PlayAlarmAudio {
                             volume,
                             include_built_in,
                             custom_path,
@@ -1609,7 +1675,7 @@ impl AudioEngine {
                                 }
                             }
                         }
-                        SequenceKind::Meal {
+                        SequenceKind::Alarm {
                             repeat,
                             custom_path,
                             chime_with_custom,
@@ -1618,7 +1684,7 @@ impl AudioEngine {
                             edge_voice,
                             tts_rate,
                         } => {
-                            // 触发餐饮提醒时自动平滑压低其他后台音乐/媒体音量，播报结束或被中断时自动恢复
+                            // 触发自定义闹钟时自动平滑压低其他后台音乐/媒体音量，播报结束或被中断时自动恢复
                             let _duck_guard =
                                 BackgroundAudioDuckGuard::acquire(job.gen_id, Arc::clone(&gen_seq));
 
@@ -1640,7 +1706,7 @@ impl AudioEngine {
                                 if include_built_in || has_custom {
                                     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
                                     let cur_vol = vol_seq.load(Ordering::Relaxed);
-                                    let _ = audio_tx_seq.send(AudioCommand::PlayMealAudio {
+                                    let _ = audio_tx_seq.send(AudioCommand::PlayAlarmAudio {
                                         volume: cur_vol,
                                         include_built_in,
                                         custom_path: custom_path.clone(),
@@ -1761,7 +1827,7 @@ impl AudioEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn play_meal(
+    pub fn play_alarm(
         &self,
         repeat: u8,
         volume: u8,
@@ -1771,14 +1837,14 @@ impl AudioEngine {
         tts_engine: TtsEngine,
         edge_voice: String,
         tts_rate: i8,
-    ) {
+    ) -> u64 {
         self.live_volume.store(volume.min(100), Ordering::Relaxed);
         let gen_id = self.gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
         self.active_seq_gen.store(gen_id, Ordering::SeqCst);
         let _ = self.audio_tx.send(AudioCommand::StopActive);
         let _ = self.seq_tx.send(SequenceJob {
             gen_id,
-            kind: SequenceKind::Meal {
+            kind: SequenceKind::Alarm {
                 repeat,
                 custom_path,
                 chime_with_custom,
@@ -1788,12 +1854,17 @@ impl AudioEngine {
                 tts_rate,
             },
         });
+        gen_id
     }
 
     pub fn set_live_volume(&self, volume: u8) {
         let clamped = volume.min(100);
         self.live_volume.store(clamped, Ordering::Relaxed);
         let _ = self.audio_tx.send(AudioCommand::SetLiveVolume(clamped));
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.active_seq_gen.load(Ordering::SeqCst) != 0
     }
 
     pub fn is_playing_gen(&self, gen_id: u64) -> bool {
@@ -1813,6 +1884,11 @@ impl AudioEngine {
             cache.clear();
         }
         let _ = self.audio_tx.send(AudioCommand::TrimIdle);
+    }
+
+    pub fn reset_edge_tts_cooldown(&self) {
+        EDGE_TTS_CONSECUTIVE_FAILS.store(0, Ordering::Relaxed);
+        EDGE_TTS_COOLDOWN_UNTIL_SECS.store(0, Ordering::Relaxed);
     }
 
     pub fn shutdown(&self) {
@@ -1984,5 +2060,16 @@ mod tests {
         assert!(compute_ducked_volume(0.05).is_none());
         assert!(compute_ducked_volume(0.0).is_none());
         assert!(compute_ducked_volume(f32::NAN).is_none());
+    }
+
+    #[test]
+    fn test_edge_tts_circuit_breaker_cooldown() {
+        assert_eq!(compute_edge_tts_cooldown_secs(1), 180);
+        assert_eq!(compute_edge_tts_cooldown_secs(2), 900);
+        assert_eq!(compute_edge_tts_cooldown_secs(5), 900);
+
+        assert_eq!(remaining_edge_tts_cooldown_secs(1000, 0), None);
+        assert_eq!(remaining_edge_tts_cooldown_secs(1000, 1000), None);
+        assert_eq!(remaining_edge_tts_cooldown_secs(1000, 1180), Some(180));
     }
 }

@@ -8,9 +8,9 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 static TRAY_ICON_RGBA: &[u8] = include_bytes!("../assets/tray_icon_32.rgba");
 
-/// 单日单个日志文件安全上限：2 MiB（防止调试日志异常暴涨占用网吧系统盘）
+/// 单日单个日志文件安全上限：2 MiB（防止调试日志异常暴涨占用系统盘）
 pub const DEFAULT_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
-/// 按天归档默认保留天数：14 天（自动清理更早历史日志，方便运维按日期快速导出）
+/// 按天归档默认保留天数：14 天（自动清理更早历史日志，方便按日期快速查看导出）
 pub const DEFAULT_LOG_RETENTION_DAYS: usize = 14;
 /// 同日超出单文件上限时的最大分片备份数
 pub const DEFAULT_LOG_MAX_BACKUPS: usize = 3;
@@ -330,11 +330,11 @@ fn is_dir_writable_for_log(dir: &Path) -> bool {
     }
 }
 
-/// 按网吧运行环境优先级解析可写日志目录：
-/// 1) 传入基准目录/logs（通常与 config.json 同目录，如 dist\logs，便于运维按天导出）
+/// 按运行环境优先级解析可写日志目录：
+/// 1) 传入基准目录/logs（通常与 config.json 同目录，如 dist\logs，便于按天查看导出）
 /// 2) 当前 exe 同级 logs 目录
 /// 3) %APPDATA%\HalfHourChime\logs
-/// 4) %TEMP%\HalfHourChime\logs（只读系统盘/网吧影子系统兜底）
+/// 4) %TEMP%\HalfHourChime\logs（只读系统目录兜底）
 pub fn resolve_log_file_path(preferred_base_dir: Option<&Path>) -> PathBuf {
     let today_name = daily_log_filename("half_hour_chime", Local::now().date_naive());
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -441,7 +441,7 @@ pub fn log_error(target: &str, message: &str) {
     log_msg(LogLevel::Error, target, message);
 }
 
-/// 记录网吧运行环境关键快照，便于排查权限、只读目录、无盘环境与音频/网络异常
+/// 记录当前运行环境关键快照，便于排查权限、只读目录与音频/网络异常
 pub fn log_environment_snapshot(app_version: &str, config_path: &Path) {
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
@@ -474,9 +474,10 @@ pub fn log_environment_snapshot(app_version: &str, config_path: &Path) {
     );
 }
 
-/// 托盘右键菜单命令 ID 集合（FR-15 + 运维快捷菜单）
+/// 托盘右键菜单命令 ID 集合（FR-15 + 快捷操作）
 pub struct TrayMenuIds {
     pub test_chime: MenuId,
+    pub stop_audio: MenuId,
     pub sync_ntp: MenuId,
     pub mute_mode: MenuId,
     pub open_settings: MenuId,
@@ -509,17 +510,19 @@ impl TrayController {
 
         let menu = Menu::new();
         let item_test = MenuItem::new("测试报时", true, None);
+        let item_stop = MenuItem::new("停止当前播报", true, None);
         let item_sync = MenuItem::new("立即校时", true, None);
         let item_mute = CheckMenuItem::new("静音模式", true, initial_mute_mode, None);
-        let item_settings = MenuItem::new("设置...", true, None);
+        let item_settings = MenuItem::new("设置与闹钟...", true, None);
         let item_autostart = CheckMenuItem::new("开机自启", true, initial_auto_start, None);
-        let item_logs = MenuItem::new("快速访问日志文件夹", true, None);
+        let item_logs = MenuItem::new("打开日志文件夹", true, None);
         let item_update = MenuItem::new("检查更新", true, None);
         let item_about = MenuItem::new("关于", true, None);
         let item_exit = MenuItem::new("退出", true, None);
 
         let ids = TrayMenuIds {
             test_chime: item_test.id().clone(),
+            stop_audio: item_stop.id().clone(),
             sync_ntp: item_sync.id().clone(),
             mute_mode: item_mute.id().clone(),
             open_settings: item_settings.id().clone(),
@@ -531,6 +534,7 @@ impl TrayController {
         };
 
         let _ = menu.append(&item_test);
+        let _ = menu.append(&item_stop);
         let _ = menu.append(&item_sync);
         let _ = menu.append(&item_mute);
         let _ = menu.append(&PredefinedMenuItem::separator());
@@ -976,7 +980,7 @@ pub fn open_url_in_browser(url: &str) -> Result<(), String> {
     }
 }
 
-/// 快速在系统文件管理器中打开当前按天归档日志所在目录（方便网吧运维直接排查导出）
+/// 快速在系统文件管理器中打开当前按天归档日志所在目录
 pub fn open_logs_folder() -> Result<(), String> {
     let log_dir = current_log_path()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -1298,7 +1302,7 @@ pub fn spawn_cleanup_stale_update_files(cleanup_temp_arg: Option<String>) {
         });
 }
 
-/// 呼出 Windows 原生文件选择器，允许用户挑选餐饮提醒自定义音频文件（支持 WAV/MP3/OGG/FLAC）
+/// 呼出 Windows 原生文件选择器，允许用户挑选自定义音频文件（支持 WAV/MP3/OGG/FLAC）
 pub fn browse_audio_file() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
@@ -1310,7 +1314,7 @@ pub fn browse_audio_file() -> Option<String> {
         };
 
         let mut file_buf = vec![0u16; 1024];
-        let title: Vec<u16> = "选择餐饮提醒自定义音频文件\0".encode_utf16().collect();
+        let title: Vec<u16> = "选择自定义音频文件\0".encode_utf16().collect();
         let filter: Vec<u16> =
             "音频文件 (*.wav;*.mp3;*.ogg;*.flac)\0*.wav;*.mp3;*.ogg;*.flac\0所有文件 (*.*)\0*.*\0\0"
                 .encode_utf16()
@@ -1334,7 +1338,7 @@ pub fn browse_audio_file() -> Option<String> {
                 .unwrap_or(file_buf.len());
             let path = String::from_utf16_lossy(&file_buf[..len]).trim().to_string();
             if !path.is_empty() {
-                log_info("audio", &format!("selected custom meal audio: \"{path}\""));
+                log_info("audio", &format!("selected custom audio: \"{path}\""));
                 return Some(path);
             }
         }
@@ -1429,6 +1433,38 @@ pub fn apply_rounded_window_corners(
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (hwnd_isize, width_px, height_px, radius_px);
+    }
+}
+
+/// 将指定窗体置顶显示（用于闹钟响铃提醒弹窗）
+pub fn bring_window_topmost(hwnd_isize: isize) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+        };
+
+        if hwnd_isize == 0 {
+            return;
+        }
+        let hwnd = HWND(hwnd_isize as *mut std::ffi::c_void);
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = hwnd_isize;
     }
 }
 
@@ -1549,9 +1585,9 @@ mod tests {
             2,
             LogLevel::Debug,
         );
-        logger.log_at(d1, LogLevel::Info, "netcafe", "day1 event");
-        logger.log_at(d2, LogLevel::Info, "netcafe", "day2 event");
-        logger.log_at(d3, LogLevel::Info, "netcafe", "day3 event");
+        logger.log_at(d1, LogLevel::Info, "app", "day1 event");
+        logger.log_at(d2, LogLevel::Info, "app", "day2 event");
+        logger.log_at(d3, LogLevel::Info, "app", "day3 event");
         logger.flush();
 
         let f1 = dir.join("half_hour_chime_2026-11-12.log");
