@@ -15,7 +15,9 @@ use config::{
     AlarmRepeatMode, AppConfig, ConfigStore, CustomAlarm, ThemeMode, TtsEngine,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use scheduler::{solar_to_lunar, HolidayInfo, HolidayKind, Scheduler, TriggerEvent};
+use scheduler::{
+    solar_to_lunar, HolidayInfo, HolidayKind, ScheduledRefContext, Scheduler, TriggerEvent,
+};
 use slint::{ComponentHandle, ModelRc, Timer, TimerMode, VecModel};
 use std::cell::{Cell, RefCell};
 use std::io::{Read, Write};
@@ -154,9 +156,7 @@ mod perf_guard {
             PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
             PdhGetFormattedCounterValue, PdhOpenQueryW, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE,
         };
-        use windows::Win32::System::ProcessStatus::{
-            EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
-        };
+        use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
         use windows::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
         use windows::Win32::System::Threading::{
             GetCurrentProcess, GetProcessTimes, GetSystemTimes,
@@ -386,22 +386,9 @@ mod perf_guard {
             }
         }
 
+        #[inline]
         pub fn query_process_memory_bytes() -> (u64, u64) {
-            unsafe {
-                let mut pmc: PROCESS_MEMORY_COUNTERS_EX = mem::zeroed();
-                pmc.cb = mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-                if GetProcessMemoryInfo(
-                    GetCurrentProcess(),
-                    &mut pmc as *mut PROCESS_MEMORY_COUNTERS_EX as *mut _,
-                    pmc.cb,
-                )
-                .is_ok()
-                {
-                    (pmc.WorkingSetSize as u64, pmc.PrivateUsage as u64)
-                } else {
-                    (0, 0)
-                }
-            }
+            win_sys::query_process_memory_bytes()
         }
 
         /// 执行 Windows 原生强制内存回收：清理空闲音频缓存 + 刷新日志缓冲 + 紧缩默认堆 + 裁剪进程工作集
@@ -504,8 +491,9 @@ mod perf_guard {
             (0, 0, 0)
         }
 
+        #[inline]
         pub fn query_process_memory_bytes() -> (u64, u64) {
-            (0, 0)
+            win_sys::query_process_memory_bytes()
         }
     }
 
@@ -790,6 +778,39 @@ fn fetch_public_github_release_via_redirect(
     }
 }
 
+fn fetch_public_gitee_release_via_redirect(
+    agent: &ureq::Agent,
+    owner: &str,
+    repo: &str,
+) -> Option<Result<version::RemoteVersionManifest, String>> {
+    let web_latest = format!("https://gitee.com/{owner}/{repo}/releases/latest");
+    let resp = agent
+        .get(&web_latest)
+        .set(
+            "User-Agent",
+            &format!("HalfHourChime/{}", version::APP_PKG_VERSION),
+        )
+        .call()
+        .ok()?;
+
+    let final_url = resp.get_url().to_string();
+    let tag_part = final_url.split("/releases/tag/").nth(1)?;
+    let tag = tag_part.split(['?', '#']).next()?.trim();
+    if tag.is_empty() {
+        return None;
+    }
+
+    let exe_url =
+        format!("https://gitee.com/{owner}/{repo}/releases/download/{tag}/HalfHourChime.exe");
+    Some(Ok(version::RemoteVersionManifest {
+        version: tag.to_string(),
+        download_url: exe_url,
+        api_download_url: String::new(),
+        notes: "已通过 Gitee 国内直连源检测到新版本，点击“自动更新”即可下载升级。".to_string(),
+        package_type: "portable".to_string(),
+    }))
+}
+
 fn fetch_gitee_release_manifest(
     owner: &str,
     repo: &str,
@@ -808,12 +829,18 @@ fn fetch_gitee_release_manifest(
                     }
                 }
                 Err(HttpTextErr::Status(code, detail)) => {
-                    last_err = format!("连接 Gitee 镜像失败：{detail} (HTTP {code})");
+                    last_err = format!("连接 Gitee 国内源失败：{detail} (HTTP {code})");
                 }
                 Err(HttpTextErr::Other(msg)) => {
                     last_err = msg;
                 }
             }
+        }
+    }
+
+    for agent in &agents {
+        if let Some(Ok(manifest)) = fetch_public_gitee_release_via_redirect(agent, owner, repo) {
+            return Ok(manifest);
         }
     }
 
@@ -832,7 +859,12 @@ fn fetch_primary_manifest_once(
     let agent = build_ureq_agent(5, 8);
 
     match http_get_text(&agent, &resolved_url, token) {
-        Ok(body) => version::parse_remote_manifest_body(&body),
+        Ok(body) => {
+            let mut manifest = version::parse_remote_manifest_body(&body)?;
+            manifest.download_url =
+                version::resolve_manifest_download_url(trimmed, &manifest.download_url);
+            Ok(manifest)
+        }
         Err(HttpTextErr::Status(code, detail)) => {
             if let Some((owner, repo)) = version::extract_github_owner_repo(&resolved_url) {
                 if code == 404 {
@@ -849,18 +881,18 @@ fn fetch_primary_manifest_once(
                             return res;
                         }
                         return Err(
-                            "连接更新服务器返回 404：仓库可能是私有（Private）或尚未公开发布正式 Release。请在 GitHub 将仓库改为 Public（公开），或在「本地 Web 控制台 → 版本与更新」填入只读 GitHub Token。"
+                            "连接更新服务器返回 404：仓库可能是私有（Private）或尚未公开发布正式 Release。"
                                 .to_string(),
                         );
                     }
                     return Err(
-                        "连接更新服务器返回 404：未找到可访问的 Release，或当前 GitHub Token 缺少该仓库的只读权限（Contents: Read）。"
+                        "连接更新服务器返回 404：未找到可访问的 Release，或当前访问 Token 权限不足。"
                             .to_string(),
                     );
                 }
                 if code == 401 {
                     return Err(
-                        "GitHub 访问令牌无效或已过期（401），请在「本地 Web 控制台 → 版本与更新」中重新配置。"
+                        "更新源访问令牌无效或已过期（401），请在「本地 Web 控制台 → 版本与更新」中重新配置。"
                             .to_string(),
                     );
                 }
@@ -869,7 +901,7 @@ fn fetch_primary_manifest_once(
                         return res;
                     }
                     return Err(
-                        "GitHub API 访问受限（403 请求频率限制），请稍后重试或在本地 Web 控制台配置只读 Token。"
+                        "更新源 API 访问受限（403 请求频率限制），请稍后重试或改用国内 Gitee / 本地路径更新。"
                             .to_string(),
                     );
                 }
@@ -880,8 +912,8 @@ fn fetch_primary_manifest_once(
     }
 }
 
-/// 轻量级 HTTP/HTTPS/本地共享读取服务端版本清单：
-/// 支持 GitHub Releases（无代理受限时自动回退 Gitee 国内镜像）、Gitee Releases、version.json、Google Drive 及局域网路径
+/// 轻量级国内 HTTP/本地/局域网更新清单读取：
+/// 默认直连 Gitee Releases；支持自建内网 HTTP `version.json`、本地目录及局域网共享目录（UNC）
 fn fetch_remote_manifest(
     url: &str,
     token: &str,
@@ -890,27 +922,34 @@ fn fetch_remote_manifest(
     let trimmed = migrated.trim();
     if trimmed.is_empty() || trimmed.contains("updates.zwai.local") {
         return Err(
-            "尚未配置更新源地址：请在「本地 Web 控制台 → 版本与更新」填入更新地址或 GitHub/Gitee Releases 地址"
+            "尚未配置更新源地址：请在「本地 Web 控制台 → 版本与更新」填入 Gitee Releases 地址、内网 HTTP 或本地共享路径"
                 .to_string(),
         );
     }
 
-    if let Some(local_path) = resolve_local_or_unc_path(trimmed) {
-        let meta = std::fs::metadata(&local_path)
-            .map_err(|e| format!("读取本地/局域网更新清单失败（{}）：{e}", local_path.display()))?;
+    if let Some(raw_local_path) = resolve_local_or_unc_path(trimmed) {
+        let manifest_path = if raw_local_path.is_dir() {
+            raw_local_path.join("version.json")
+        } else {
+            raw_local_path
+        };
+        let meta = std::fs::metadata(&manifest_path)
+            .map_err(|e| format!("读取本地/局域网更新清单失败（{}）：{e}", manifest_path.display()))?;
         if meta.len() > 256 * 1024 {
             return Err("更新清单文件过大（超过 256 KB）".to_string());
         }
-        let body = std::fs::read_to_string(&local_path)
+        let body = std::fs::read_to_string(&manifest_path)
             .map_err(|e| format!("读取本地/局域网更新清单失败：{e}"))?;
-        return Ok((version::parse_remote_manifest_body(&body)?, None));
+        let mut manifest = version::parse_remote_manifest_body(&body)?;
+        let manifest_src_str = manifest_path.to_string_lossy();
+        manifest.download_url =
+            version::resolve_manifest_download_url(&manifest_src_str, &manifest.download_url);
+        return Ok((manifest, None));
     }
 
     match fetch_primary_manifest_once(trimmed, token) {
         Ok(manifest) => {
-            let fallback_url = if version::is_official_gitee_release_url(trimmed) {
-                version::build_github_mirror_exe_url(&manifest.version)
-            } else if version::is_official_github_release_url(trimmed) {
+            let fallback_url = if version::is_official_github_release_url(trimmed) {
                 version::build_gitee_mirror_exe_url(&manifest.version)
             } else {
                 None
@@ -918,36 +957,11 @@ fn fetch_remote_manifest(
             Ok((manifest, fallback_url))
         }
         Err(primary_err) => {
-            if version::is_official_gitee_release_url(trimmed) {
-                win_sys::log_warn(
-                    "update",
-                    &format!(
-                        "Gitee primary update check failed ({primary_err}), falling back to GitHub (cqcmd/HalfHourChime)"
-                    ),
-                );
-                match fetch_primary_manifest_once(version::DEFAULT_GITHUB_RELEASE_URL, token) {
-                    Ok(gh_manifest) => {
-                        win_sys::log_info(
-                            "update",
-                            &format!(
-                                "GitHub fallback check succeeded version={} url={}",
-                                gh_manifest.version, gh_manifest.download_url
-                            ),
-                        );
-                        return Ok((gh_manifest, None));
-                    }
-                    Err(gh_err) => {
-                        return Err(format!(
-                            "Gitee 默认更新源与 GitHub 备用源均暂不可用：{gh_err}"
-                        ));
-                    }
-                }
-            }
             if version::is_official_github_release_url(trimmed) {
                 win_sys::log_warn(
                     "update",
                     &format!(
-                        "GitHub primary update check failed ({primary_err}), falling back to Gitee mirror (djjz/HalfHourChime)"
+                        "GitHub source failed ({primary_err}), falling back to domestic Gitee (djjz/HalfHourChime)"
                     ),
                 );
                 match fetch_gitee_release_manifest("djjz", "HalfHourChime") {
@@ -955,7 +969,7 @@ fn fetch_remote_manifest(
                         win_sys::log_info(
                             "update",
                             &format!(
-                                "Gitee mirror check succeeded version={} url={}",
+                                "Gitee domestic check succeeded version={} url={}",
                                 gitee_manifest.version, gitee_manifest.download_url
                             ),
                         );
@@ -963,7 +977,7 @@ fn fetch_remote_manifest(
                     }
                     Err(gitee_err) => {
                         return Err(format!(
-                            "GitHub 主源连接受限，且 Gitee 国内镜像暂不可用：{gitee_err}"
+                            "更新源暂不可用（Gitee 国内源：{gitee_err}）"
                         ));
                     }
                 }
@@ -2184,7 +2198,7 @@ fn download_and_apply_auto_update(
                             let switch_msg = if fallback_dl_url.contains("gitee.com") {
                                 "主下载源连接受限，正在自动切换国内 Gitee 镜像源下载...".to_string()
                             } else {
-                                "主下载源连接受限，正在自动切换 GitHub 备用源下载...".to_string()
+                                "主下载源连接受限，正在尝试备用镜像源下载...".to_string()
                             };
                             ctx_clone.download_progress.store(0, Ordering::SeqCst);
                             if let Ok(mut ds) = ctx_clone.download_status_text.lock() {
@@ -2545,7 +2559,7 @@ fn main() {
         *tok_guard = initial_update_token.clone();
     }
     if let Ok(mut st_msg) = update_ctx.status_text.lock() {
-        *st_msg = "已启用 Gitee 默认直连 / GitHub 备用双源自动更新检查".to_string();
+        *st_msg = "已启用 Gitee 国内直连 / 本地与局域网自动更新检查".to_string();
     }
     let update_tx = start_update_check_worker(
         initial_update_enabled,
@@ -3797,6 +3811,7 @@ fn main() {
         let preview_gen_tick = Rc::clone(&last_voice_preview_gen);
         let wc_tick = Rc::clone(&web_console);
         let perf_sample_tick = Arc::clone(&latest_perf);
+        let cpu_throttled_tick = Arc::clone(&cpu_throttled);
         let update_ctx_tick = update_ctx.clone();
         let u_tx_tick = update_tx.clone();
         let perf_stop_tick = perf_stop_tx.clone();
@@ -4067,6 +4082,45 @@ fn main() {
 
             let config_snapshot = st.config.clone();
             let volume_snapshot = st.live_volume;
+            if st.scheduler.needs_leak_sample_at(now) {
+                let mut visible_windows_mask = 0u8;
+                if mw_weak.upgrade().is_some_and(|w| w.window().is_visible()) {
+                    visible_windows_mask |= 1 << 0;
+                }
+                if sw_weak.upgrade().is_some_and(|w| w.window().is_visible()) {
+                    visible_windows_mask |= 1 << 1;
+                }
+                if aw_weak.upgrade().is_some_and(|w| w.window().is_visible()) {
+                    visible_windows_mask |= 1 << 2;
+                }
+                if uw_weak.upgrade().is_some_and(|w| w.window().is_visible()) {
+                    visible_windows_mask |= 1 << 3;
+                }
+                let alarm_alert_alive = {
+                    let aaw_b = aaw_slot_tick.borrow();
+                    if aaw_b.as_ref().is_some_and(|w| w.window().is_visible()) {
+                        visible_windows_mask |= 1 << 4;
+                    }
+                    aaw_b.is_some()
+                };
+                st.scheduler.set_runtime_refs(ScheduledRefContext {
+                    app_state_strong: Rc::strong_count(&st_rc),
+                    draft_alarms_strong: Rc::strong_count(&drafts_tick),
+                    web_console_strong: Rc::strong_count(&wc_tick),
+                    alarm_alert_slot_strong: Rc::strong_count(&aaw_slot_tick),
+                    single_instance_guard_strong: Rc::strong_count(&guard_tick),
+                    voice_preview_gen_strong: Rc::strong_count(&preview_gen_tick),
+                    tray_arc_strong: Arc::strong_count(&tray_for_tick),
+                    ipc_wake_arc_strong: Arc::strong_count(&ipc_wake_for_tick),
+                    perf_sample_arc_strong: Arc::strong_count(&perf_sample_tick),
+                    cpu_throttled_arc_strong: Arc::strong_count(&cpu_throttled_tick),
+                    update_github_token_strong: Arc::strong_count(&update_ctx_tick.github_token),
+                    web_console_running: wc_tick.borrow().is_running(),
+                    alarm_alert_alive,
+                    visible_windows_mask,
+                    audio: audio_clone.ref_snapshot(),
+                });
+            }
             let events = st.scheduler.evaluate_at(&config_snapshot, now);
 
             for ev in events {

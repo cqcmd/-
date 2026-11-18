@@ -1807,7 +1807,7 @@ export component SettingsWindow inherits Window {
                                         font-size: 12px;
                                         vertical-alignment: center;
                                     }
-                                    for eng-opt[idx] in ["本地 SAPI5（离线可用）", "Microsoft Edge TTS（在线）"] : Rectangle {
+                                    for eng-opt[idx] in ["本地 Windows 语音（纯离线首选）", "Edge 在线语音（备选）"] : Rectangle {
                                         horizontal-stretch: 1;
                                         height: 30px;
                                         border-radius: 6px;
@@ -1925,7 +1925,7 @@ export component SettingsWindow inherits Window {
                                     StyledInput {
                                         horizontal-stretch: 1;
                                         text <=> root.ntp-server;
-                                        placeholder: "如：ntp.aliyun.com";
+                                        placeholder: "默认 ntp.aliyun.com（支持逗号分隔多地址或内网 IP）";
                                     }
                                     SecondaryButton {
                                         width: 88px;
@@ -2221,7 +2221,7 @@ export component AboutWindow inherits Window {
     in property <string> app-version: "v2.0.0+20261114";
     in property <string> app-vendor: "Z.W.&AI";
     in property <string> config-path: "config.json";
-    in property <string> update-status-text: "已启用 Gitee 默认直连 / GitHub 备用自动更新检查";
+    in property <string> update-status-text: "已启用 Gitee 国内直连 / 本地与局域网更新检查";
     in property <bool> is-checking-update: false;
     in property <bool> has-update: false;
 

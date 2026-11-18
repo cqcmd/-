@@ -6,12 +6,39 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// 1900-01-01 至 1970-01-01 之间的秒数差（70 年含 17 个闰年）
 const NTP_TO_UNIX_EPOCH_SECS: u64 = 2_208_988_800;
 
+/// 内置国内公共 NTP 容灾池（阿里云 / 腾讯云 / 中科院国家授时中心 / 中国 NTP 池）
+pub const DOMESTIC_FALLBACK_NTP_SERVERS: &[&str] = &[
+    "ntp.aliyun.com",
+    "ntp.tencent.com",
+    "ntp.ntsc.ac.cn",
+    "cn.ntp.org.cn",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NtpSyncResult {
     pub success: bool,
     pub message: String,
     pub synced_at: String,
     pub offset_ms: i64,
+}
+
+/// 解析逗号/中文逗号/分号分隔的 NTP 服务器列表；使用默认国内主源时自动附带国内容灾备选节点
+pub fn build_ntp_candidate_servers(raw: &str) -> Vec<String> {
+    let mut list: Vec<String> = Vec::new();
+    for token in raw.split([',', '，', ';', '；']) {
+        let s = token.trim();
+        if !s.is_empty() && !list.iter().any(|existing| existing.eq_ignore_ascii_case(s)) {
+            list.push(s.to_string());
+        }
+    }
+    if list.is_empty() || list.iter().any(|s| s.eq_ignore_ascii_case("ntp.aliyun.com")) {
+        for &fb in DOMESTIC_FALLBACK_NTP_SERVERS {
+            if !list.iter().any(|existing| existing.eq_ignore_ascii_case(fb)) {
+                list.push(fb.to_string());
+            }
+        }
+    }
+    list
 }
 
 /// 纯标准库 UDP SNTP（RFC 4330）请求并计算高精度时钟偏差
@@ -33,10 +60,10 @@ pub fn query_ntp_utc(server: &str) -> Result<(DateTime<Utc>, i64), String> {
     let socket = UdpSocket::bind(bind_addr)
         .map_err(|e| format!("创建 UDP 套接字失败：{e}"))?;
     socket
-        .set_read_timeout(Some(Duration::from_secs(4)))
+        .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|e| format!("设置超时失败：{e}"))?;
     socket
-        .set_write_timeout(Some(Duration::from_secs(4)))
+        .set_write_timeout(Some(Duration::from_secs(2)))
         .map_err(|e| format!("设置写超时失败：{e}"))?;
 
     // 构造 48 字节 SNTP v4 客户端请求包（LI=0, VN=4, Mode=3 -> 0x23）
@@ -103,9 +130,24 @@ pub fn parse_ntp_transmit_timestamp(
     Ok((server_dt, offset_ms))
 }
 
+/// 按候选列表依次向国内/自定义 NTP 节点取时，返回命中的服务器地址
+pub fn query_ntp_utc_with_fallback(server: &str) -> Result<(DateTime<Utc>, i64, String), String> {
+    let candidates = build_ntp_candidate_servers(server);
+    let mut last_err = String::from("未配置有效的 NTP 服务器");
+    for candidate in candidates {
+        match query_ntp_utc(&candidate) {
+            Ok((utc_dt, offset_ms)) => return Ok((utc_dt, offset_ms, candidate)),
+            Err(err) => {
+                last_err = err;
+            }
+        }
+    }
+    Err(last_err)
+}
+
 /// 执行完整校时流程（先直调 SetSystemTime；若权限不足且允许 UAC，则拉起提权子进程完成校时）
 pub fn sync_system_time_with_elevation(server: &str) -> NtpSyncResult {
-    let (utc_dt, offset_ms) = match query_ntp_utc(server) {
+    let (utc_dt, offset_ms, matched_server) = match query_ntp_utc_with_fallback(server) {
         Ok(res) => res,
         Err(err) => {
             return NtpSyncResult {
@@ -122,13 +164,13 @@ pub fn sync_system_time_with_elevation(server: &str) -> NtpSyncResult {
         match apply_windows_system_time(utc_dt) {
             Ok(()) => NtpSyncResult {
                 success: true,
-                message: format!("校时成功（校准偏差 {offset_ms:+} ms）"),
+                message: format!("校时成功（{matched_server}，校准偏差 {offset_ms:+} ms）"),
                 synced_at: Local::now().format("%H:%M:%S").to_string(),
                 offset_ms,
             },
             Err(WinTimeError::AccessDenied) => {
                 // 日常以普通权限驻留托盘时，按需通过 UAC 提权短生命周期子进程完成系统时钟写入
-                match run_elevated_ntp_helper(server) {
+                match run_elevated_ntp_helper(&matched_server) {
                     Ok(elevated_res) => elevated_res,
                     Err(err) => NtpSyncResult {
                         success: false,
@@ -152,7 +194,9 @@ pub fn sync_system_time_with_elevation(server: &str) -> NtpSyncResult {
         let _ = utc_dt;
         NtpSyncResult {
             success: false,
-            message: format!("非 Windows 环境仅支持读取 NTP 时间（偏差 {offset_ms:+} ms）"),
+            message: format!(
+                "非 Windows 环境仅支持读取 NTP 时间（{matched_server}，偏差 {offset_ms:+} ms）"
+            ),
             synced_at: Local::now().format("%H:%M:%S").to_string(),
             offset_ms,
         }
@@ -162,14 +206,14 @@ pub fn sync_system_time_with_elevation(server: &str) -> NtpSyncResult {
 /// 提权子进程入口：处理 `--sync-ntp <server>` 参数
 pub fn run_elevated_cli_mode(server: &str) -> i32 {
     let result_path = elevated_result_file_path();
-    let result = match query_ntp_utc(server) {
-        Ok((utc_dt, offset_ms)) => {
+    let result = match query_ntp_utc_with_fallback(server) {
+        Ok((utc_dt, offset_ms, matched_server)) => {
             #[cfg(target_os = "windows")]
             {
                 match apply_windows_system_time(utc_dt) {
                     Ok(()) => NtpSyncResult {
                         success: true,
-                        message: format!("校时成功（校准偏差 {offset_ms:+} ms）"),
+                        message: format!("校时成功（{matched_server}，校准偏差 {offset_ms:+} ms）"),
                         synced_at: Local::now().format("%H:%M:%S").to_string(),
                         offset_ms,
                     },
@@ -347,5 +391,22 @@ mod tests {
         let resp = [0u8; 48];
         let now = SystemTime::now();
         assert!(parse_ntp_transmit_timestamp(&resp, now, now).is_err());
+    }
+
+    #[test]
+    fn test_build_domestic_ntp_candidate_servers() {
+        let default_list = build_ntp_candidate_servers("ntp.aliyun.com");
+        assert_eq!(default_list[0], "ntp.aliyun.com");
+        assert!(default_list.contains(&"ntp.tencent.com".to_string()));
+        assert!(default_list.contains(&"ntp.ntsc.ac.cn".to_string()));
+        assert!(default_list.contains(&"cn.ntp.org.cn".to_string()));
+
+        let custom_lan = build_ntp_candidate_servers("192.168.1.1");
+        assert_eq!(custom_lan, vec!["192.168.1.1".to_string()]);
+
+        let multi = build_ntp_candidate_servers("192.168.1.1, ntp.aliyun.com; 192.168.1.1");
+        assert_eq!(multi[0], "192.168.1.1");
+        assert_eq!(multi[1], "ntp.aliyun.com");
+        assert!(multi.contains(&"ntp.ntsc.ac.cn".to_string()));
     }
 }

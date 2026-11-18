@@ -1,9 +1,11 @@
+use crate::audio::AudioRefSnapshot;
 use crate::config::{
     render_alarm_tts_template, render_holiday_template, render_tts_template, AlarmRepeatMode,
     AppConfig, CustomAlarm,
 };
+use crate::win_sys;
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// 2010–2040 紫金山标准农历位图压缩表（2010-02-14 为正月初一起点）
 /// bit 0..=3: 闰月月份（0 表示无闰月）；bit 4..=15: 正月到腊月大小月（1=30天，0=29天）；bit 16: 闰月大小月
@@ -297,17 +299,247 @@ pub struct NextEventInfo {
     pub target_time_text: String,
 }
 
-/// 核心定时调度器（负责整/半点及自定义闹钟节拍识别、防重入、跨日静默判定、内置节假日与倒计时计算）
+/// 调度器内存泄漏周期监测采样间隔（秒）：每 60 秒为一个独立观测周期
+const LEAK_CYCLE_INTERVAL_SECS: i64 = 60;
+/// 判定为非预期单调递增所需的连续上升周期数（baseline + 5 个连续上升周期共 6 个采样点）
+const LEAK_CONSECUTIVE_CYCLES: usize = 5;
+/// 单周期视为真实增长的最小增量阈值（16 KiB，过滤 OS 页表与小对象复用波动）
+const LEAK_MIN_STEP_BYTES: u64 = 16 * 1024;
+/// 连续 5 个周期累计净增长告警阈值（256 KiB）
+const LEAK_MIN_TOTAL_GROWTH_BYTES: u64 = 256 * 1024;
+
+/// 主循环传给调度器的运行时对象引用计数与活跃资源快照
+#[derive(Debug, Clone, Default)]
+pub struct ScheduledRefContext {
+    pub app_state_strong: usize,
+    pub draft_alarms_strong: usize,
+    pub web_console_strong: usize,
+    pub alarm_alert_slot_strong: usize,
+    pub single_instance_guard_strong: usize,
+    pub voice_preview_gen_strong: usize,
+    pub tray_arc_strong: usize,
+    pub ipc_wake_arc_strong: usize,
+    pub perf_sample_arc_strong: usize,
+    pub cpu_throttled_arc_strong: usize,
+    pub update_github_token_strong: usize,
+    pub web_console_running: bool,
+    pub alarm_alert_alive: bool,
+    /// 可见窗口位掩码：bit0=Main bit1=Settings bit2=About bit3=Update bit4=AlarmAlert
+    pub visible_windows_mask: u8,
+    pub audio: AudioRefSnapshot,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryCycleSample {
+    cycle_bucket: i64,
+    timestamp_text: String,
+    working_set_bytes: u64,
+    private_bytes: u64,
+    tracked_bytes: u64,
+}
+
+/// 连续 5 个调度周期内存单调递增泄漏监控器
+#[derive(Debug, Default)]
+struct MemoryLeakMonitor {
+    last_cycle_bucket: Option<i64>,
+    last_alarm_alert_alive: bool,
+    samples: VecDeque<MemoryCycleSample>,
+    alert_count: u64,
+}
+
+/// 核心定时调度器（负责整/半点及自定义闹钟节拍识别、防重入、跨日静默判定、内置节假日、倒计时与周期泄漏监控）
 #[derive(Debug, Default)]
 pub struct Scheduler {
     last_chime_slot: Option<(i32, u32, u32, u32)>,
     last_alarm_slots: HashMap<u64, (i32, u32, u32, u32)>,
     snooze_alarm: Option<(CustomAlarm, DateTime<Local>)>,
+    leak_monitor: MemoryLeakMonitor,
+    runtime_refs: ScheduledRefContext,
 }
 
 impl Scheduler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 判断当前时刻是否进入新的 60 秒内存观测周期
+    pub fn needs_leak_sample_at(&self, now: DateTime<Local>) -> bool {
+        let bucket = now.timestamp().div_euclid(LEAK_CYCLE_INTERVAL_SECS);
+        self.leak_monitor.last_cycle_bucket != Some(bucket)
+    }
+
+    /// 更新主循环提供的 Rc/Arc 强引用计数与活跃资源快照
+    pub fn set_runtime_refs(&mut self, refs: ScheduledRefContext) {
+        self.runtime_refs = refs;
+    }
+
+    /// 在每个 60 秒调度周期检测进程内存是否连续 5 个周期呈非预期单调递增；
+    /// 若命中则记录完整增长曲线、Scheduler 容器状态及各子系统对象引用计数到日志。
+    pub fn check_leak_at_cycle(
+        &mut self,
+        cfg: &AppConfig,
+        now: DateTime<Local>,
+        working_set_bytes: u64,
+        private_bytes: u64,
+    ) -> Option<String> {
+        let cycle_bucket = now.timestamp().div_euclid(LEAK_CYCLE_INTERVAL_SECS);
+        if self.leak_monitor.last_cycle_bucket == Some(cycle_bucket) {
+            return None;
+        }
+        self.leak_monitor.last_cycle_bucket = Some(cycle_bucket);
+
+        let tracked_bytes = if private_bytes > 0 {
+            private_bytes
+        } else {
+            working_set_bytes
+        };
+        if tracked_bytes == 0 {
+            return None;
+        }
+
+        let current_sample = MemoryCycleSample {
+            cycle_bucket,
+            timestamp_text: now.format("%H:%M:%S").to_string(),
+            working_set_bytes,
+            private_bytes,
+            tracked_bytes,
+        };
+
+        // 懒加载闹钟弹窗首次实例化会带来一次性 Slint 纹理/组件内存抬升，重置基线避免误报
+        let alert_just_created =
+            self.runtime_refs.alarm_alert_alive && !self.leak_monitor.last_alarm_alert_alive;
+        self.leak_monitor.last_alarm_alert_alive = self.runtime_refs.alarm_alert_alive;
+        if alert_just_created {
+            self.leak_monitor.samples.clear();
+            self.leak_monitor.samples.push_back(current_sample);
+            return None;
+        }
+
+        // 若正在播放音频/TTS 语音，临时解码缓冲会短暂抬高占用，跳过本周期防止误计入单调序列
+        if self.runtime_refs.audio.active_seq_gen != 0
+            || self.runtime_refs.audio.active_sink_present
+        {
+            return None;
+        }
+
+        let Some(prev) = self.leak_monitor.samples.back() else {
+            self.leak_monitor.samples.push_back(current_sample);
+            return None;
+        };
+
+        if current_sample.tracked_bytes < prev.tracked_bytes.saturating_add(LEAK_MIN_STEP_BYTES) {
+            self.leak_monitor.samples.clear();
+            self.leak_monitor.samples.push_back(current_sample);
+            return None;
+        }
+
+        self.leak_monitor.samples.push_back(current_sample);
+        while self.leak_monitor.samples.len() > LEAK_CONSECUTIVE_CYCLES + 1 {
+            self.leak_monitor.samples.pop_front();
+        }
+
+        if self.leak_monitor.samples.len() < LEAK_CONSECUTIVE_CYCLES + 1 {
+            return None;
+        }
+
+        let first = self.leak_monitor.samples.front()?;
+        let last = self.leak_monitor.samples.back()?;
+        let net_growth = last.tracked_bytes.saturating_sub(first.tracked_bytes);
+        if net_growth < LEAK_MIN_TOTAL_GROWTH_BYTES {
+            return None;
+        }
+
+        self.leak_monitor.alert_count = self.leak_monitor.alert_count.saturating_add(1);
+        let curve = self
+            .leak_monitor
+            .samples
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| {
+                let delta_kb = if idx == 0 {
+                    0.0
+                } else {
+                    let prev_b = self.leak_monitor.samples[idx - 1].tracked_bytes;
+                    (s.tracked_bytes.saturating_sub(prev_b) as f64) / 1024.0
+                };
+                format!(
+                    "{}@{}(priv={:.2}MB,ws={:.2}MB,+{:.1}KB)",
+                    s.cycle_bucket,
+                    s.timestamp_text,
+                    s.private_bytes as f64 / (1024.0 * 1024.0),
+                    s.working_set_bytes as f64 / (1024.0 * 1024.0),
+                    delta_kb
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" -> ");
+
+        let r = &self.runtime_refs;
+        let a = &r.audio;
+        let report = format!(
+            "monotonic memory growth detected across {} consecutive scheduled cycles (#{}, net=+{:.2}MB / {}B): curve=[{}] | \
+            scheduler={{last_chime_slot={}, last_alarm_slots={}/{}, snooze_active={}, cfg_alarms={}, custom_chime_mins={}}} | \
+            rc/arc={{app_state={}, draft_alarms={}, web_console={}, alarm_alert_slot={}, single_instance={}, voice_preview_gen={}, \
+            tray={}, ipc_wake={}, perf_sample={}, cpu_throttled={}, update_token={}, web_running={}, alert_alive={}, visible_windows=0x{:02x}}} | \
+            audio_engine_refs={{gen_counter={}, active_seq_gen_arc={}, live_volume={}, tts_cache={}, buffer_pool={}, tts_status_tx={}, \
+            active_sink={}, active_seq_gen={}}} | \
+            pool={{byte_bufs={}, byte_cap={}B, byte_hits={}, byte_misses={}, sample_queues={}, sample_cap={}, sample_hits={}, sample_misses={}}} | \
+            tts_cache={{entries={}, bytes={}B}}",
+            LEAK_CONSECUTIVE_CYCLES,
+            self.leak_monitor.alert_count,
+            net_growth as f64 / (1024.0 * 1024.0),
+            net_growth,
+            curve,
+            self.last_chime_slot.is_some(),
+            self.last_alarm_slots.len(),
+            self.last_alarm_slots.capacity(),
+            self.snooze_alarm.is_some(),
+            cfg.alarms.len(),
+            cfg.custom_chime_minutes.len(),
+            r.app_state_strong,
+            r.draft_alarms_strong,
+            r.web_console_strong,
+            r.alarm_alert_slot_strong,
+            r.single_instance_guard_strong,
+            r.voice_preview_gen_strong,
+            r.tray_arc_strong,
+            r.ipc_wake_arc_strong,
+            r.perf_sample_arc_strong,
+            r.cpu_throttled_arc_strong,
+            r.update_github_token_strong,
+            r.web_console_running,
+            r.alarm_alert_alive,
+            r.visible_windows_mask,
+            a.gen_counter_strong,
+            a.active_seq_gen_strong,
+            a.live_volume_strong,
+            a.tts_cache_strong,
+            a.buffer_pool_strong,
+            a.tts_status_tx_strong,
+            a.active_sink_present,
+            a.active_seq_gen,
+            a.pool_byte_buffers,
+            a.pool_byte_capacity,
+            a.pool_byte_hits,
+            a.pool_byte_misses,
+            a.pool_sample_queues,
+            a.pool_sample_capacity,
+            a.pool_sample_hits,
+            a.pool_sample_misses,
+            a.tts_cache_entries,
+            a.tts_cache_bytes,
+        );
+
+        win_sys::log_warn("leak-watch", &report);
+        win_sys::flush_logs();
+
+        // 告警输出后以最新采样点重建基线，避免连续刷屏，若后续再连续 5 个周期上升则再次捕获
+        if let Some(latest) = self.leak_monitor.samples.pop_back() {
+            self.leak_monitor.samples.clear();
+            self.leak_monitor.samples.push_back(latest);
+        }
+
+        Some(report)
     }
 
     /// 校时后重置防重入槽位，防止系统时间回调或向前校时后错过提醒
@@ -442,6 +674,28 @@ impl Scheduler {
         }
     }
 
+    /// 栈上构建有效报时分钟位图，避免每 250ms 节拍重复在堆上分配 Vec<u8>
+    #[inline]
+    fn chime_minute_mask(cfg: &AppConfig) -> ([bool; 60], bool) {
+        let mut mask = [false; 60];
+        let mut any = false;
+        if cfg.hourly_chime_enabled {
+            mask[0] = true;
+            any = true;
+        }
+        if cfg.half_hour_chime_enabled {
+            mask[30] = true;
+            any = true;
+        }
+        for &m in &cfg.custom_chime_minutes {
+            if m <= 59 {
+                mask[usize::from(m)] = true;
+                any = true;
+            }
+        }
+        (mask, any)
+    }
+
     /// 周期检测（建议每 250ms–500ms 调用一次），返回本拍需要触发的事件列表
     pub fn evaluate_at(&mut self, cfg: &AppConfig, now: DateTime<Local>) -> Vec<TriggerEvent> {
         let mut events = Vec::new();
@@ -451,8 +705,11 @@ impl Scheduler {
         let today = now.date_naive();
 
         // 1. 报时检测（由整点、半点及可选额外分钟勾选控制，受静音模式与静默时段约束）
-        let active_minutes = cfg.effective_chime_minutes();
-        if active_minutes.contains(&minute_u8) && self.last_chime_slot != Some(slot) {
+        let (minute_mask, any_chime) = Self::chime_minute_mask(cfg);
+        if any_chime
+            && minute_mask[usize::from(minute_u8.min(59))]
+            && self.last_chime_slot != Some(slot)
+        {
             self.last_chime_slot = Some(slot);
             if !cfg.mute_mode && !Self::is_quiet_at(cfg, now.hour(), now.minute()) {
                 let holiday = if cfg.holiday_enabled {
@@ -560,6 +817,21 @@ impl Scheduler {
             });
         }
 
+        // 清理跨日或已删除闹钟的过期防重入槽位，防止 HashMap 在长期驻留期间累积历史记录
+        if !self.last_alarm_slots.is_empty() {
+            self.last_alarm_slots.retain(|id, recorded| {
+                recorded.0 == slot.0
+                    && recorded.1 == slot.1
+                    && cfg.alarms.iter().any(|a| a.id == *id)
+            });
+        }
+
+        // 4. 调度周期内存泄漏监控（每 60s 观测一次，连续 5 个周期非预期单调递增时输出详细对象引用快照）
+        if self.needs_leak_sample_at(now) {
+            let (ws_bytes, private_bytes) = win_sys::query_process_memory_bytes();
+            let _ = self.check_leak_at_cycle(cfg, now, ws_bytes, private_bytes);
+        }
+
         events
     }
 
@@ -603,11 +875,23 @@ impl Scheduler {
 
     /// 计算距离下一个“整/半点报时”或“自定义闹钟”的精确倒计时
     pub fn compute_next_event(&self, cfg: &AppConfig, now: DateTime<Local>) -> NextEventInfo {
-        let mut candidates: Vec<(DateTime<Local>, String)> = Vec::new();
-        let active_minutes = cfg.effective_chime_minutes();
+        enum WinnerKind {
+            Chime(&'static str),
+            Snooze,
+            Alarm(usize),
+        }
+
+        let mut best: Option<(DateTime<Local>, WinnerKind)> = None;
+        let mut consider = |dt: DateTime<Local>, kind: WinnerKind| {
+            if best.as_ref().is_none_or(|(cur_dt, _)| dt < *cur_dt) {
+                best = Some((dt, kind));
+            }
+        };
+
+        let (minute_mask, any_chime) = Self::chime_minute_mask(cfg);
 
         // 1. 向前搜索最多 48 小时内的下一个有效报时时刻（自动跳过静默时段）
-        if !active_minutes.is_empty() {
+        if any_chime {
             let base = now
                 .with_second(0)
                 .and_then(|t| t.with_nanosecond(0))
@@ -617,7 +901,7 @@ impl Scheduler {
             for offset_min in 0..(48 * 60) {
                 let candidate = base + Duration::minutes(offset_min);
                 let m = candidate.minute() as u8;
-                if active_minutes.contains(&m)
+                if minute_mask[usize::from(m.min(59))]
                     && !Self::is_quiet_at(cfg, candidate.hour(), candidate.minute())
                 {
                     let label = if m == 0 {
@@ -627,29 +911,35 @@ impl Scheduler {
                     } else {
                         "定时报时"
                     };
-                    candidates.push((candidate, label.to_string()));
+                    consider(candidate, WinnerKind::Chime(label));
                     break;
                 }
             }
         }
 
         // 2. 稍后提醒（Snooze）
-        if let Some((snooze_alarm, dt)) = &self.snooze_alarm {
+        if let Some((_, dt)) = &self.snooze_alarm {
             if *dt > now {
-                candidates.push((*dt, format!("稍后提醒 · {}", snooze_alarm.label)));
+                consider(*dt, WinnerKind::Snooze);
             }
         }
 
         // 3. 所有启用中的自定义闹钟
-        for alarm in &cfg.alarms {
+        for (idx, alarm) in cfg.alarms.iter().enumerate() {
             if let Some(dt) = Self::next_alarm_trigger(cfg, alarm, now) {
-                candidates.push((dt, format!("闹钟 · {}", alarm.label)));
+                consider(dt, WinnerKind::Alarm(idx));
             }
         }
 
-        candidates.sort_by_key(|(dt, _)| *dt);
-
-        if let Some((target, label)) = candidates.into_iter().next() {
+        if let Some((target, kind)) = best {
+            let label = match kind {
+                WinnerKind::Chime(s) => s.to_string(),
+                WinnerKind::Snooze => match &self.snooze_alarm {
+                    Some((snooze_alarm, _)) => format!("稍后提醒 · {}", snooze_alarm.label),
+                    None => "稍后提醒".to_string(),
+                },
+                WinnerKind::Alarm(idx) => format!("闹钟 · {}", cfg.alarms[idx].label),
+            };
             let secs = (target - now).num_seconds().max(0);
             let days = secs / 86_400;
             let hours = (secs % 86_400) / 3600;
@@ -920,5 +1210,130 @@ mod tests {
         sched.sync_slots_after_config_save(&next_cfg, &edited_cfg);
         assert!(!sched.last_alarm_slots.contains_key(&1));
         assert!(sched.last_chime_slot.is_some());
+    }
+
+    #[test]
+    fn test_leak_monitor_detects_five_consecutive_monotonic_cycles_and_logs_refs() {
+        let mut sched = Scheduler::new();
+        let cfg = AppConfig::default();
+
+        sched.set_runtime_refs(ScheduledRefContext {
+            app_state_strong: 2,
+            draft_alarms_strong: 2,
+            web_console_strong: 2,
+            alarm_alert_slot_strong: 2,
+            single_instance_guard_strong: 2,
+            voice_preview_gen_strong: 2,
+            tray_arc_strong: 3,
+            ipc_wake_arc_strong: 2,
+            perf_sample_arc_strong: 2,
+            cpu_throttled_arc_strong: 2,
+            update_github_token_strong: 2,
+            web_console_running: true,
+            alarm_alert_alive: false,
+            visible_windows_mask: 0b00001,
+            audio: AudioRefSnapshot {
+                gen_counter_strong: 3,
+                active_seq_gen_strong: 3,
+                live_volume_strong: 3,
+                tts_cache_strong: 3,
+                buffer_pool_strong: 3,
+                tts_status_tx_strong: 2,
+                active_sink_present: false,
+                active_seq_gen: 0,
+                tts_cache_entries: 4,
+                tts_cache_bytes: 64 * 1024,
+                pool_byte_buffers: 2,
+                pool_byte_capacity: 512 * 1024,
+                pool_sample_queues: 1,
+                pool_sample_capacity: 8192,
+                pool_byte_hits: 10,
+                pool_byte_misses: 2,
+                pool_sample_hits: 15,
+                pool_sample_misses: 1,
+            },
+        });
+
+        let base_t = Local.with_ymd_and_hms(2026, 11, 18, 19, 0, 10).unwrap();
+        let base_mem = 40 * 1024 * 1024u64;
+
+        // Baseline (cycle 0) + cycles 1..=4: not yet 5 consecutive increases
+        for i in 0..5u64 {
+            let t = base_t + Duration::seconds((i * 60) as i64);
+            let mem = base_mem + i * 128 * 1024;
+            assert!(
+                sched.check_leak_at_cycle(&cfg, t, mem, mem).is_none(),
+                "should not alert before 5 consecutive increases (step {i})"
+            );
+        }
+
+        // Cycle 5: 5th consecutive monotonic increase -> triggers detailed object-ref report
+        let t5 = base_t + Duration::seconds(5 * 60);
+        let mem5 = base_mem + 5 * 128 * 1024;
+        let report = sched
+            .check_leak_at_cycle(&cfg, t5, mem5, mem5)
+            .expect("expected leak report at 5th consecutive monotonic increase");
+        assert!(report.contains("5 consecutive scheduled cycles"));
+        assert!(report.contains("scheduler="));
+        assert!(report.contains("rc/arc="));
+        assert!(report.contains("audio_engine_refs="));
+        assert!(report.contains("pool="));
+        assert!(report.contains("tts_cache="));
+        assert!(report.contains("tray=3"));
+        assert!(report.contains("gen_counter=3"));
+    }
+
+    #[test]
+    fn test_leak_monitor_filters_transient_audio_lazy_window_and_resets_on_drop() {
+        let mut sched = Scheduler::new();
+        let cfg = AppConfig::default();
+        let base_t = Local.with_ymd_and_hms(2026, 11, 18, 20, 0, 10).unwrap();
+        let base_mem = 42 * 1024 * 1024u64;
+
+        // Baseline + 3 rising cycles
+        for i in 0..4u64 {
+            let t = base_t + Duration::seconds((i * 60) as i64);
+            let mem = base_mem + i * 128 * 1024;
+            assert!(sched.check_leak_at_cycle(&cfg, t, mem, mem).is_none());
+        }
+
+        // Cycle 4: active audio playback should be ignored cleanly without false alert
+        let mut busy_refs = ScheduledRefContext::default();
+        busy_refs.audio.active_sink_present = true;
+        busy_refs.audio.active_seq_gen = 7;
+        sched.set_runtime_refs(busy_refs);
+        assert!(sched
+            .check_leak_at_cycle(
+                &cfg,
+                base_t + Duration::seconds(4 * 60),
+                base_mem + 900 * 1024,
+                base_mem + 900 * 1024
+            )
+            .is_none());
+
+        // Cycle 5: lazy AlarmAlertWindow creation resets baseline instead of triggering leak alert
+        sched.set_runtime_refs(ScheduledRefContext {
+            alarm_alert_alive: true,
+            ..ScheduledRefContext::default()
+        });
+        assert!(sched
+            .check_leak_at_cycle(
+                &cfg,
+                base_t + Duration::seconds(5 * 60),
+                base_mem + 1200 * 1024,
+                base_mem + 1200 * 1024
+            )
+            .is_none());
+
+        // Cycle 6: memory drop resets streak
+        assert!(sched
+            .check_leak_at_cycle(
+                &cfg,
+                base_t + Duration::seconds(6 * 60),
+                base_mem + 500 * 1024,
+                base_mem + 500 * 1024
+            )
+            .is_none());
+        assert_eq!(sched.leak_monitor.samples.len(), 1);
     }
 }

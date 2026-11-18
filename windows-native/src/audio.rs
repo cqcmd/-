@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::{BufReader, Cursor, ErrorKind};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,9 +26,19 @@ const EDGE_SEC_MS_GEC_VERSION: &str = "2-143.0.3650.75";
 const EDGE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0";
 const EDGE_ORIGIN: &str = "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold";
 const WIN_EPOCH_SECS: u64 = 11_644_473_600;
-const EDGE_TTS_MAX_CACHE_ENTRIES: usize = 6;
-const EDGE_TTS_MAX_CACHE_BYTES: usize = 2 * 1024 * 1024;
+const EDGE_TTS_MAX_CACHE_ENTRIES: usize = 4;
+const EDGE_TTS_MAX_CACHE_BYTES: usize = 1024 * 1024;
 const EDGE_TTS_MAX_AUDIO_BYTES: usize = 4 * 1024 * 1024;
+
+/// 音频缓冲区对象池配置：复用常用 MP3/WAV 字节缓冲与淡入淡出采样预读队列，避免反复堆分配造成 Windows 堆碎片化
+const BYTE_POOL_MAX_BUFFERS: usize = 8;
+const BYTE_POOL_DEFAULT_CAP: usize = 64 * 1024;
+const BYTE_POOL_MAX_RETAINED_CAP: usize = 512 * 1024;
+const SAMPLE_POOL_MAX_QUEUES: usize = 4;
+const SAMPLE_POOL_DEFAULT_CAP: usize = 24_576;
+const SAMPLE_POOL_MAX_RETAINED_CAP: usize = 65_536;
+/// 小于 2 MiB 的自定义提醒音频直接借用池化字节缓冲一次读完并立即关闭 OS File 句柄
+const CUSTOM_AUDIO_INLINE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 static EDGE_CLOCK_SKEW_SECS: AtomicI64 = AtomicI64::new(0);
 static EDGE_TTS_CONSECUTIVE_FAILS: AtomicU32 = AtomicU32::new(0);
@@ -105,19 +115,20 @@ enum AudioCommand {
     PlayChimeWav {
         volume: u8,
         custom_path: Option<String>,
-        reply: SyncSender<Option<Arc<Sink>>>,
+        reply: SyncSender<Option<(u64, Arc<Sink>)>>,
     },
     PlayAlarmAudio {
         volume: u8,
         include_built_in: bool,
         custom_path: Option<String>,
-        reply: SyncSender<Option<Arc<Sink>>>,
+        reply: SyncSender<Option<(u64, Arc<Sink>)>>,
     },
     PlayMemoryAudio {
         volume: u8,
-        bytes: Vec<u8>,
-        reply: SyncSender<Option<Arc<Sink>>>,
+        bytes: AudioMemoryBytes,
+        reply: SyncSender<Option<(u64, Arc<Sink>)>>,
     },
+    ReleaseSink(u64),
     StopActive,
     SetLiveVolume(u8),
     TrimIdle,
@@ -130,20 +141,289 @@ struct SequenceJob {
 }
 
 #[derive(Default)]
+struct AudioPoolInner {
+    byte_buffers: Vec<Vec<u8>>,
+    sample_queues: Vec<VecDeque<f32>>,
+    byte_hits: u64,
+    byte_misses: u64,
+    sample_hits: u64,
+    sample_misses: u64,
+}
+
+/// 线程安全且带容量上界的音频缓冲区对象池（覆盖 Vec<u8> 码流缓冲与 VecDeque<f32> 采样预读队列）
+#[derive(Clone, Default)]
+pub(crate) struct AudioBufferPool {
+    inner: Arc<Mutex<AudioPoolInner>>,
+}
+
+impl AudioBufferPool {
+    pub(crate) fn acquire_bytes(&self, min_cap: usize) -> PooledBytes {
+        let target_cap = min_cap.max(BYTE_POOL_DEFAULT_CAP);
+        let reused = if let Ok(mut guard) = self.inner.lock() {
+            if let Some(pos) = guard
+                .byte_buffers
+                .iter()
+                .rposition(|b| b.capacity() >= min_cap)
+                .or_else(|| {
+                    if guard.byte_buffers.is_empty() {
+                        None
+                    } else {
+                        Some(guard.byte_buffers.len() - 1)
+                    }
+                })
+            {
+                guard.byte_hits += 1;
+                Some(guard.byte_buffers.swap_remove(pos))
+            } else {
+                guard.byte_misses += 1;
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut buf = reused.unwrap_or_else(|| Vec::with_capacity(target_cap));
+        buf.clear();
+        if buf.capacity() < min_cap {
+            buf.reserve(min_cap);
+        }
+        PooledBytes {
+            buf: Some(buf),
+            pool: Some(self.clone()),
+        }
+    }
+
+    pub(crate) fn acquire_sample_queue(&self, min_cap: usize) -> PooledSampleQueue {
+        let target_cap = min_cap.max(SAMPLE_POOL_DEFAULT_CAP);
+        let reused = if let Ok(mut guard) = self.inner.lock() {
+            if let Some(pos) = guard
+                .sample_queues
+                .iter()
+                .rposition(|q| q.capacity() >= min_cap)
+                .or_else(|| {
+                    if guard.sample_queues.is_empty() {
+                        None
+                    } else {
+                        Some(guard.sample_queues.len() - 1)
+                    }
+                })
+            {
+                guard.sample_hits += 1;
+                Some(guard.sample_queues.swap_remove(pos))
+            } else {
+                guard.sample_misses += 1;
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut queue = reused.unwrap_or_else(|| VecDeque::with_capacity(target_cap));
+        queue.clear();
+        if queue.capacity() < min_cap {
+            queue.reserve(min_cap);
+        }
+        PooledSampleQueue {
+            queue: Some(queue),
+            pool: Some(self.clone()),
+        }
+    }
+
+    fn recycle_bytes(&self, mut buf: Vec<u8>) {
+        if buf.capacity() == 0 {
+            return;
+        }
+        buf.clear();
+        if buf.capacity() > BYTE_POOL_MAX_RETAINED_CAP {
+            buf.shrink_to(BYTE_POOL_MAX_RETAINED_CAP);
+        }
+        if let Ok(mut guard) = self.inner.lock() {
+            if guard.byte_buffers.len() < BYTE_POOL_MAX_BUFFERS {
+                guard.byte_buffers.push(buf);
+            }
+        }
+    }
+
+    fn recycle_sample_queue(&self, mut queue: VecDeque<f32>) {
+        if queue.capacity() == 0 {
+            return;
+        }
+        queue.clear();
+        if queue.capacity() > SAMPLE_POOL_MAX_RETAINED_CAP {
+            queue.shrink_to(SAMPLE_POOL_MAX_RETAINED_CAP);
+        }
+        if let Ok(mut guard) = self.inner.lock() {
+            if guard.sample_queues.len() < SAMPLE_POOL_MAX_QUEUES {
+                guard.sample_queues.push(queue);
+            }
+        }
+    }
+
+    pub(crate) fn trim_idle(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.byte_buffers.clear();
+            guard.byte_buffers.shrink_to_fit();
+            guard.sample_queues.clear();
+            guard.sample_queues.shrink_to_fit();
+        }
+    }
+
+    pub(crate) fn snapshot_metrics(&self) -> (usize, usize, usize, usize, u64, u64, u64, u64) {
+        self.inner
+            .lock()
+            .map(|g| {
+                let byte_cap: usize = g.byte_buffers.iter().map(|b| b.capacity()).sum();
+                let sample_cap: usize = g.sample_queues.iter().map(|q| q.capacity()).sum();
+                (
+                    g.byte_buffers.len(),
+                    byte_cap,
+                    g.sample_queues.len(),
+                    sample_cap,
+                    g.byte_hits,
+                    g.byte_misses,
+                    g.sample_hits,
+                    g.sample_misses,
+                )
+            })
+            .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> (usize, usize, u64, u64, u64, u64) {
+        self.inner
+            .lock()
+            .map(|g| {
+                (
+                    g.byte_buffers.len(),
+                    g.sample_queues.len(),
+                    g.byte_hits,
+                    g.byte_misses,
+                    g.sample_hits,
+                    g.sample_misses,
+                )
+            })
+            .unwrap_or((0, 0, 0, 0, 0, 0))
+    }
+}
+
+/// 池化字节缓冲 RAII 句柄：生命周期结束（含解码器播放完毕）自动归还给对象池
+pub(crate) struct PooledBytes {
+    buf: Option<Vec<u8>>,
+    pool: Option<AudioBufferPool>,
+}
+
+impl std::fmt::Debug for PooledBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PooledBytes")
+            .field("len", &self.buf.as_ref().map(|v| v.len()).unwrap_or(0))
+            .field(
+                "capacity",
+                &self.buf.as_ref().map(|v| v.capacity()).unwrap_or(0),
+            )
+            .finish()
+    }
+}
+
+impl std::ops::Deref for PooledBytes {
+    type Target = Vec<u8>;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.buf.as_ref().expect("PooledBytes still active")
+    }
+}
+
+impl std::ops::DerefMut for PooledBytes {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.buf.as_mut().expect("PooledBytes still active")
+    }
+}
+
+impl AsRef<[u8]> for PooledBytes {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.buf.as_deref().unwrap_or(&[])
+    }
+}
+
+impl Drop for PooledBytes {
+    fn drop(&mut self) {
+        if let (Some(buf), Some(pool)) = (self.buf.take(), self.pool.take()) {
+            pool.recycle_bytes(buf);
+        }
+    }
+}
+
+/// 池化采样预读队列 RAII 句柄：用于 FadeEnvelopeSource 尾音缓存并在播毕后自动归还对象池
+pub(crate) struct PooledSampleQueue {
+    queue: Option<VecDeque<f32>>,
+    pool: Option<AudioBufferPool>,
+}
+
+impl PooledSampleQueue {
+    fn unpooled(cap: usize) -> Self {
+        Self {
+            queue: Some(VecDeque::with_capacity(cap)),
+            pool: None,
+        }
+    }
+}
+
+impl std::ops::Deref for PooledSampleQueue {
+    type Target = VecDeque<f32>;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.queue.as_ref().expect("PooledSampleQueue still active")
+    }
+}
+
+impl std::ops::DerefMut for PooledSampleQueue {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.queue.as_mut().expect("PooledSampleQueue still active")
+    }
+}
+
+impl Drop for PooledSampleQueue {
+    fn drop(&mut self) {
+        if let (Some(queue), Some(pool)) = (self.queue.take(), self.pool.take()) {
+            pool.recycle_sample_queue(queue);
+        }
+    }
+}
+
+/// 统一内存音频数据源：池化字节可零碎片回收，缓存命中共享 Arc<[u8]> 零拷贝播放
+#[derive(Debug)]
+enum AudioMemoryBytes {
+    Pooled(PooledBytes),
+    Shared(Arc<[u8]>),
+}
+
+impl AsRef<[u8]> for AudioMemoryBytes {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Pooled(p) => p.as_ref(),
+            Self::Shared(s) => s.as_ref(),
+        }
+    }
+}
+
+#[derive(Default)]
 struct EdgeTtsCache {
-    entries: VecDeque<(String, Vec<u8>)>,
+    entries: VecDeque<(String, Arc<[u8]>)>,
     total_bytes: usize,
 }
 
 impl EdgeTtsCache {
-    fn get(&self, key: &str) -> Option<Vec<u8>> {
+    fn get(&self, key: &str) -> Option<Arc<[u8]>> {
         self.entries
             .iter()
             .find(|(k, _)| k == key)
-            .map(|(_, bytes)| bytes.clone())
+            .map(|(_, bytes)| Arc::clone(bytes))
     }
 
-    fn insert(&mut self, key: String, bytes: Vec<u8>) {
+    fn insert(&mut self, key: String, bytes: Arc<[u8]>) {
         if bytes.is_empty() || bytes.len() > EDGE_TTS_MAX_CACHE_BYTES / 2 {
             return;
         }
@@ -169,6 +449,33 @@ impl EdgeTtsCache {
         self.entries.clear();
         self.total_bytes = 0;
     }
+
+    fn snapshot_metrics(&self) -> (usize, usize) {
+        (self.entries.len(), self.total_bytes)
+    }
+}
+
+/// 音频子系统引用计数与缓冲池/缓存实时快照（供调度器内存泄漏监控输出详细对象引用诊断）
+#[derive(Debug, Clone, Default)]
+pub struct AudioRefSnapshot {
+    pub gen_counter_strong: usize,
+    pub active_seq_gen_strong: usize,
+    pub live_volume_strong: usize,
+    pub tts_cache_strong: usize,
+    pub buffer_pool_strong: usize,
+    pub tts_status_tx_strong: usize,
+    pub active_sink_present: bool,
+    pub active_seq_gen: u64,
+    pub tts_cache_entries: usize,
+    pub tts_cache_bytes: usize,
+    pub pool_byte_buffers: usize,
+    pub pool_byte_capacity: usize,
+    pub pool_sample_queues: usize,
+    pub pool_sample_capacity: usize,
+    pub pool_byte_hits: u64,
+    pub pool_byte_misses: u64,
+    pub pool_sample_hits: u64,
+    pub pool_sample_misses: u64,
 }
 
 /// 异步音频与双引擎语音合成句柄（支持 SAPI5 离线与 Microsoft Edge TTS 在线切换，断网自动回退）
@@ -180,6 +487,8 @@ pub struct AudioEngine {
     active_seq_gen: Arc<AtomicU64>,
     live_volume: Arc<AtomicU8>,
     tts_cache: Arc<Mutex<EdgeTtsCache>>,
+    buffer_pool: AudioBufferPool,
+    active_sink_present: Arc<AtomicBool>,
     tts_status_tx: Arc<Mutex<Option<Sender<(u64, String)>>>>,
 }
 
@@ -206,7 +515,7 @@ pub fn compute_ducked_volume(original_volume: f32) -> Option<f32> {
     }
 }
 
-/// 采样级淡入淡出音频包络包装器：利用轻量尾音预读缓冲支持任意格式（WAV/MP3/FLAC/OGG）的完整淡入与淡出
+/// 采样级淡入淡出音频包络包装器：利用池化尾音预读缓冲支持任意格式（WAV/MP3/FLAC/OGG）的完整淡入与淡出
 struct FadeEnvelopeSource<S>
 where
     S: Source<Item = f32>,
@@ -220,7 +529,7 @@ where
     effective_fade_in_samples: usize,
     effective_fade_out_samples: usize,
     played_samples: usize,
-    lookahead: VecDeque<f32>,
+    lookahead: PooledSampleQueue,
     eof: bool,
 }
 
@@ -228,7 +537,26 @@ impl<S> FadeEnvelopeSource<S>
 where
     S: Source<Item = f32>,
 {
+    #[allow(dead_code)]
     fn new(inner: S, fade_in: Duration, fade_out: Duration) -> Self {
+        Self::with_pool(inner, fade_in, fade_out, None)
+    }
+
+    fn new_pooled(
+        inner: S,
+        fade_in: Duration,
+        fade_out: Duration,
+        pool: &AudioBufferPool,
+    ) -> Self {
+        Self::with_pool(inner, fade_in, fade_out, Some(pool))
+    }
+
+    fn with_pool(
+        inner: S,
+        fade_in: Duration,
+        fade_out: Duration,
+        pool: Option<&AudioBufferPool>,
+    ) -> Self {
         let channels = inner.channels().max(1);
         let sample_rate = inner.sample_rate().max(1);
         let total_duration = inner.total_duration();
@@ -242,6 +570,11 @@ where
 
         let fade_in_samples = align_to_frame(fade_in.as_millis());
         let fade_out_samples = align_to_frame(fade_out.as_millis());
+        let min_cap = fade_out_samples.max(1);
+        let lookahead = match pool {
+            Some(p) => p.acquire_sample_queue(min_cap),
+            None => PooledSampleQueue::unpooled(min_cap),
+        };
 
         Self {
             inner,
@@ -253,7 +586,7 @@ where
             effective_fade_in_samples: fade_in_samples,
             effective_fade_out_samples: fade_out_samples,
             played_samples: 0,
-            lookahead: VecDeque::with_capacity(fade_out_samples.max(1)),
+            lookahead,
             eof: false,
         }
     }
@@ -599,19 +932,42 @@ mod windows_duck {
     }
 }
 
-fn append_custom_audio(sink: &Sink, path: &str) -> bool {
+fn append_custom_audio(sink: &Sink, path: &str, pool: &AudioBufferPool) -> bool {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return false;
     }
     let p = Path::new(trimmed);
-    match File::open(p) {
-        Ok(file) => match Decoder::new(BufReader::new(file)) {
+    let mut file = match File::open(p) {
+        Ok(f) => f,
+        Err(err) => {
+            win_sys::log_warn(
+                "audio",
+                &format!("open custom alarm audio \"{trimmed}\" failed: {err}"),
+            );
+            return false;
+        }
+    };
+
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+    if file_len <= CUSTOM_AUDIO_INLINE_MAX_BYTES {
+        let mut buf = pool.acquire_bytes(file_len as usize);
+        if let Err(err) = std::io::Read::read_to_end(&mut file, &mut *buf) {
+            win_sys::log_warn(
+                "audio",
+                &format!("read custom alarm audio \"{trimmed}\" failed: {err}"),
+            );
+            return false;
+        }
+        // 小文件读入池化缓冲区后立即释放 OS File 句柄，避免播放期间长期锁定音频文件
+        drop(file);
+        match Decoder::new(Cursor::new(AudioMemoryBytes::Pooled(buf))) {
             Ok(source) => {
-                let faded = FadeEnvelopeSource::new(
+                let faded = FadeEnvelopeSource::new_pooled(
                     source.convert_samples::<f32>(),
                     Duration::from_millis(AUDIO_FADE_IN_MS),
                     Duration::from_millis(AUDIO_FADE_OUT_MS),
+                    pool,
                 );
                 sink.append(faded);
                 true
@@ -623,13 +979,26 @@ fn append_custom_audio(sink: &Sink, path: &str) -> bool {
                 );
                 false
             }
-        },
-        Err(err) => {
-            win_sys::log_warn(
-                "audio",
-                &format!("open custom alarm audio \"{trimmed}\" failed: {err}"),
-            );
-            false
+        }
+    } else {
+        match Decoder::new(BufReader::with_capacity(64 * 1024, file)) {
+            Ok(source) => {
+                let faded = FadeEnvelopeSource::new_pooled(
+                    source.convert_samples::<f32>(),
+                    Duration::from_millis(AUDIO_FADE_IN_MS),
+                    Duration::from_millis(AUDIO_FADE_OUT_MS),
+                    pool,
+                );
+                sink.append(faded);
+                true
+            }
+            Err(err) => {
+                win_sys::log_warn(
+                    "audio",
+                    &format!("decode custom alarm audio \"{trimmed}\" failed: {err}"),
+                );
+                false
+            }
         }
     }
 }
@@ -1031,8 +1400,9 @@ fn synthesize_edge_tts_mp3_once(
     rate: i8,
     gen_id: u64,
     gen_seq: &AtomicU64,
+    pool: &AudioBufferPool,
     allow_clock_skew_retry: bool,
-) -> Result<Vec<u8>, String> {
+) -> Result<PooledBytes, String> {
     if gen_seq.load(Ordering::SeqCst) != gen_id {
         return Err("cancelled".to_string());
     }
@@ -1107,7 +1477,7 @@ fn synthesize_edge_tts_mp3_once(
                     let skew = server_dt.timestamp().saturating_sub(local_raw);
                     EDGE_CLOCK_SKEW_SECS.store(skew, Ordering::Relaxed);
                     return synthesize_edge_tts_mp3_once(
-                        trimmed, voice, rate, gen_id, gen_seq, false,
+                        trimmed, voice, rate, gen_id, gen_seq, pool, false,
                     );
                 }
             }
@@ -1152,7 +1522,7 @@ fn synthesize_edge_tts_mp3_once(
         .send(Message::Text(ssml_msg.into()))
         .map_err(|e| format!("发送 SSML 请求失败：{e}"))?;
 
-    let mut audio_bytes: Vec<u8> = Vec::with_capacity(32 * 1024);
+    let mut audio_bytes = pool.acquire_bytes(BYTE_POOL_DEFAULT_CAP);
     let started = Instant::now();
     loop {
         if gen_seq.load(Ordering::SeqCst) != gen_id {
@@ -1205,19 +1575,20 @@ fn synthesize_edge_tts_mp3_once(
     Ok(audio_bytes)
 }
 
-/// 通过 Microsoft Edge TTS 在线 WebSocket 接口合成 MP3 字节流（带时钟偏差自修正与即时取消保护）
+/// 通过 Microsoft Edge TTS 在线 WebSocket 接口合成 MP3 字节流（带池化缓冲复用、时钟偏差自修正与即时取消保护）
 fn synthesize_edge_tts_mp3(
     text: &str,
     voice: &str,
     rate: i8,
     gen_id: u64,
     gen_seq: &AtomicU64,
-) -> Result<Vec<u8>, String> {
+    pool: &AudioBufferPool,
+) -> Result<PooledBytes, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Err("empty tts text".to_string());
     }
-    synthesize_edge_tts_mp3_once(trimmed, voice, rate, gen_id, gen_seq, true)
+    synthesize_edge_tts_mp3_once(trimmed, voice, rate, gen_id, gen_seq, pool, true)
 }
 
 fn edge_voice_display_name(voice: &str) -> &'static str {
@@ -1252,6 +1623,7 @@ fn speak_with_engine(
     gen_seq: &AtomicU64,
     audio_tx_seq: &Sender<AudioCommand>,
     tts_cache: &Arc<Mutex<EdgeTtsCache>>,
+    buffer_pool: &AudioBufferPool,
     tts_status_tx: &Arc<Mutex<Option<Sender<(u64, String)>>>>,
 ) -> bool {
     if gen_seq.load(Ordering::SeqCst) != gen_id {
@@ -1281,8 +1653,8 @@ fn speak_with_engine(
         let skip_network = cached.is_none()
             && remaining_edge_tts_cooldown_secs(now_secs, cooldown_until).is_some();
 
-        let mp3_result = match cached {
-            Some(bytes) => Ok(bytes),
+        let mp3_result: Result<AudioMemoryBytes, String> = match cached {
+            Some(shared) => Ok(AudioMemoryBytes::Shared(shared)),
             None if skip_network => {
                 let rem = remaining_edge_tts_cooldown_secs(now_secs, cooldown_until).unwrap_or(0);
                 win_sys::log_debug(
@@ -1297,14 +1669,17 @@ fn speak_with_engine(
                     gen_id,
                     format!("正在连接 Edge TTS 在线音色（{voice_label}）..."),
                 );
-                match synthesize_edge_tts_mp3(text, voice, tts_rate, gen_id, gen_seq) {
-                    Ok(bytes) => {
+                match synthesize_edge_tts_mp3(text, voice, tts_rate, gen_id, gen_seq, buffer_pool) {
+                    Ok(pooled_bytes) => {
                         EDGE_TTS_CONSECUTIVE_FAILS.store(0, Ordering::Relaxed);
                         EDGE_TTS_COOLDOWN_UNTIL_SECS.store(0, Ordering::Relaxed);
-                        if let Ok(mut c) = tts_cache.lock() {
-                            c.insert(cache_key, bytes.clone());
+                        if pooled_bytes.len() <= EDGE_TTS_MAX_CACHE_BYTES / 2 {
+                            let shared: Arc<[u8]> = Arc::from(pooled_bytes.as_ref());
+                            if let Ok(mut c) = tts_cache.lock() {
+                                c.insert(cache_key, shared);
+                            }
                         }
-                        Ok(bytes)
+                        Ok(AudioMemoryBytes::Pooled(pooled_bytes))
                     }
                     Err(err) => {
                         if err != "cancelled" && gen_seq.load(Ordering::SeqCst) == gen_id {
@@ -1338,13 +1713,16 @@ fn speak_with_engine(
                     bytes,
                     reply: reply_tx,
                 });
-                if let Ok(Some(sink)) = reply_rx.recv() {
+                if let Ok(Some((sink_id, sink))) = reply_rx.recv() {
                     emit_tts_status(
                         tts_status_tx,
                         gen_id,
                         format!("Edge TTS 在线音色：{voice_label}"),
                     );
-                    return wait_sink_with_cancel(&sink, gen_id, gen_seq);
+                    let completed = wait_sink_with_cancel(&sink, gen_id, gen_seq);
+                    drop(sink);
+                    let _ = audio_tx_seq.send(AudioCommand::ReleaseSink(sink_id));
+                    return completed;
                 }
                 win_sys::log_warn(
                     "tts",
@@ -1381,7 +1759,7 @@ fn speak_with_engine(
         emit_tts_status(
             tts_status_tx,
             gen_id,
-            "本地 SAPI5（离线系统语音）".to_string(),
+            "本地 Windows SAPI5（纯离线零外网）".to_string(),
         );
     }
 
@@ -1407,13 +1785,18 @@ impl AudioEngine {
         let active_seq_gen = Arc::new(AtomicU64::new(0));
         let live_volume = Arc::new(AtomicU8::new(80));
         let tts_cache = Arc::new(Mutex::new(EdgeTtsCache::default()));
+        let buffer_pool = AudioBufferPool::default();
+        let active_sink_present = Arc::new(AtomicBool::new(false));
         let tts_status_tx = Arc::new(Mutex::new(None));
 
-        // 1. 底层 rodio 音频线程（负责 OutputStream、提示音/自定义音频、Edge TTS MP3 播放与实时音量）
+        // 1. 底层 rodio 音频线程（负责 OutputStream、提示音/自定义音频、Edge TTS MP3 播放与池化缓冲回收）
+        let pool_audio = buffer_pool.clone();
+        let cache_audio = Arc::clone(&tts_cache);
+        let sink_present_audio = Arc::clone(&active_sink_present);
         thread::Builder::new()
             .name("audio-worker".to_string())
             .spawn(move || {
-                let stream_pair = match OutputStream::try_default() {
+                let mut stream_pair = match OutputStream::try_default() {
                     Ok(pair) => Some(pair),
                     Err(err) => {
                         win_sys::log_error(
@@ -1423,19 +1806,29 @@ impl AudioEngine {
                         None
                     }
                 };
-                let mut active_sink: Option<Arc<Sink>> = None;
+                let mut active_sink: Option<(u64, Arc<Sink>)> = None;
+                let mut next_sink_id: u64 = 1;
 
                 while let Ok(cmd) = audio_rx.recv() {
                     match cmd {
                         AudioCommand::SetLiveVolume(vol) => {
                             let vol_f = (vol.min(100) as f32) / 100.0;
-                            if let Some(sink) = &active_sink {
+                            if let Some((_, sink)) = &active_sink {
                                 sink.set_volume(vol_f);
                             }
                         }
                         AudioCommand::StopActive => {
-                            if let Some(prev) = active_sink.take() {
+                            if let Some((_, prev)) = active_sink.take() {
                                 fade_out_and_stop_sink(prev, AUDIO_SWITCH_FADE_MS);
+                            }
+                        }
+                        AudioCommand::ReleaseSink(target_id) => {
+                            if let Some((cur_id, _)) = &active_sink {
+                                if *cur_id == target_id {
+                                    if let Some((_, sink)) = active_sink.take() {
+                                        sink.stop();
+                                    }
+                                }
                             }
                         }
                         AudioCommand::PlayChimeWav {
@@ -1445,28 +1838,31 @@ impl AudioEngine {
                         } => {
                             let vol_f = (volume.min(100) as f32) / 100.0;
                             let created = if let Some((_, handle)) = &stream_pair {
-                                if let Some(prev) = active_sink.take() {
+                                if let Some((_, prev)) = active_sink.take() {
                                     fade_out_and_stop_sink(prev, AUDIO_SWITCH_FADE_MS);
                                 }
                                 if let Ok(sink) = Sink::try_new(handle) {
                                     sink.set_volume(vol_f);
                                     let custom_ok = custom_path
                                         .as_deref()
-                                        .is_some_and(|p| append_custom_audio(&sink, p));
+                                        .is_some_and(|p| append_custom_audio(&sink, p, &pool_audio));
                                     if !custom_ok {
                                         if let Ok(source) = Decoder::new(Cursor::new(CHIME_WAV_BYTES))
                                         {
-                                            let faded = FadeEnvelopeSource::new(
+                                            let faded = FadeEnvelopeSource::new_pooled(
                                                 source.convert_samples::<f32>(),
                                                 Duration::from_millis(AUDIO_FADE_IN_MS),
                                                 Duration::from_millis(AUDIO_FADE_OUT_MS),
+                                                &pool_audio,
                                             );
                                             sink.append(faded);
                                         }
                                     }
+                                    let sink_id = next_sink_id;
+                                    next_sink_id = next_sink_id.wrapping_add(1).max(1);
                                     let arc_sink = Arc::new(sink);
-                                    active_sink = Some(Arc::clone(&arc_sink));
-                                    Some(arc_sink)
+                                    active_sink = Some((sink_id, Arc::clone(&arc_sink)));
+                                    Some((sink_id, arc_sink))
                                 } else {
                                     None
                                 }
@@ -1483,7 +1879,7 @@ impl AudioEngine {
                         } => {
                             let vol_f = (volume.min(100) as f32) / 100.0;
                             let created = if let Some((_, handle)) = &stream_pair {
-                                if let Some(prev) = active_sink.take() {
+                                if let Some((_, prev)) = active_sink.take() {
                                     fade_out_and_stop_sink(prev, AUDIO_SWITCH_FADE_MS);
                                 }
                                 if let Ok(sink) = Sink::try_new(handle) {
@@ -1497,10 +1893,11 @@ impl AudioEngine {
                                         if let Ok(source) =
                                             Decoder::new(Cursor::new(MEAL_WAV_BYTES))
                                         {
-                                            let faded = FadeEnvelopeSource::new(
+                                            let faded = FadeEnvelopeSource::new_pooled(
                                                 source.convert_samples::<f32>(),
                                                 Duration::from_millis(AUDIO_FADE_IN_MS),
                                                 Duration::from_millis(AUDIO_FADE_OUT_MS),
+                                                &pool_audio,
                                             );
                                             target_sink.append(faded);
                                         }
@@ -1511,7 +1908,7 @@ impl AudioEngine {
                                             if include_built_in {
                                                 append_builtin_faded(&sink);
                                             }
-                                            if !append_custom_audio(&sink, path_str)
+                                            if !append_custom_audio(&sink, path_str, &pool_audio)
                                                 && !include_built_in
                                             {
                                                 append_builtin_faded(&sink);
@@ -1523,9 +1920,11 @@ impl AudioEngine {
                                             }
                                         }
                                     }
+                                    let sink_id = next_sink_id;
+                                    next_sink_id = next_sink_id.wrapping_add(1).max(1);
                                     let arc_sink = Arc::new(sink);
-                                    active_sink = Some(Arc::clone(&arc_sink));
-                                    Some(arc_sink)
+                                    active_sink = Some((sink_id, Arc::clone(&arc_sink)));
+                                    Some((sink_id, arc_sink))
                                 } else {
                                     None
                                 }
@@ -1541,7 +1940,7 @@ impl AudioEngine {
                         } => {
                             let vol_f = (volume.min(100) as f32) / 100.0;
                             let created = if let Some((_, handle)) = &stream_pair {
-                                if let Some(prev) = active_sink.take() {
+                                if let Some((_, prev)) = active_sink.take() {
                                     fade_out_and_stop_sink(prev, AUDIO_SWITCH_FADE_MS);
                                 }
                                 match (
@@ -1550,15 +1949,18 @@ impl AudioEngine {
                                 ) {
                                     (Ok(sink), Ok(source)) => {
                                         sink.set_volume(vol_f);
-                                        let faded = FadeEnvelopeSource::new(
+                                        let faded = FadeEnvelopeSource::new_pooled(
                                             source.convert_samples::<f32>(),
                                             Duration::from_millis(SPEECH_FADE_IN_MS),
                                             Duration::from_millis(SPEECH_FADE_OUT_MS),
+                                            &pool_audio,
                                         );
                                         sink.append(faded);
+                                        let sink_id = next_sink_id;
+                                        next_sink_id = next_sink_id.wrapping_add(1).max(1);
                                         let arc_sink = Arc::new(sink);
-                                        active_sink = Some(Arc::clone(&arc_sink));
-                                        Some(arc_sink)
+                                        active_sink = Some((sink_id, Arc::clone(&arc_sink)));
+                                        Some((sink_id, arc_sink))
                                     }
                                     (Err(err), _) => {
                                         win_sys::log_warn(
@@ -1581,19 +1983,35 @@ impl AudioEngine {
                             let _ = reply.send(created);
                         }
                         AudioCommand::TrimIdle => {
-                            if let Some(sink) = active_sink.as_ref() {
+                            let mut dropped_sink = false;
+                            if let Some((_, sink)) = active_sink.as_ref() {
                                 if sink.empty() {
-                                    active_sink = None;
+                                    dropped_sink = true;
                                 }
+                            }
+                            if dropped_sink {
+                                if let Some((_, sink)) = active_sink.take() {
+                                    sink.stop();
+                                }
+                            }
+                            if active_sink.is_none() {
+                                pool_audio.trim_idle();
                             }
                         }
                         AudioCommand::Shutdown => {
-                            if let Some(sink) = active_sink.take() {
+                            if let Some((_, sink)) = active_sink.take() {
                                 fade_out_and_stop_sink(sink, 80);
                             }
+                            drop(stream_pair.take());
+                            if let Ok(mut c) = cache_audio.lock() {
+                                c.clear();
+                            }
+                            pool_audio.trim_idle();
+                            sink_present_audio.store(false, Ordering::Relaxed);
                             break;
                         }
                     }
+                    sink_present_audio.store(active_sink.is_some(), Ordering::Relaxed);
                 }
             })
             .expect("Failed to spawn audio worker thread");
@@ -1604,6 +2022,7 @@ impl AudioEngine {
         let active_seq_clone = Arc::clone(&active_seq_gen);
         let vol_seq = Arc::clone(&live_volume);
         let cache_seq = Arc::clone(&tts_cache);
+        let pool_seq = buffer_pool.clone();
         let status_tx_seq = Arc::clone(&tts_status_tx);
         thread::Builder::new()
             .name("audio-sequence-worker".to_string())
@@ -1650,8 +2069,11 @@ impl AudioEngine {
                                         custom_path: custom_audio_path.clone(),
                                         reply: reply_tx,
                                     });
-                                    if let Ok(Some(sink)) = reply_rx.recv() {
-                                        if !wait_sink_with_cancel(&sink, job.gen_id, &gen_seq) {
+                                    if let Ok(Some((sink_id, sink))) = reply_rx.recv() {
+                                        let ok = wait_sink_with_cancel(&sink, job.gen_id, &gen_seq);
+                                        drop(sink);
+                                        let _ = audio_tx_seq.send(AudioCommand::ReleaseSink(sink_id));
+                                        if !ok {
                                             break;
                                         }
                                     }
@@ -1668,6 +2090,7 @@ impl AudioEngine {
                                         &gen_seq,
                                         &audio_tx_seq,
                                         &cache_seq,
+                                        &pool_seq,
                                         &status_tx_seq,
                                     ) {
                                         break;
@@ -1712,8 +2135,11 @@ impl AudioEngine {
                                         custom_path: custom_path.clone(),
                                         reply: reply_tx,
                                     });
-                                    if let Ok(Some(sink)) = reply_rx.recv() {
-                                        if !wait_sink_with_cancel(&sink, job.gen_id, &gen_seq) {
+                                    if let Ok(Some((sink_id, sink))) = reply_rx.recv() {
+                                        let ok = wait_sink_with_cancel(&sink, job.gen_id, &gen_seq);
+                                        drop(sink);
+                                        let _ = audio_tx_seq.send(AudioCommand::ReleaseSink(sink_id));
+                                        if !ok {
                                             break;
                                         }
                                     }
@@ -1730,6 +2156,7 @@ impl AudioEngine {
                                         &gen_seq,
                                         &audio_tx_seq,
                                         &cache_seq,
+                                        &pool_seq,
                                         &status_tx_seq,
                                     ) {
                                         break;
@@ -1756,7 +2183,49 @@ impl AudioEngine {
             active_seq_gen,
             live_volume,
             tts_cache,
+            buffer_pool,
+            active_sink_present,
             tts_status_tx,
+        }
+    }
+
+    /// 采集音频引擎内部所有 Arc 强引用计数、活跃 Sink 状态、TTS 缓存及缓冲池快照
+    pub fn ref_snapshot(&self) -> AudioRefSnapshot {
+        let (tts_cache_entries, tts_cache_bytes) = self
+            .tts_cache
+            .lock()
+            .map(|c| c.snapshot_metrics())
+            .unwrap_or((0, 0));
+        let (
+            pool_byte_buffers,
+            pool_byte_capacity,
+            pool_sample_queues,
+            pool_sample_capacity,
+            pool_byte_hits,
+            pool_byte_misses,
+            pool_sample_hits,
+            pool_sample_misses,
+        ) = self.buffer_pool.snapshot_metrics();
+
+        AudioRefSnapshot {
+            gen_counter_strong: Arc::strong_count(&self.gen_counter),
+            active_seq_gen_strong: Arc::strong_count(&self.active_seq_gen),
+            live_volume_strong: Arc::strong_count(&self.live_volume),
+            tts_cache_strong: Arc::strong_count(&self.tts_cache),
+            buffer_pool_strong: Arc::strong_count(&self.buffer_pool.inner),
+            tts_status_tx_strong: Arc::strong_count(&self.tts_status_tx),
+            active_sink_present: self.active_sink_present.load(Ordering::Relaxed),
+            active_seq_gen: self.active_seq_gen.load(Ordering::SeqCst),
+            tts_cache_entries,
+            tts_cache_bytes,
+            pool_byte_buffers,
+            pool_byte_capacity,
+            pool_sample_queues,
+            pool_sample_capacity,
+            pool_byte_hits,
+            pool_byte_misses,
+            pool_sample_hits,
+            pool_sample_misses,
         }
     }
 
@@ -1878,10 +2347,13 @@ impl AudioEngine {
         let _ = self.audio_tx.send(AudioCommand::StopActive);
     }
 
-    /// 清理已完成播放的空闲解码器与 Edge TTS 内存缓存，配合后台内存回收降低驻留占用
+    /// 清理已完成播放的空闲解码器、Edge TTS 内存缓存与对象池空闲缓冲，配合后台内存回收降低驻留占用
     pub fn trim_idle(&self) {
         if let Ok(mut cache) = self.tts_cache.lock() {
             cache.clear();
+        }
+        if !self.is_busy() {
+            self.buffer_pool.trim_idle();
         }
         let _ = self.audio_tx.send(AudioCommand::TrimIdle);
     }
@@ -1893,6 +2365,11 @@ impl AudioEngine {
 
     pub fn shutdown(&self) {
         self.gen_counter.fetch_add(1, Ordering::SeqCst);
+        self.active_seq_gen.store(0, Ordering::SeqCst);
+        if let Ok(mut cache) = self.tts_cache.lock() {
+            cache.clear();
+        }
+        self.buffer_pool.trim_idle();
         let _ = self.audio_tx.send(AudioCommand::Shutdown);
     }
 }
@@ -2071,5 +2548,73 @@ mod tests {
         assert_eq!(remaining_edge_tts_cooldown_secs(1000, 0), None);
         assert_eq!(remaining_edge_tts_cooldown_secs(1000, 1000), None);
         assert_eq!(remaining_edge_tts_cooldown_secs(1000, 1180), Some(180));
+    }
+
+    #[test]
+    fn test_audio_buffer_pool_recycling_cap_and_trim() {
+        let pool = AudioBufferPool::default();
+
+        // 1. 字节缓冲区借还复用与 Oversize 收缩
+        {
+            let mut b1 = pool.acquire_bytes(32 * 1024);
+            b1.extend_from_slice(&[0xAB; 1024]);
+            assert_eq!(b1.as_ref().len(), 1024);
+        }
+        assert_eq!(pool.stats().0, 1);
+
+        {
+            let b2 = pool.acquire_bytes(32 * 1024);
+            assert!(b2.is_empty());
+            assert!(b2.capacity() >= 32 * 1024);
+            // 触发池命中
+            assert_eq!(pool.stats().2, 1);
+        }
+
+        // 超大一次性缓冲区归还时按上限收缩，防止长期钉死大块内存
+        {
+            let mut huge = pool.acquire_bytes(1024 * 1024);
+            huge.push(1);
+        }
+        let reused_after_huge = pool.acquire_bytes(64 * 1024);
+        assert!(reused_after_huge.capacity() <= BYTE_POOL_MAX_RETAINED_CAP);
+        drop(reused_after_huge);
+
+        // 2. 采样队列通过 FadeEnvelopeSource::new_pooled 播毕自动归还复用
+        let src1 = VecTestSource {
+            samples: vec![1.0; 100],
+            idx: 0,
+            channels: 2,
+            sample_rate: 1000,
+        };
+        let _out1: Vec<f32> = FadeEnvelopeSource::new_pooled(
+            src1,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            &pool,
+        )
+        .collect();
+        assert_eq!(pool.stats().1, 1);
+
+        let src2 = VecTestSource {
+            samples: vec![1.0; 100],
+            idx: 0,
+            channels: 2,
+            sample_rate: 1000,
+        };
+        let _out2: Vec<f32> = FadeEnvelopeSource::new_pooled(
+            src2,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            &pool,
+        )
+        .collect();
+        // 第二次应直接命中采样队列对象池
+        assert_eq!(pool.stats().4, 1);
+
+        // 3. trim_idle 应彻底释放池内空闲缓冲归还操作系统
+        pool.trim_idle();
+        let (bytes_cnt, sample_cnt, _, _, _, _) = pool.stats();
+        assert_eq!(bytes_cnt, 0);
+        assert_eq!(sample_cnt, 0);
     }
 }

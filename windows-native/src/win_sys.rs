@@ -1558,6 +1558,39 @@ pub fn speak_text_sapi(text: &str, volume: u8, rate: i8) -> Result<(), String> {
     speak_text_sapi_cancellable(text, volume, rate, || false).map(|_| ())
 }
 
+/// 查询当前进程实时工作集（WorkingSetSize）与私有提交内存（PrivateUsage），返回单位为字节
+pub fn query_process_memory_bytes() -> (u64, u64) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::mem;
+        use windows::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcess;
+
+        unsafe {
+            let mut pmc: PROCESS_MEMORY_COUNTERS_EX = mem::zeroed();
+            pmc.cb = mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+            if GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut pmc as *mut PROCESS_MEMORY_COUNTERS_EX as *mut _,
+                pmc.cb,
+            )
+            .is_ok()
+            {
+                (pmc.WorkingSetSize as u64, pmc.PrivateUsage as u64)
+            } else {
+                (0, 0)
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        (0, 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

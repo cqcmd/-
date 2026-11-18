@@ -42,14 +42,14 @@ impl ThemeMode {
     }
 }
 
-/// 语音合成引擎（本地离线 SAPI5 vs Microsoft Edge TTS 在线网络接口）
+/// 语音合成引擎（默认本地离线 SAPI5，可选 Microsoft Edge 在线语音）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TtsEngine {
-    /// Windows 原生 SAPI5 离线引擎（无需联网，纯本地可用）
-    Sapi5,
-    /// Microsoft Edge TTS 在线神经网络语音（默认，网络异常或受限时自动回退至本地 SAPI5）
+    /// Windows 原生 SAPI5 离线引擎（默认首选：零外网请求、无需联网、纯本地毫秒级播报）
     #[default]
+    Sapi5,
+    /// Microsoft Edge TTS 在线神经网络语音（备选，网络异常或受限时自动回退至本地 SAPI5）
     EdgeTts,
 }
 
@@ -70,8 +70,8 @@ impl TtsEngine {
 
     pub fn display_name(self) -> &'static str {
         match self {
-            TtsEngine::Sapi5 => "本地 SAPI5（离线）",
-            TtsEngine::EdgeTts => "Microsoft Edge TTS（在线）",
+            TtsEngine::Sapi5 => "本地 Windows 语音（纯离线）",
+            TtsEngine::EdgeTts => "微软 Edge 在线语音（备选）",
         }
     }
 }
@@ -454,11 +454,11 @@ pub struct AppConfig {
 
     /// 是否开启后台定期版本检查，默认 true
     pub update_check_enabled: bool,
-    /// 更新清单接口地址（默认 Gitee 国内直连源，支持 GitHub 备用回退）
+    /// 更新清单接口地址（默认 Gitee 国内直连源，支持内网 HTTP 及本地/局域网共享路径）
     pub update_check_url: String,
     /// 更新检查间隔（小时，1..=168），默认 6 小时
     pub update_check_interval_hours: u16,
-    /// 可选 GitHub 访问令牌（PAT，仅当更新源为私有仓库时需要；公开仓库留空即可）
+    /// 可选访问令牌（私有仓库或内网鉴权选填，公开仓库留空即可）
     pub update_github_token: String,
 
     /// 是否开启本地 Web 控制台（127.0.0.1:3000），默认 false（按需手动开启）
@@ -485,7 +485,7 @@ impl Default for AppConfig {
             quiet_end_hour: 8,
             quiet_end_minute: 0,
             alarms: Vec::new(),
-            tts_engine: TtsEngine::EdgeTts,
+            tts_engine: TtsEngine::Sapi5,
             edge_tts_voice: DEFAULT_EDGE_TTS_VOICE.to_string(),
             tts_rate: 0,
             volume: 80,
@@ -665,14 +665,23 @@ impl AppConfig {
             self.volume = 100;
         }
 
-        let server = self.ntp_server.trim().to_string();
-        if server.is_empty() {
+        let mut ntp_hosts: Vec<String> = Vec::new();
+        for token in self.ntp_server.split([',', '，', ';', '；']) {
+            let part = token.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if part.chars().any(|c| c.is_whitespace()) {
+                return Err("单个 NTP 服务器地址内部不能包含空格。".to_string());
+            }
+            if !ntp_hosts.iter().any(|h| h.eq_ignore_ascii_case(part)) {
+                ntp_hosts.push(part.to_string());
+            }
+        }
+        if ntp_hosts.is_empty() {
             return Err("NTP 服务器地址不能为空。".to_string());
         }
-        if server.chars().any(|c| c.is_whitespace()) {
-            return Err("NTP 服务器地址不能包含空格。".to_string());
-        }
-        self.ntp_server = server;
+        self.ntp_server = ntp_hosts.join(",");
 
         let update_url = crate::version::migrate_legacy_update_url(&self.update_check_url);
         let is_valid_update_target = update_url.starts_with("https://")
@@ -686,7 +695,7 @@ impl AppConfig {
                 .unwrap_or(false);
         if !is_valid_update_target {
             return Err(
-                "更新检查地址须为 http(s):// 链接、局域网共享路径 (\\\\server\\...) 或本地文件路径"
+                "更新检查地址须为 Gitee/内网 http(s):// 链接、局域网共享路径 (\\\\server\\...) 或本地目录/文件路径"
                     .to_string(),
             );
         }
@@ -1113,6 +1122,7 @@ mod tests {
 
     #[test]
     fn test_tts_engine_and_voice_mapping() {
+        assert_eq!(TtsEngine::default(), TtsEngine::Sapi5);
         assert_eq!(TtsEngine::from_index(0), TtsEngine::Sapi5);
         assert_eq!(TtsEngine::from_index(1), TtsEngine::EdgeTts);
         assert_eq!(TtsEngine::Sapi5.to_index(), 0);

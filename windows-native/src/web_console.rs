@@ -870,12 +870,12 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
         <div class="field">
           <label><span>语音合成引擎</span></label>
           <select id="cfgTtsEngine">
-            <option value="1">Microsoft Edge TTS（在线神经网络语音 · 自动回退离线）</option>
-            <option value="0">本地 Windows SAPI5（纯离线系统语音）</option>
+            <option value="0">本地 Windows 语音（纯离线 · 默认首选）</option>
+            <option value="1">微软 Edge 在线语音（备选 · 受限自动回退本地）</option>
           </select>
         </div>
         <div class="field">
-          <label><span>Edge TTS 音色选择</span></label>
+          <label><span>Edge 在线音色选择（仅选择备选在线语音时生效）</span></label>
           <select id="cfgEdgeVoice">
             <option value="0">晓晓 (zh-CN-XiaoxiaoNeural · 温暖女声)</option>
             <option value="1">云希 (zh-CN-YunxiNeural · 阳光男声)</option>
@@ -895,7 +895,7 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
           <div class="field"><label><span>静默开始时间</span></label><input type="time" id="cfgQuietStart"></div>
           <div class="field"><label><span>静默结束时间</span></label><input type="time" id="cfgQuietEnd"></div>
         </div>
-        <div class="field"><label><span>NTP 校时服务器</span></label><input type="text" id="cfgNtpServer" placeholder="ntp.aliyun.com"></div>
+        <div class="field"><label><span>NTP 校时服务器（默认阿里云，自动容灾腾讯/中科院国家授时中心，也支持内网 NTP）</span></label><input type="text" id="cfgNtpServer" placeholder="ntp.aliyun.com"></div>
         <label class="switch"><input type="checkbox" id="cfgAutoStart"> 开机自动启动并最小化到托盘</label>
       </div>
     </div>
@@ -1013,17 +1013,17 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
     </div>
 
     <div class="card">
-      <div class="card-title">更新源与镜像配置（可选）</div>
+      <div class="card-title">更新源与内网/本地配置（可选）</div>
       <div class="muted">
-        说明：默认优先使用 <strong>Gitee 国内直连源（<code>djjz/HalfHourChime</code>）</strong>，国内无需代理即可连接更新；若 Gitee 临时不可用，程序会自动回退至 <strong>GitHub 备用源（<code>cqcmd/HalfHourChime</code>）</strong>。
+        说明：默认优先使用 <strong>Gitee 国内直连源（<code>djjz/HalfHourChime</code>）</strong>，国内无需代理即可检查并下载更新；也支持填入自建内网 HTTP <code>version.json</code>、本地文件夹（如 <code>D:\updates</code>）或局域网共享目录（如 <code>\\192.168.1.10\updates</code>）进行纯离线/内网升级。
       </div>
       <div class="field">
-        <label><span>更新源清单地址（支持 Gitee / GitHub Releases / 局域网共享 / version.json）</span></label>
+        <label><span>更新源地址（支持 Gitee / 内网 HTTP version.json / 局域网共享 / 本地目录）</span></label>
         <input type="text" id="cfgUpdUrl" placeholder="https://gitee.com/djjz/HalfHourChime/releases/latest">
       </div>
       <div class="grid2" style="gap:10px">
         <div class="field">
-          <label><span>GitHub Token (PAT，私有仓库选填)</span><span class="muted" id="tokenStateBadge">未设置</span></label>
+          <label><span>访问令牌 Token（私有仓库或内网鉴权选填）</span><span class="muted" id="tokenStateBadge">未设置</span></label>
           <input type="password" id="cfgGhToken" placeholder="输入新的 Token（留空表示保持原配置不变）">
         </div>
         <div class="field">
