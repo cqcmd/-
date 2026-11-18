@@ -444,14 +444,21 @@ jobs:
           # 4. 上传 HalfHourChime.exe 与 version.json 到 Gitee Release
           $exeDistPath = Join-Path $PWD "windows-native/dist/HalfHourChime.exe"
           foreach ($assetPath in @($exeDistPath, $giteeManifestPath)) {
-            $respRaw = & curl.exe -sS -w "`n%{http_code}" -F "access_token=$token" -F "file=@$assetPath" "$apiBase/$releaseId/attach_files"
-            $curlCode = $LASTEXITCODE
-            $lines = @("$respRaw" -split "`r?`n")
-            $httpCode = if ($lines.Count -gt 0) { $lines[-1].Trim() } else { "000" }
-            if ($curlCode -ne 0 -or -not ($httpCode -match '^2\d\d$')) {
-              $bodyText = if ($lines.Count -gt 1) { ($lines[0..($lines.Count - 2)] -join "`n") } else { "" }
-              throw ("上传 Gitee Release 附件 $([System.IO.Path]::GetFileName($assetPath)) 失败 (curl=$curlCode, http=$httpCode): " + (Mask-Token $bodyText))
+            $tmpResp = [System.IO.Path]::GetTempFileName()
+            try {
+              $ErrorActionPreference = "Continue"
+              $httpCode = (& curl.exe -sS -o $tmpResp -w "%{http_code}" -F "access_token=$token" -F "file=@$assetPath" "$apiBase/$releaseId/attach_files" | Out-String).Trim()
+              $curlCode = $LASTEXITCODE
+              $ErrorActionPreference = "Stop"
+
+              $bodyText = if (Test-Path $tmpResp) { Get-Content $tmpResp -Raw -Encoding utf8 } else { "" }
+              if ($curlCode -ne 0 -or -not ($httpCode -match '^2\d\d$')) {
+                throw ("上传 Gitee Release 附件 $([System.IO.Path]::GetFileName($assetPath)) 失败 (curl=$curlCode, http=$httpCode): " + (Mask-Token $bodyText))
+              }
+              Write-Host "已上传附件到 Gitee Release：$([System.IO.Path]::GetFileName($assetPath)) (HTTP $httpCode)"
+            } finally {
+              Remove-Item $tmpResp -Force -ErrorAction SilentlyContinue
             }
-            Write-Host "已上传附件到 Gitee Release：$([System.IO.Path]::GetFileName($assetPath))"
           }
+
 
