@@ -310,10 +310,29 @@ impl Scheduler {
         Self::default()
     }
 
-    /// 校时或保存配置后重置防重入槽位，防止系统时间回调或修改时间后错过提醒
+    /// 校时后重置防重入槽位，防止系统时间回调或向前校时后错过提醒
     pub fn reset_slots(&mut self) {
         self.last_chime_slot = None;
         self.last_alarm_slots.clear();
+    }
+
+    /// 保存配置后按变更幅度同步防重入槽位：
+    /// 保留本分钟已播报的整/半点报时槽位以及触发时间(hour, minute)未变的闹钟槽位，
+    /// 避免在刚报时/响铃的同一分钟内保存其他设置后再次重复触发；若闹钟调整了新时间则清理旧槽位。
+    pub fn sync_slots_after_config_save(&mut self, prev_cfg: &AppConfig, next_cfg: &AppConfig) {
+        self.last_alarm_slots.retain(|alarm_id, _| {
+            let prev_time = prev_cfg
+                .alarms
+                .iter()
+                .find(|a| a.id == *alarm_id)
+                .map(|a| (a.hour, a.minute));
+            let next_time = next_cfg
+                .alarms
+                .iter()
+                .find(|a| a.id == *alarm_id)
+                .map(|a| (a.hour, a.minute));
+            matches!((prev_time, next_time), (Some(pt), Some(nt)) if pt == nt)
+        });
     }
 
     pub fn schedule_snooze(&mut self, alarm: CustomAlarm, trigger_at: DateTime<Local>) {
@@ -862,5 +881,44 @@ mod tests {
             }
             _ => panic!("expected Chime event"),
         }
+    }
+
+    #[test]
+    fn test_sync_slots_after_config_save_prevents_same_minute_retrigger() {
+        let mut sched = Scheduler::new();
+        let mut prev_cfg = AppConfig::default();
+        prev_cfg.half_hour_chime_enabled = true;
+        prev_cfg.alarms = vec![CustomAlarm {
+            id: 1,
+            enabled: true,
+            label: "喝水提醒".to_string(),
+            hour: 18,
+            minute: 30,
+            repeat_mode: AlarmRepeatMode::Daily,
+            ..CustomAlarm::default()
+        }];
+
+        // 18:30:00 触发一次整半点报时 + 一次 18:30 闹钟
+        let t0 = Local.with_ymd_and_hms(2026, 11, 18, 18, 30, 0).unwrap();
+        let events0 = sched.evaluate_at(&prev_cfg, t0);
+        assert_eq!(events0.len(), 2);
+
+        // 同一分钟 18:30:15 保存了其他设置（闹钟时间未改），再评估不应重复触发
+        let mut next_cfg = prev_cfg.clone();
+        next_cfg.volume = 65;
+        sched.sync_slots_after_config_save(&prev_cfg, &next_cfg);
+        let t1 = Local.with_ymd_and_hms(2026, 11, 18, 18, 30, 15).unwrap();
+        let events1 = sched.evaluate_at(&next_cfg, t1);
+        assert!(
+            events1.is_empty(),
+            "same-minute save without changing time should not retrigger"
+        );
+
+        // 若将同一闹钟改到另一个时间后改回 18:30（或时间发生变更），仅闹钟槽位会被清理允许重新评估
+        let mut edited_cfg = next_cfg.clone();
+        edited_cfg.alarms[0].minute = 31;
+        sched.sync_slots_after_config_save(&next_cfg, &edited_cfg);
+        assert!(!sched.last_alarm_slots.contains_key(&1));
+        assert!(sched.last_chime_slot.is_some());
     }
 }

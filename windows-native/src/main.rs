@@ -89,16 +89,16 @@ mod perf_guard {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    /// 内存常驻告警与强制回收阈值：50 MiB
-    pub const MEMORY_GC_THRESHOLD_BYTES: u64 = 50 * 1024 * 1024;
+    /// 内存常驻告警与强制回收阈值：85 MiB（适配 Slint 窗口与 Windows Web/DLL 基础提交集，避免在 50 MiB 处频繁抖动工作集）
+    pub const MEMORY_GC_THRESHOLD_BYTES: u64 = 85 * 1024 * 1024;
     /// 本进程 CPU 负载偏高阈值（%）
     pub const PROCESS_CPU_HIGH_THRESHOLD_PCT: f64 = 15.0;
     /// 整机 CPU 负载偏高阈值（%，触发后台非核心任务让步）
     pub const SYSTEM_CPU_HIGH_THRESHOLD_PCT: f64 = 85.0;
     /// 后台巡检采样间隔（30 秒一次，自身开销几乎为 0）
     pub const PERF_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
-    /// 强制回收冷却间隔，避免高压环境下反复抖动工作集
-    pub const GC_COOLDOWN: Duration = Duration::from_secs(120);
+    /// 强制回收冷却间隔（5 分钟，避免反复清空工作集引发硬缺页抖动）
+    pub const GC_COOLDOWN: Duration = Duration::from_secs(300);
 
     #[derive(Debug, Clone, Copy, PartialEq, Default)]
     pub struct PerfSample {
@@ -531,7 +531,7 @@ mod perf_guard {
         )
     }
 
-    /// 启动后台资源与性能计数器监控线程，并在超限（内存 > 50MB）时执行强制内存回收
+    /// 启动后台资源与性能计数器监控线程，并在超限（内存 > 85MB 且非播报期间）时执行强制内存回收
     pub fn start_performance_monitor(
         audio: AudioEngine,
         cpu_throttled: Arc<AtomicBool>,
@@ -588,28 +588,39 @@ mod perf_guard {
                         GC_COOLDOWN,
                     ) {
                         GcDecision::MemoryExceeded => {
-                            let (before_ws, after_ws, compacted) =
-                                imp::force_windows_memory_reclaim(&audio);
-                            last_gc_at = Some(Instant::now());
-                            win_sys::log_info(
-                                "perf",
-                                &format!(
-                                    "memory exceeded >50MB ({}), forced reclaim: ws {:.2}MB -> {:.2}MB (private={:.2}MB, heap_largest_free={}B, proc_cpu={:.1}%, sys_cpu={:.1}%)",
-                                    sample.source,
-                                    format_mb(before_ws),
-                                    format_mb(after_ws),
-                                    format_mb(sample.private_bytes),
-                                    compacted,
-                                    sample.process_cpu_pct,
-                                    sample.system_cpu_pct
-                                ),
-                            );
+                            if audio.is_busy() {
+                                win_sys::log_debug(
+                                    "perf",
+                                    &format!(
+                                        "memory above 85MB (ws={:.2}MB, private={:.2}MB) but deferred while audio is busy",
+                                        format_mb(sample.working_set_bytes),
+                                        format_mb(sample.private_bytes)
+                                    ),
+                                );
+                            } else {
+                                let (before_ws, after_ws, compacted) =
+                                    imp::force_windows_memory_reclaim(&audio);
+                                last_gc_at = Some(Instant::now());
+                                win_sys::log_info(
+                                    "perf",
+                                    &format!(
+                                        "memory exceeded >85MB ({}), forced reclaim: ws {:.2}MB -> {:.2}MB (private={:.2}MB, heap_largest_free={}B, proc_cpu={:.1}%, sys_cpu={:.1}%)",
+                                        sample.source,
+                                        format_mb(before_ws),
+                                        format_mb(after_ws),
+                                        format_mb(sample.private_bytes),
+                                        compacted,
+                                        sample.process_cpu_pct,
+                                        sample.system_cpu_pct
+                                    ),
+                                );
+                            }
                         }
                         GcDecision::CooldownActive => {
                             win_sys::log_debug(
                                 "perf",
                                 &format!(
-                                    "memory above 50MB (ws={:.2}MB, private={:.2}MB) but GC cooldown active",
+                                    "memory above 85MB (ws={:.2}MB, private={:.2}MB) but GC cooldown active",
                                     format_mb(sample.working_set_bytes),
                                     format_mb(sample.private_bytes)
                                 ),
@@ -1384,14 +1395,137 @@ fn sync_theme_across_windows(
     settings_w: &SettingsWindow,
     about_w: &AboutWindow,
     update_w: &UpdateWindow,
-    alarm_alert_w: &AlarmAlertWindow,
+    alarm_alert_w: Option<&AlarmAlertWindow>,
     theme_idx: i32,
 ) {
     ThemeStore::get(main_w).set_active_index(theme_idx);
     ThemeStore::get(settings_w).set_active_index(theme_idx);
     ThemeStore::get(about_w).set_active_index(theme_idx);
     ThemeStore::get(update_w).set_active_index(theme_idx);
-    ThemeStore::get(alarm_alert_w).set_active_index(theme_idx);
+    if let Some(aaw) = alarm_alert_w {
+        ThemeStore::get(aaw).set_active_index(theme_idx);
+    }
+}
+
+/// 懒加载创建闹钟响铃强提醒弹窗，避免在仅使用整半点报时的静默驻留期间提前分配第 5 套 Slint 窗口与渲染上下文
+fn ensure_alarm_alert_window(
+    slot: &Rc<RefCell<Option<AlarmAlertWindow>>>,
+    state_rc: &Rc<RefCell<AppState>>,
+    mw_weak: &slint::Weak<MainWindow>,
+    audio: &AudioEngine,
+    theme_idx: i32,
+) -> Option<AlarmAlertWindow> {
+    {
+        let guard = slot.borrow();
+        if let Some(existing) = guard.as_ref() {
+            ThemeStore::get(existing).set_active_index(theme_idx);
+            return existing.as_weak().upgrade();
+        }
+    }
+
+    let alarm_alert_win = match AlarmAlertWindow::new() {
+        Ok(w) => w,
+        Err(err) => {
+            win_sys::log_error("ui", &format!("failed to create AlarmAlertWindow lazily: {err}"));
+            return None;
+        }
+    };
+    ThemeStore::get(&alarm_alert_win).set_active_index(theme_idx);
+
+    {
+        let w_drag = alarm_alert_win.as_weak();
+        alarm_alert_win.on_drag_window(move |dx, dy| {
+            if let Some(w) = w_drag.upgrade() {
+                drag_slint_window(&w, dx, dy);
+            }
+        });
+        let w_min = alarm_alert_win.as_weak();
+        alarm_alert_win.on_minimize_window(move || {
+            if let Some(w) = w_min.upgrade() {
+                w.window().set_minimized(true);
+            }
+        });
+    }
+    {
+        let aaw_weak = alarm_alert_win.as_weak();
+        let st_rc = Rc::clone(state_rc);
+        let mw_w = mw_weak.clone();
+        let audio_clone = audio.clone();
+        alarm_alert_win.window().on_close_requested(move || {
+            audio_clone.stop_active();
+            let mut st = st_rc.borrow_mut();
+            st.scheduler.clear_snooze();
+            if let Some(aaw) = aaw_weak.upgrade() {
+                let _ = aaw.hide();
+            }
+            if let Some(mw) = mw_w.upgrade() {
+                refresh_main_window_ui(&mw, &st, false);
+            }
+            slint::CloseRequestResponse::KeepWindowShown
+        });
+    }
+    {
+        let aaw_weak = alarm_alert_win.as_weak();
+        let st_rc = Rc::clone(state_rc);
+        let mw_w = mw_weak.clone();
+        let audio_clone = audio.clone();
+        alarm_alert_win.on_close_clicked(move || {
+            audio_clone.stop_active();
+            let mut st = st_rc.borrow_mut();
+            st.scheduler.clear_snooze();
+            if let Some(aaw) = aaw_weak.upgrade() {
+                let _ = aaw.hide();
+            }
+            if let Some(mw) = mw_w.upgrade() {
+                refresh_main_window_ui(&mw, &st, false);
+            }
+        });
+    }
+    {
+        let aaw_weak = alarm_alert_win.as_weak();
+        let st_rc = Rc::clone(state_rc);
+        let mw_w = mw_weak.clone();
+        let audio_clone = audio.clone();
+        alarm_alert_win.on_dismiss_clicked(move || {
+            audio_clone.stop_active();
+            let mut st = st_rc.borrow_mut();
+            st.scheduler.clear_snooze();
+            if let Some(aaw) = aaw_weak.upgrade() {
+                let _ = aaw.hide();
+            }
+            if let Some(mw) = mw_w.upgrade() {
+                refresh_main_window_ui(&mw, &st, false);
+            }
+        });
+    }
+    {
+        let aaw_weak = alarm_alert_win.as_weak();
+        let st_rc = Rc::clone(state_rc);
+        let mw_w = mw_weak.clone();
+        let audio_clone = audio.clone();
+        alarm_alert_win.on_snooze_clicked(move || {
+            audio_clone.stop_active();
+            let mut st = st_rc.borrow_mut();
+            if let Some(alarm) = st.last_triggered_alarm.clone() {
+                let trigger_at = Local::now() + chrono::Duration::minutes(5);
+                st.scheduler.schedule_snooze(alarm, trigger_at);
+                win_sys::log_info(
+                    "scheduler",
+                    &format!("alarm snoozed for 5 minutes until {}", trigger_at.format("%H:%M:%S")),
+                );
+            }
+            if let Some(aaw) = aaw_weak.upgrade() {
+                let _ = aaw.hide();
+            }
+            if let Some(mw) = mw_w.upgrade() {
+                refresh_main_window_ui(&mw, &st, false);
+            }
+        });
+    }
+
+    let ret = alarm_alert_win.as_weak().upgrade();
+    *slot.borrow_mut() = Some(alarm_alert_win);
+    ret
 }
 
 fn sync_alarm_list_to_settings(settings_w: &SettingsWindow, alarms: &[CustomAlarm]) {
@@ -2347,12 +2481,12 @@ fn main() {
     let (tts_status_tx, tts_status_rx) = mpsc::channel::<(u64, String)>();
     audio.attach_tts_status_sender(tts_status_tx);
 
-    // 5. 构建 Slint 原生多窗口组件（默认隐藏，仅托盘可见）
+    // 5. 构建 Slint 原生多窗口组件（默认隐藏，仅托盘可见；闹钟弹窗按需懒加载初始化以节省常驻内存）
     let main_win = MainWindow::new().expect("Failed to create MainWindow");
     let settings_win = SettingsWindow::new().expect("Failed to create SettingsWindow");
     let about_win = AboutWindow::new().expect("Failed to create AboutWindow");
     let update_win = UpdateWindow::new().expect("Failed to create UpdateWindow");
-    let alarm_alert_win = AlarmAlertWindow::new().expect("Failed to create AlarmAlertWindow");
+    let alarm_alert_slot: Rc<RefCell<Option<AlarmAlertWindow>>> = Rc::new(RefCell::new(None));
 
     about_win.set_app_version(version::display_version().into());
     about_win.set_app_vendor(version::APP_VENDOR.into());
@@ -2363,7 +2497,7 @@ fn main() {
         &settings_win,
         &about_win,
         &update_win,
-        &alarm_alert_win,
+        None,
         cfg.theme.to_index(),
     );
 
@@ -2459,24 +2593,23 @@ fn main() {
         let mw_weak = main_win.as_weak();
         let aw_weak = about_win.as_weak();
         let uw_weak = update_win.as_weak();
-        let aaw_weak = alarm_alert_win.as_weak();
+        let aaw_slot = Rc::clone(&alarm_alert_slot);
         let audio_clone = audio.clone();
         settings_win.window().on_close_requested(move || {
             let st = st_rc.borrow();
             audio_clone.set_live_volume(st.config.volume);
-            if let (Some(mw), Some(sw), Some(aw), Some(uw), Some(aaw)) = (
+            if let (Some(mw), Some(sw), Some(aw), Some(uw)) = (
                 mw_weak.upgrade(),
                 sw_weak.upgrade(),
                 aw_weak.upgrade(),
                 uw_weak.upgrade(),
-                aaw_weak.upgrade(),
             ) {
                 sync_theme_across_windows(
                     &mw,
                     &sw,
                     &aw,
                     &uw,
-                    &aaw,
+                    aaw_slot.borrow().as_ref(),
                     st.config.theme.to_index(),
                 );
                 let _ = sw.hide();
@@ -2505,25 +2638,6 @@ fn main() {
             slint::CloseRequestResponse::KeepWindowShown
         });
     }
-    {
-        let aaw_weak = alarm_alert_win.as_weak();
-        let st_rc = Rc::clone(&state);
-        let mw_weak = main_win.as_weak();
-        let audio_clone = audio.clone();
-        alarm_alert_win.window().on_close_requested(move || {
-            audio_clone.stop_active();
-            let mut st = st_rc.borrow_mut();
-            st.scheduler.clear_snooze();
-            if let Some(aaw) = aaw_weak.upgrade() {
-                let _ = aaw.hide();
-            }
-            if let Some(mw) = mw_weak.upgrade() {
-                refresh_main_window_ui(&mw, &st, false);
-            }
-            slint::CloseRequestResponse::KeepWindowShown
-        });
-    }
-
     // 7.5 绑定无边框窗口的自定义标题栏拖拽、最小化与关闭按钮控制
     macro_rules! bind_custom_titlebar {
         ($win:expr) => {{
@@ -2545,7 +2659,6 @@ fn main() {
     bind_custom_titlebar!(settings_win);
     bind_custom_titlebar!(about_win);
     bind_custom_titlebar!(update_win);
-    bind_custom_titlebar!(alarm_alert_win);
 
     {
         let mw_weak = main_win.as_weak();
@@ -2561,25 +2674,24 @@ fn main() {
         let mw_weak = main_win.as_weak();
         let aw_weak = about_win.as_weak();
         let uw_weak = update_win.as_weak();
-        let aaw_weak = alarm_alert_win.as_weak();
+        let aaw_slot = Rc::clone(&alarm_alert_slot);
         let audio_clone = audio.clone();
         settings_win.on_close_clicked(move || {
             let mut st = st_rc.borrow_mut();
             st.live_volume = st.config.volume;
             audio_clone.set_live_volume(st.config.volume);
-            if let (Some(mw), Some(sw), Some(aw), Some(uw), Some(aaw)) = (
+            if let (Some(mw), Some(sw), Some(aw), Some(uw)) = (
                 mw_weak.upgrade(),
                 sw_weak.upgrade(),
                 aw_weak.upgrade(),
                 uw_weak.upgrade(),
-                aaw_weak.upgrade(),
             ) {
                 sync_theme_across_windows(
                     &mw,
                     &sw,
                     &aw,
                     &uw,
-                    &aaw,
+                    aaw_slot.borrow().as_ref(),
                     st.config.theme.to_index(),
                 );
                 let _ = sw.hide();
@@ -2594,64 +2706,6 @@ fn main() {
                 if let Some(uw) = uw_weak.upgrade() {
                     let _ = uw.hide();
                 }
-            }
-        });
-    }
-    {
-        let aaw_weak = alarm_alert_win.as_weak();
-        let st_rc = Rc::clone(&state);
-        let mw_weak = main_win.as_weak();
-        let audio_clone = audio.clone();
-        alarm_alert_win.on_close_clicked(move || {
-            audio_clone.stop_active();
-            let mut st = st_rc.borrow_mut();
-            st.scheduler.clear_snooze();
-            if let Some(aaw) = aaw_weak.upgrade() {
-                let _ = aaw.hide();
-            }
-            if let Some(mw) = mw_weak.upgrade() {
-                refresh_main_window_ui(&mw, &st, false);
-            }
-        });
-    }
-    {
-        let aaw_weak = alarm_alert_win.as_weak();
-        let st_rc = Rc::clone(&state);
-        let mw_weak = main_win.as_weak();
-        let audio_clone = audio.clone();
-        alarm_alert_win.on_dismiss_clicked(move || {
-            audio_clone.stop_active();
-            let mut st = st_rc.borrow_mut();
-            st.scheduler.clear_snooze();
-            if let Some(aaw) = aaw_weak.upgrade() {
-                let _ = aaw.hide();
-            }
-            if let Some(mw) = mw_weak.upgrade() {
-                refresh_main_window_ui(&mw, &st, false);
-            }
-        });
-    }
-    {
-        let aaw_weak = alarm_alert_win.as_weak();
-        let st_rc = Rc::clone(&state);
-        let mw_weak = main_win.as_weak();
-        let audio_clone = audio.clone();
-        alarm_alert_win.on_snooze_clicked(move || {
-            audio_clone.stop_active();
-            let mut st = st_rc.borrow_mut();
-            if let Some(alarm) = st.last_triggered_alarm.clone() {
-                let trigger_at = Local::now() + chrono::Duration::minutes(5);
-                st.scheduler.schedule_snooze(alarm, trigger_at);
-                win_sys::log_info(
-                    "scheduler",
-                    &format!("alarm snoozed for 5 minutes until {}", trigger_at.format("%H:%M:%S")),
-                );
-            }
-            if let Some(aaw) = aaw_weak.upgrade() {
-                let _ = aaw.hide();
-            }
-            if let Some(mw) = mw_weak.upgrade() {
-                refresh_main_window_ui(&mw, &st, false);
             }
         });
     }
@@ -2701,13 +2755,13 @@ fn main() {
     {
         let st_rc = Rc::clone(&state);
         let mw_weak = main_win.as_weak();
-        let aaw_weak = alarm_alert_win.as_weak();
+        let aaw_slot = Rc::clone(&alarm_alert_slot);
         let audio_clone = audio.clone();
         main_win.on_stop_audio(move || {
             audio_clone.stop_active();
             let mut st = st_rc.borrow_mut();
             st.scheduler.clear_snooze();
-            if let Some(aaw) = aaw_weak.upgrade() {
+            if let Some(aaw) = aaw_slot.borrow().as_ref() {
                 let _ = aaw.hide();
             }
             if let Some(mw) = mw_weak.upgrade() {
@@ -2744,20 +2798,26 @@ fn main() {
         let sw_weak = settings_win.as_weak();
         let aw_weak = about_win.as_weak();
         let uw_weak = update_win.as_weak();
-        let aaw_weak = alarm_alert_win.as_weak();
+        let aaw_slot = Rc::clone(&alarm_alert_slot);
         main_win.on_cycle_theme(move || {
             let mut st = st_rc.borrow_mut();
             let next_idx = (st.config.theme.to_index() + 1) % 3;
             st.config.theme = ThemeMode::from_index(next_idx);
             let _ = st.config_store.save(&st.config);
-            if let (Some(mw), Some(sw), Some(aw), Some(uw), Some(aaw)) = (
+            if let (Some(mw), Some(sw), Some(aw), Some(uw)) = (
                 mw_weak.upgrade(),
                 sw_weak.upgrade(),
                 aw_weak.upgrade(),
                 uw_weak.upgrade(),
-                aaw_weak.upgrade(),
             ) {
-                sync_theme_across_windows(&mw, &sw, &aw, &uw, &aaw, next_idx);
+                sync_theme_across_windows(
+                    &mw,
+                    &sw,
+                    &aw,
+                    &uw,
+                    aaw_slot.borrow().as_ref(),
+                    next_idx,
+                );
             }
         });
     }
@@ -3233,16 +3293,15 @@ fn main() {
         let sw_weak = settings_win.as_weak();
         let aw_weak = about_win.as_weak();
         let uw_weak = update_win.as_weak();
-        let aaw_weak = alarm_alert_win.as_weak();
+        let aaw_slot = Rc::clone(&alarm_alert_slot);
         settings_win.on_select_theme(move |idx| {
-            if let (Some(mw), Some(sw), Some(aw), Some(uw), Some(aaw)) = (
+            if let (Some(mw), Some(sw), Some(aw), Some(uw)) = (
                 mw_weak.upgrade(),
                 sw_weak.upgrade(),
                 aw_weak.upgrade(),
                 uw_weak.upgrade(),
-                aaw_weak.upgrade(),
             ) {
-                sync_theme_across_windows(&mw, &sw, &aw, &uw, &aaw, idx);
+                sync_theme_across_windows(&mw, &sw, &aw, &uw, aaw_slot.borrow().as_ref(), idx);
             }
         });
     }
@@ -3288,7 +3347,7 @@ fn main() {
         let mw_weak = main_win.as_weak();
         let aw_weak = about_win.as_weak();
         let uw_weak = update_win.as_weak();
-        let aaw_weak = alarm_alert_win.as_weak();
+        let aaw_slot = Rc::clone(&alarm_alert_slot);
         let audio_clone = audio.clone();
         let wc_rc = Rc::clone(&web_console);
         settings_win.on_cancel_clicked(move || {
@@ -3301,19 +3360,18 @@ fn main() {
             } else {
                 wc_rc.borrow_mut().stop();
             }
-            if let (Some(mw), Some(sw), Some(aw), Some(uw), Some(aaw)) = (
+            if let (Some(mw), Some(sw), Some(aw), Some(uw)) = (
                 mw_weak.upgrade(),
                 sw_weak.upgrade(),
                 aw_weak.upgrade(),
                 uw_weak.upgrade(),
-                aaw_weak.upgrade(),
             ) {
                 sync_theme_across_windows(
                     &mw,
                     &sw,
                     &aw,
                     &uw,
-                    &aaw,
+                    aaw_slot.borrow().as_ref(),
                     st.config.theme.to_index(),
                 );
                 let _ = sw.hide();
@@ -3326,19 +3384,18 @@ fn main() {
         let mw_weak = main_win.as_weak();
         let aw_weak = about_win.as_weak();
         let uw_weak = update_win.as_weak();
-        let aaw_weak = alarm_alert_win.as_weak();
+        let aaw_slot = Rc::clone(&alarm_alert_slot);
         let drafts_rc = Rc::clone(&draft_alarms);
         let tray_clone = Arc::clone(&tray);
         let audio_clone = audio.clone();
         let u_tx = update_tx.clone();
         let wc_rc = Rc::clone(&web_console);
         settings_win.on_save_clicked(move || {
-            let (Some(sw), Some(mw), Some(aw), Some(uw), Some(aaw)) = (
+            let (Some(sw), Some(mw), Some(aw), Some(uw)) = (
                 sw_weak.upgrade(),
                 mw_weak.upgrade(),
                 aw_weak.upgrade(),
                 uw_weak.upgrade(),
-                aaw_weak.upgrade(),
             ) else {
                 return;
             };
@@ -3381,6 +3438,7 @@ fn main() {
                 };
 
             let (
+                prev_cfg,
                 preserved_mute_mode,
                 preserved_update_url,
                 preserved_update_token,
@@ -3393,6 +3451,7 @@ fn main() {
                     st.config.update_check_url.clone()
                 };
                 (
+                    st.config.clone(),
                     st.config.mute_mode,
                     u_url,
                     st.config.update_github_token.clone(),
@@ -3452,9 +3511,11 @@ fn main() {
                 wc_rc.borrow_mut().stop();
             }
 
-            if let Err(err) = win_sys::apply_auto_start(candidate.auto_start) {
-                sw.set_validation_error(err.into());
-                return;
+            if candidate.auto_start != prev_cfg.auto_start {
+                if let Err(err) = win_sys::apply_auto_start(candidate.auto_start) {
+                    sw.set_validation_error(err.into());
+                    return;
+                }
             }
 
             {
@@ -3465,7 +3526,8 @@ fn main() {
                 }
                 st.config = candidate.clone();
                 st.live_volume = candidate.volume;
-                st.scheduler.reset_slots();
+                st.scheduler
+                    .sync_slots_after_config_save(&prev_cfg, &candidate);
                 refresh_main_window_ui(&mw, &st, audio_clone.is_busy());
             }
             wc_rc
@@ -3481,7 +3543,14 @@ fn main() {
 
             tray_clone.set_auto_start_checked(candidate.auto_start);
             audio_clone.set_live_volume(candidate.volume);
-            sync_theme_across_windows(&mw, &sw, &aw, &uw, &aaw, candidate.theme.to_index());
+            sync_theme_across_windows(
+                &mw,
+                &sw,
+                &aw,
+                &uw,
+                aaw_slot.borrow().as_ref(),
+                candidate.theme.to_index(),
+            );
             sw.set_validation_error("".into());
             let _ = sw.hide();
         });
@@ -3601,7 +3670,7 @@ fn main() {
         let mw_weak = main_win.as_weak();
         let sw_weak = settings_win.as_weak();
         let aw_weak = about_win.as_weak();
-        let aaw_weak = alarm_alert_win.as_weak();
+        let aaw_slot_tray = Rc::clone(&alarm_alert_slot);
         let st_rc_main_thread = Rc::clone(&state);
         let drafts_rc_tray = Rc::clone(&draft_alarms);
         let audio_clone = audio.clone();
@@ -3643,7 +3712,7 @@ fn main() {
                     audio_clone.stop_active();
                     let mut st = st_rc_main_thread.borrow_mut();
                     st.scheduler.clear_snooze();
-                    if let Some(aaw) = aaw_weak.upgrade() {
+                    if let Some(aaw) = aaw_slot_tray.borrow().as_ref() {
                         let _ = aaw.hide();
                     }
                     if let Some(mw) = mw_weak.upgrade() {
@@ -3720,7 +3789,7 @@ fn main() {
         let sw_weak = settings_win.as_weak();
         let aw_weak = about_win.as_weak();
         let uw_weak = update_win.as_weak();
-        let aaw_weak = alarm_alert_win.as_weak();
+        let aaw_slot_tick = Rc::clone(&alarm_alert_slot);
         let drafts_tick = Rc::clone(&draft_alarms);
         let audio_clone = audio.clone();
         let tray_for_tick = Arc::clone(&tray);
@@ -3759,7 +3828,7 @@ fn main() {
                         audio_clone.stop_active();
                         let mut st = st_rc.borrow_mut();
                         st.scheduler.clear_snooze();
-                        if let Some(aaw) = aaw_weak.upgrade() {
+                        if let Some(aaw) = aaw_slot_tick.borrow().as_ref() {
                             let _ = aaw.hide();
                         }
                         if let Some(mw) = mw_weak.upgrade() {
@@ -3869,14 +3938,20 @@ fn main() {
                         st.config.theme = ThemeMode::from_index(idx);
                         let norm_idx = st.config.theme.to_index();
                         let _ = st.config_store.save(&st.config);
-                        if let (Some(mw), Some(sw), Some(aw), Some(uw), Some(aaw)) = (
+                        if let (Some(mw), Some(sw), Some(aw), Some(uw)) = (
                             mw_weak.upgrade(),
                             sw_weak.upgrade(),
                             aw_weak.upgrade(),
                             uw_weak.upgrade(),
-                            aaw_weak.upgrade(),
                         ) {
-                            sync_theme_across_windows(&mw, &sw, &aw, &uw, &aaw, norm_idx);
+                            sync_theme_across_windows(
+                                &mw,
+                                &sw,
+                                &aw,
+                                &uw,
+                                aaw_slot_tick.borrow().as_ref(),
+                                norm_idx,
+                            );
                             sw.set_theme_index(norm_idx);
                         }
                         wc_tick.borrow().update_config_view(config_to_web_view(&st.config));
@@ -3914,12 +3989,9 @@ fn main() {
                     }
                     WebAction::SaveConfig(patch, reply_tx) => {
                         let res = (|| -> Result<String, String> {
-                            let prev_auto_start = st_rc.borrow().config.auto_start;
-                            let candidate = {
-                                let st = st_rc.borrow();
-                                apply_web_config_patch(&st.config, patch)?
-                            };
-                            if candidate.auto_start != prev_auto_start {
+                            let prev_cfg = st_rc.borrow().config.clone();
+                            let candidate = apply_web_config_patch(&prev_cfg, patch)?;
+                            if candidate.auto_start != prev_cfg.auto_start {
                                 win_sys::apply_auto_start(candidate.auto_start)?;
                             }
                             {
@@ -3927,7 +3999,8 @@ fn main() {
                                 st.config_store.save(&candidate)?;
                                 st.config = candidate.clone();
                                 st.live_volume = candidate.volume;
-                                st.scheduler.reset_slots();
+                                st.scheduler
+                                    .sync_slots_after_config_save(&prev_cfg, &candidate);
                                 *drafts_tick.borrow_mut() = st.config.alarms.clone();
                                 if let Some(mw) = mw_weak.upgrade() {
                                     refresh_main_window_ui(&mw, &st, audio_clone.is_busy());
@@ -3947,19 +4020,18 @@ fn main() {
                             });
                             tray_for_tick.set_auto_start_checked(candidate.auto_start);
                             audio_clone.set_live_volume(candidate.volume);
-                            if let (Some(mw), Some(sw), Some(aw), Some(uw), Some(aaw)) = (
+                            if let (Some(mw), Some(sw), Some(aw), Some(uw)) = (
                                 mw_weak.upgrade(),
                                 sw_weak.upgrade(),
                                 aw_weak.upgrade(),
                                 uw_weak.upgrade(),
-                                aaw_weak.upgrade(),
                             ) {
                                 sync_theme_across_windows(
                                     &mw,
                                     &sw,
                                     &aw,
                                     &uw,
-                                    &aaw,
+                                    aaw_slot_tick.borrow().as_ref(),
                                     candidate.theme.to_index(),
                                 );
                             }
@@ -4101,7 +4173,13 @@ fn main() {
                             }
                         }
 
-                        if let Some(aaw) = aaw_weak.upgrade() {
+                        if let Some(aaw) = ensure_alarm_alert_window(
+                            &aaw_slot_tick,
+                            &st_rc,
+                            &mw_weak,
+                            &audio_clone,
+                            config_snapshot.theme.to_index(),
+                        ) {
                             let display_label = if is_snooze {
                                 format!("{label}（稍后提醒）")
                             } else {
@@ -4263,10 +4341,10 @@ mod perf_tests {
     use std::time::Duration;
 
     #[test]
-    fn gc_decision_triggers_above_50mb_and_respects_cooldown() {
+    fn gc_decision_triggers_above_85mb_and_respects_cooldown() {
         let under = PerfSample {
-            working_set_bytes: 22 * 1024 * 1024,
-            private_bytes: 18 * 1024 * 1024,
+            working_set_bytes: 40 * 1024 * 1024,
+            private_bytes: 68 * 1024 * 1024,
             process_cpu_pct: 0.3,
             system_cpu_pct: 12.0,
             source: "test",
@@ -4277,8 +4355,8 @@ mod perf_tests {
         );
 
         let over = PerfSample {
-            working_set_bytes: 54 * 1024 * 1024,
-            private_bytes: 49 * 1024 * 1024,
+            working_set_bytes: 90 * 1024 * 1024,
+            private_bytes: 92 * 1024 * 1024,
             process_cpu_pct: 1.5,
             system_cpu_pct: 30.0,
             source: "test",
@@ -4299,7 +4377,7 @@ mod perf_tests {
         assert_eq!(
             evaluate_gc_decision(
                 &over,
-                Some(Duration::from_secs(125)),
+                Some(Duration::from_secs(305)),
                 MEMORY_GC_THRESHOLD_BYTES,
                 GC_COOLDOWN
             ),
