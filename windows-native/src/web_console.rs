@@ -867,13 +867,18 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
         <label class="switch"><input type="checkbox" id="cfgPlaySound"> 播放内置提示音</label>
         <label class="switch"><input type="checkbox" id="cfgChimeTts"> 文字转语音报时</label>
         <div class="field">
-          <label><span>报时语音模板（{TIME} {TIME12} {PERIOD} {HH}:{MM}）</span></label>
+          <label><span>报时语音模板</span></label>
           <input type="text" id="cfgChimeTpl" placeholder="现在时间，{TIME}">
+          <div class="muted" style="font-size:11px;margin-top:4px">{TIME} 24小时时间（十四点整） · {TIME12} 12小时时间（下午两点整） · {PERIOD} 时段 · {HH}:{MM} 数字时分</div>
         </div>
         <hr>
         <div class="card-title">节假日播报</div>
         <label class="switch"><input type="checkbox" id="cfgHolidayEnabled"> 启用节假日自动播报</label>
-        <div class="field"><label><span>问候模板（{HOLIDAY} {GREETING} {LUNAR} {TIME}）</span></label><input type="text" id="cfgHolidayTpl"></div>
+        <div class="field">
+          <label><span>问候模板</span></label>
+          <input type="text" id="cfgHolidayTpl">
+          <div class="muted" style="font-size:11px;margin-top:4px">{HOLIDAY} 节日名 · {GREETING} 节日祝福语 · {LUNAR} 农历日期 · {TIME} 当前时间（也支持 {TIME12}/{PERIOD}/{HH}:{MM}）</div>
+        </div>
         <div class="field"><label><span>节庆音频路径（可选）</span></label><input type="text" id="cfgHolidayAudio" placeholder="留空使用内置提示音"></div>
       </div>
 
@@ -983,7 +988,11 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
           <label class="switch"><input type="checkbox" id="aeRespectQuiet"> 静默时段跳过</label>
         </div>
         <div class="grid2" style="gap:10px">
-          <div class="field"><label><span>播报文字（{TIME} {LABEL} {TIME12}）</span></label><input type="text" id="aeTtsText" placeholder="现在时间，{TIME}，{LABEL}"></div>
+          <div class="field">
+            <label><span>播报文字</span></label>
+            <input type="text" id="aeTtsText" placeholder="现在时间，{TIME}，{LABEL}">
+            <div class="muted" style="font-size:11px;margin-top:4px">{LABEL} 闹钟名称 · {TIME} 24小时时间 · {TIME12} 12小时时间 · {PERIOD} 时段 · {HH}:{MM} 数字时分</div>
+          </div>
           <div class="field"><label><span>自定义音频路径（可选）</span></label><input type="text" id="aeCustomAudio" placeholder="例如 D:\Audio\alarm.mp3"></div>
         </div>
       </div>

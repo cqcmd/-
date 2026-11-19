@@ -1099,7 +1099,7 @@ export component SettingsWindow inherits Window {
                                         }
                                     }
                                     Text {
-                                        text: "变量：{TIME} / {TIME12} / {PERIOD} / {HH}:{MM}";
+                                        text: "变量：{TIME} 24小时时间（十四点整） · {TIME12} 12小时时间（下午两点整）\n{PERIOD} 时段（上午/下午） · {HH}:{MM} 数字时分（14:00）";
                                         color: ThemeStore.palette.text-muted;
                                         font-size: 11px;
                                         wrap: word-wrap;
@@ -1187,7 +1187,7 @@ export component SettingsWindow inherits Window {
                                 }
 
                                 Text {
-                                    text: "变量：{HOLIDAY} / {GREETING} / {LUNAR} / {TIME}";
+                                    text: "变量：{HOLIDAY} 节日名 · {GREETING} 节日祝福语 · {LUNAR} 农历日期\n{TIME} 24小时时间（也可用 {TIME12} / {PERIOD} / {HH}:{MM}）";
                                     color: ThemeStore.palette.text-muted;
                                     font-size: 11px;
                                     wrap: word-wrap;
@@ -1512,7 +1512,7 @@ export component SettingsWindow inherits Window {
                                         }
                                     }
                                     Text {
-                                        text: "变量：{TIME} / {LABEL} / {TIME12} / {PERIOD}";
+                                        text: "变量：{LABEL} 闹钟名称 · {TIME} 24小时时间 · {TIME12} 12小时时间\n{PERIOD} 时段 · {HH}:{MM} 数字时分";
                                         color: ThemeStore.palette.text-muted;
                                         font-size: 11px;
                                         wrap: word-wrap;

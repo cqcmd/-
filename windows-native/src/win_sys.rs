@@ -548,6 +548,7 @@ impl TrayController {
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
             .with_tooltip(format_tray_tooltip(initial_mute_mode))
             .with_icon(icon)
             .build()
