@@ -212,7 +212,7 @@ pub fn build_gitee_mirror_exe_url(tag_or_version: &str) -> Option<String> {
 /// 识别并标准化更新检查地址：
 /// - 支持 `https://gitee.com/owner/repo/releases/latest` 自动转为 Gitee OpenAPI v5 Releases
 /// - 支持自定义 `https://github.com/owner/repo/releases/latest` 转为 API 地址
-/// - 支持内网 HTTP `version.json`、本地目录及局域网 UNC 共享路径
+/// - 支持标准 HTTP(S) `version.json` 地址
 pub fn normalize_update_check_url(input: &str) -> String {
     let migrated = migrate_legacy_update_url(input);
     let trimmed = migrated.trim();
@@ -231,71 +231,35 @@ pub fn normalize_update_check_url(input: &str) -> String {
     trimmed.to_string()
 }
 
-/// 标准化更新包下载地址（支持绝对直链、局域网 UNC 与本地路径）
+/// 标准化更新包下载地址
 pub fn normalize_download_url(input: &str) -> String {
     input.trim().to_string()
 }
 
-fn is_absolute_update_target(target: &str) -> bool {
+fn is_http_url(target: &str) -> bool {
     let t = target.trim();
-    t.starts_with("https://")
-        || t.starts_with("http://")
-        || t.starts_with("file://")
-        || t.starts_with("\\\\")
-        || t.starts_with('/')
-        || t.as_bytes()
-            .get(1)
-            .map(|&b| b == b':')
-            .unwrap_or(false)
+    t.starts_with("https://") || t.starts_with("http://")
 }
 
-/// 将清单内的 `download_url` 基于清单来源地址解析为完整下载目标：
-/// 支持局域网共享目录（`\\server\share\version.json` + `HalfHourChime.exe`）、
-/// 本地目录（`D:\updates\version.json` + `./HalfHourChime.exe`）与内网 HTTP（`http://192.168.1.10/version.json` + `HalfHourChime.exe`）
+/// 将清单内的 `download_url` 基于 HTTP(S) 清单来源解析为完整下载链接
 pub fn resolve_manifest_download_url(manifest_source: &str, raw_download_url: &str) -> String {
     let dl = normalize_download_url(raw_download_url);
-    if dl.is_empty() || is_absolute_update_target(&dl) {
+    if dl.is_empty() || is_http_url(&dl) {
         return dl;
     }
 
-    let rel = dl.trim_start_matches("./").trim_start_matches(".\\");
+    let rel = dl.trim_start_matches("./").trim_start_matches('/');
     let src = manifest_source.trim();
-    if src.starts_with("http://") || src.starts_with("https://") {
+    if is_http_url(src) {
         let base = if let Some(pos) = src.rfind('/') {
             &src[..=pos]
         } else {
             src
         };
-        return format!("{}{}", base.trim_end_matches('/'), format!("/{}", rel.trim_start_matches('/')));
+        return format!("{}/{}", base.trim_end_matches('/'), rel);
     }
 
-    let cleaned_src = src
-        .strip_prefix("file:///")
-        .unwrap_or(src);
-    let base_dir = if cleaned_src.to_ascii_lowercase().ends_with(".json") {
-        if let Some(pos) = cleaned_src.rfind(['\\', '/']) {
-            &cleaned_src[..pos]
-        } else {
-            "."
-        }
-    } else {
-        cleaned_src.trim_end_matches(['\\', '/'])
-    };
-    let sep = if base_dir.contains('\\') || base_dir.starts_with("\\\\") {
-        '\\'
-    } else {
-        '/'
-    };
-    let rel_norm = if sep == '\\' {
-        rel.replace('/', "\\")
-    } else {
-        rel.replace('\\', "/")
-    };
-    if base_dir.is_empty() {
-        rel_norm
-    } else {
-        format!("{base_dir}{sep}{rel_norm}")
-    }
+    dl
 }
 
 pub fn extract_github_owner_repo(url: &str) -> Option<(String, String)> {
@@ -429,7 +393,7 @@ pub fn parse_remote_manifest_body(raw_body: &str) -> Result<RemoteVersionManifes
     let lower = clean.to_ascii_lowercase();
     if lower.starts_with("<!doctype") || lower.starts_with("<html") {
         return Err(
-            "更新地址返回了网页内容而非 JSON 清单，请确认填写的是 Gitee Releases 地址、内网 version.json 或本地共享路径"
+            "更新地址返回了网页内容而非 JSON 清单，请确认填写的是 Gitee Releases 或 version.json 地址"
                 .to_string(),
         );
     }
@@ -552,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_domestic_gitee_and_local_relative_urls() {
+    fn test_normalize_domestic_gitee_and_http_relative_urls() {
         assert_eq!(
             normalize_update_check_url("https://github.com/cqcmd/HalfHourChime/releases/latest"),
             "https://gitee.com/api/v5/repos/djjz/HalfHourChime/releases/latest"
@@ -580,16 +544,8 @@ mod tests {
             Some("https://gitee.com/djjz/HalfHourChime/releases/download/v2.0.5-20261117/HalfHourChime.exe")
         );
         assert_eq!(
-            resolve_manifest_download_url(r"\\192.168.1.10\updates\version.json", "./HalfHourChime.exe"),
-            r"\\192.168.1.10\updates\HalfHourChime.exe"
-        );
-        assert_eq!(
-            resolve_manifest_download_url(r"D:\updates", "HalfHourChime.exe"),
-            r"D:\updates\HalfHourChime.exe"
-        );
-        assert_eq!(
-            resolve_manifest_download_url("http://192.168.1.10:8080/chime/version.json", "HalfHourChime.exe"),
-            "http://192.168.1.10:8080/chime/HalfHourChime.exe"
+            resolve_manifest_download_url("https://example.com/chime/version.json", "HalfHourChime.exe"),
+            "https://example.com/chime/HalfHourChime.exe"
         );
     }
 }

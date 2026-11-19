@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -239,6 +239,7 @@ impl WebConsoleController {
         let cfg_ref = Arc::clone(&self.config_view);
         let action_tx = self.action_tx.clone();
 
+        let active_conns = Arc::new(AtomicUsize::new(0));
         let join_handle = thread::Builder::new()
             .name("web-console-http".to_string())
             .spawn(move || {
@@ -251,10 +252,21 @@ impl WebConsoleController {
                             let snap_c = Arc::clone(&snap_ref);
                             let cfg_c = Arc::clone(&cfg_ref);
                             let tx_c = action_tx.clone();
-                            handle_http_client(stream, &snap_c, &cfg_c, &tx_c);
+                            if active_conns.load(Ordering::Relaxed) < 16 {
+                                let conn_counter = Arc::clone(&active_conns);
+                                conn_counter.fetch_add(1, Ordering::Relaxed);
+                                let _ = thread::Builder::new()
+                                    .name("web-console-req".to_string())
+                                    .spawn(move || {
+                                        handle_http_client(stream, &snap_c, &cfg_c, &tx_c);
+                                        conn_counter.fetch_sub(1, Ordering::Relaxed);
+                                    });
+                            } else {
+                                handle_http_client(stream, &snap_c, &cfg_c, &tx_c);
+                            }
                         }
                         Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(60));
+                            thread::sleep(Duration::from_millis(40));
                         }
                         Err(_) => {
                             thread::sleep(Duration::from_millis(120));
@@ -804,11 +816,11 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
           <button onclick="postAction('/api/action/sync-ntp',{})" id="ntpBtn">立即 NTP 校时</button>
         </div>
         <div class="field">
-          <label><span>全局音量（拖动实时生效）</span><span class="mono" id="volLabel">80%</span></label>
+          <label><span>全局音量</span><span class="mono" id="volLabel">80%</span></label>
           <input type="range" id="liveVol" min="0" max="100" value="80" oninput="onVolumeSlide(this.value)">
         </div>
         <div class="field">
-          <label><span>界面视觉主题（同步桌面端与网页）</span></label>
+          <label><span>界面主题</span></label>
           <div class="btn-row" id="themeBtns">
             <button class="chip" data-theme-idx="2" onclick="setTheme(2)">暖金咖啡馆</button>
             <button class="chip" data-theme-idx="0" onclick="setTheme(0)">暗夜曜石</button>
@@ -841,28 +853,28 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
   <div id="tab-settings" class="panel">
     <div class="grid2">
       <div class="card">
-        <div class="card-title">定时报时功能开关</div>
-        <label class="switch"><input type="checkbox" id="cfgHourlyEnabled"> 启用整点报时（每小时 :00）</label>
-        <label class="switch"><input type="checkbox" id="cfgHalfHourEnabled"> 启用半点报时（每小时 :30）</label>
+        <div class="card-title">定时报时</div>
+        <label class="switch"><input type="checkbox" id="cfgHourlyEnabled"> 启用整点报时 (:00)</label>
+        <label class="switch"><input type="checkbox" id="cfgHalfHourEnabled"> 启用半点报时 (:30)</label>
         <div class="field">
-          <label><span>额外报时分钟（可选，0–59 逗号分隔，留空仅按上方勾选）</span></label>
-          <input type="text" id="cfgExtraMinutes" placeholder="例如 15, 45">
+          <label><span>额外报时分钟（可选）</span></label>
+          <input type="text" id="cfgExtraMinutes" placeholder="如 15, 45">
         </div>
         <div class="grid2" style="gap:10px">
-          <div class="field"><label><span>重复播报次数 (1–10)</span></label><input type="number" id="cfgChimeRepeat" min="1" max="10"></div>
-          <div class="field"><label><span>语音播报语速 (-5 ~ +5)</span></label><input type="number" id="cfgTtsRate" min="-5" max="5"></div>
+          <div class="field"><label><span>重复次数 (1–10)</span></label><input type="number" id="cfgChimeRepeat" min="1" max="10"></div>
+          <div class="field"><label><span>语音语速 (-5 ~ +5)</span></label><input type="number" id="cfgTtsRate" min="-5" max="5"></div>
         </div>
-        <label class="switch"><input type="checkbox" id="cfgPlaySound"> 报时播放内置提示音</label>
-        <label class="switch"><input type="checkbox" id="cfgChimeTts"> 整/半点启用文字转语音播报</label>
+        <label class="switch"><input type="checkbox" id="cfgPlaySound"> 播放内置提示音</label>
+        <label class="switch"><input type="checkbox" id="cfgChimeTts"> 文字转语音报时</label>
         <div class="field">
-          <label><span>报时语音模板（支持 {TIME} / {TIME12} / {PERIOD} / {HH}:{MM}）</span></label>
+          <label><span>报时语音模板（{TIME} {TIME12} {PERIOD} {HH}:{MM}）</span></label>
           <input type="text" id="cfgChimeTpl" placeholder="现在时间，{TIME}">
         </div>
         <hr>
-        <div class="card-title">节假日自动播报（本地离线识别）</div>
-        <label class="switch"><input type="checkbox" id="cfgHolidayEnabled"> 启用节假日自动播报（内置 2010–2040 公历/农历节日）</label>
-        <div class="field"><label><span>问候语模板（支持 {HOLIDAY} / {GREETING} / {LUNAR} / {TIME}）</span></label><input type="text" id="cfgHolidayTpl"></div>
-        <div class="field"><label><span>节庆专属音频路径（可选 WAV/MP3/FLAC/OGG）</span></label><input type="text" id="cfgHolidayAudio" placeholder="留空则使用内置提示音"></div>
+        <div class="card-title">节假日播报</div>
+        <label class="switch"><input type="checkbox" id="cfgHolidayEnabled"> 启用节假日自动播报</label>
+        <div class="field"><label><span>问候模板（{HOLIDAY} {GREETING} {LUNAR} {TIME}）</span></label><input type="text" id="cfgHolidayTpl"></div>
+        <div class="field"><label><span>节庆音频路径（可选）</span></label><input type="text" id="cfgHolidayAudio" placeholder="留空使用内置提示音"></div>
       </div>
 
       <div class="card">
@@ -870,40 +882,40 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
         <div class="field">
           <label><span>语音合成引擎</span></label>
           <select id="cfgTtsEngine">
-            <option value="0">本地 Windows 语音（纯离线 · 默认首选）</option>
-            <option value="1">微软 Edge 在线语音（备选 · 受限自动回退本地）</option>
+            <option value="0">本地 Windows 语音</option>
+            <option value="1">Edge 在线语音</option>
           </select>
         </div>
         <div class="field">
-          <label><span>Edge 在线音色选择（仅选择备选在线语音时生效）</span></label>
+          <label><span>Edge 在线音色</span></label>
           <select id="cfgEdgeVoice">
-            <option value="0">晓晓 (zh-CN-XiaoxiaoNeural · 温暖女声)</option>
-            <option value="1">云希 (zh-CN-YunxiNeural · 阳光男声)</option>
-            <option value="2">云扬 (zh-CN-YunyangNeural · 播音男声)</option>
-            <option value="3">晓伊 (zh-CN-XiaoyiNeural · 甜美活力)</option>
+            <option value="0">晓晓 (zh-CN-XiaoxiaoNeural)</option>
+            <option value="1">云希 (zh-CN-YunxiNeural)</option>
+            <option value="2">云扬 (zh-CN-YunyangNeural)</option>
+            <option value="3">晓伊 (zh-CN-XiaoyiNeural)</option>
           </select>
         </div>
         <div class="btn-row">
-          <button type="button" onclick="previewSelectedVoice()">试听所选音色（不保存）</button>
-          <button type="button" onclick="loadConfigFromServer()">从客户端重新读取</button>
+          <button type="button" onclick="previewSelectedVoice()">试听音色</button>
+          <button type="button" onclick="loadConfigFromServer()">重新读取</button>
         </div>
-        <div class="muted" id="cfgVoiceStatus">提示：点击试听将立即打断上一段试听并播放所选音色。</div>
+        <div class="muted" id="cfgVoiceStatus"></div>
         <hr>
         <div class="card-title">静默时段与开机自启</div>
-        <label class="switch"><input type="checkbox" id="cfgQuietEnabled"> 启用夜间/特定静默免打扰时段（仅暂停报时，闹钟默认不受影响）</label>
+        <label class="switch"><input type="checkbox" id="cfgQuietEnabled"> 启用静默免打扰时段</label>
         <div class="grid2" style="gap:10px">
-          <div class="field"><label><span>静默开始时间</span></label><input type="time" id="cfgQuietStart"></div>
-          <div class="field"><label><span>静默结束时间</span></label><input type="time" id="cfgQuietEnd"></div>
+          <div class="field"><label><span>开始时间</span></label><input type="time" id="cfgQuietStart"></div>
+          <div class="field"><label><span>结束时间</span></label><input type="time" id="cfgQuietEnd"></div>
         </div>
-        <div class="field"><label><span>NTP 校时服务器（默认阿里云，自动容灾腾讯/中科院国家授时中心，也支持内网 NTP）</span></label><input type="text" id="cfgNtpServer" placeholder="ntp.aliyun.com"></div>
-        <label class="switch"><input type="checkbox" id="cfgAutoStart"> 开机自动启动并最小化到托盘</label>
+        <div class="field"><label><span>NTP 校时服务器</span></label><input type="text" id="cfgNtpServer" placeholder="ntp.aliyun.com"></div>
+        <label class="switch"><input type="checkbox" id="cfgAutoStart"> 开机自动启动</label>
       </div>
     </div>
 
     <!-- 自定义闹钟管理卡片 -->
     <div class="card">
       <div class="card-title">
-        <span>自定义闹钟管理（多周期 · 文字转语音 · 自定义音频）</span>
+        <span>自定义闹钟</span>
         <div class="btn-row">
           <button type="button" class="chip" onclick="addPresetAlarm('water')">+ 喝水提醒</button>
           <button type="button" class="chip" onclick="addPresetAlarm('stand')">+ 起身活动</button>
@@ -932,16 +944,16 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
           <div class="field">
             <label><span>重复周期</span></label>
             <select id="aeMode" onchange="onAlarmModeChange()">
-              <option value="once">仅一次（响铃后自动关闭）</option>
+              <option value="once">仅一次</option>
               <option value="daily">每天</option>
-              <option value="workdays">工作日（周一至周五）</option>
-              <option value="weekends">周末（周六、周日）</option>
+              <option value="workdays">工作日</option>
+              <option value="weekends">周末</option>
               <option value="weekly">自定义星期</option>
               <option value="interval_days">每隔 N 天</option>
             </select>
           </div>
           <div class="field" id="aeOnceWrap" style="display:none">
-            <label><span>单次目标日期（留空自动推算）</span></label>
+            <label><span>目标日期（可留空）</span></label>
             <input type="date" id="aeOnceDate">
           </div>
           <div class="field" id="aeIntervalWrap" style="display:none">
@@ -953,7 +965,7 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
           </div>
         </div>
         <div id="aeWeeklyWrap" class="field" style="display:none">
-          <label><span>选择每周响铃日期</span></label>
+          <label><span>每周日期</span></label>
           <div class="wd-row">
             <label><input type="checkbox" id="aeWd0"> 周一</label>
             <label><input type="checkbox" id="aeWd1"> 周二</label>
@@ -965,23 +977,24 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
           </div>
         </div>
         <div class="btn-row">
-          <label class="switch"><input type="checkbox" id="aePlayChime" checked> 响铃前播放内置提示音</label>
-          <label class="switch"><input type="checkbox" id="aeTtsEnabled" checked> 启用文字转语音播报</label>
-          <label class="switch"><input type="checkbox" id="aeRespectQuiet"> 静默时段内跳过此闹钟</label>
+          <label class="switch"><input type="checkbox" id="aePlayChime" checked> 播放提示音</label>
+          <label class="switch"><input type="checkbox" id="aeTtsEnabled" checked> 文字转语音播报</label>
+          <label class="switch"><input type="checkbox" id="aeShowAlert"> 响铃时弹出提醒窗口（默认不弹）</label>
+          <label class="switch"><input type="checkbox" id="aeRespectQuiet"> 静默时段跳过</label>
         </div>
         <div class="grid2" style="gap:10px">
-          <div class="field"><label><span>语音播报文字（支持 {TIME} / {LABEL} / {TIME12}）</span></label><input type="text" id="aeTtsText" placeholder="现在时间，{TIME}，{LABEL}"></div>
-          <div class="field"><label><span>本机自定义音频路径（WAV/MP3/FLAC/OGG，可选）</span></label><input type="text" id="aeCustomAudio" placeholder="例如 D:\Audio\alarm.mp3"></div>
+          <div class="field"><label><span>播报文字（{TIME} {LABEL} {TIME12}）</span></label><input type="text" id="aeTtsText" placeholder="现在时间，{TIME}，{LABEL}"></div>
+          <div class="field"><label><span>自定义音频路径（可选）</span></label><input type="text" id="aeCustomAudio" placeholder="例如 D:\Audio\alarm.mp3"></div>
         </div>
       </div>
 
       <div id="alarmListBox" class="alarm-list"></div>
+      <div id="alarmDirtyHint" class="muted" style="display:none;color:var(--accent);font-weight:700;margin-top:8px">自定义闹钟有未保存修改，请点击下方「保存配置并生效」写入磁盘</div>
     </div>
 
     <div class="card">
-      <div class="row">
-        <span class="muted">保存后立即写入本机 config.json 并同步更新桌面端窗口与定时调度器。</span>
-        <button class="primary" onclick="saveAllConfig()">保存全部配置并立即生效</button>
+      <div class="row" style="justify-content:flex-end">
+        <button class="primary" onclick="saveAllConfig()">保存配置并生效</button>
       </div>
     </div>
   </div>
@@ -1013,27 +1026,24 @@ const WEB_CONSOLE_HTML: &str = r#"<!doctype html>
     </div>
 
     <div class="card">
-      <div class="card-title">更新源与内网/本地配置（可选）</div>
-      <div class="muted">
-        说明：默认优先使用 <strong>Gitee 国内直连源（<code>djjz/HalfHourChime</code>）</strong>，国内无需代理即可检查并下载更新；也支持填入自建内网 HTTP <code>version.json</code>、本地文件夹（如 <code>D:\updates</code>）或局域网共享目录（如 <code>\\192.168.1.10\updates</code>）进行纯离线/内网升级。
-      </div>
+      <div class="card-title">更新源配置</div>
       <div class="field">
-        <label><span>更新源地址（支持 Gitee / 内网 HTTP version.json / 局域网共享 / 本地目录）</span></label>
+        <label><span>更新源地址（Gitee / GitHub / version.json）</span></label>
         <input type="text" id="cfgUpdUrl" placeholder="https://gitee.com/djjz/HalfHourChime/releases/latest">
       </div>
       <div class="grid2" style="gap:10px">
         <div class="field">
-          <label><span>访问令牌 Token（私有仓库或内网鉴权选填）</span><span class="muted" id="tokenStateBadge">未设置</span></label>
-          <input type="password" id="cfgGhToken" placeholder="输入新的 Token（留空表示保持原配置不变）">
+          <label><span>访问令牌 Token（可选）</span><span class="muted" id="tokenStateBadge">未设置</span></label>
+          <input type="password" id="cfgGhToken" placeholder="留空保持不变">
         </div>
         <div class="field">
-          <label><span>后台自动检查周期（小时，1–168）</span></label>
+          <label><span>检查周期（小时，1–168）</span></label>
           <input type="number" id="cfgUpdInterval" min="1" max="168">
         </div>
       </div>
       <div class="btn-row">
-        <button class="primary" onclick="saveUpdateSettings(false)">保存更新源配置</button>
-        <button onclick="saveUpdateSettings(true)">清除已保存的 Token</button>
+        <button class="primary" onclick="saveUpdateSettings(false)">保存配置</button>
+        <button onclick="saveUpdateSettings(true)">清除 Token</button>
       </div>
     </div>
   </div>
@@ -1077,6 +1087,14 @@ let activeTab = 'overview';
 let volumeDebounce = null;
 let draftAlarms = [];
 let editingAlarmIdx = -2; // -2: closed, -1: new, >=0: existing index
+let maxKnownAlarmId = 0;
+let alarmsDirty = false;
+
+function setAlarmsDirty(flag){
+  alarmsDirty = !!flag;
+  const el = document.getElementById('alarmDirtyHint');
+  if(el) el.style.display = alarmsDirty ? 'block' : 'none';
+}
 
 function pad2(n){ return String(Math.max(0, Number(n)||0)).padStart(2,'0'); }
 function todayStr(){
@@ -1094,7 +1112,9 @@ function switchTab(id, btn){
   if(btn) btn.classList.add('active');
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.getElementById('tab-'+id).classList.add('active');
-  if(id === 'settings' || id === 'updates') loadConfigFromServer();
+  if((id === 'settings' && !alarmsDirty && editingAlarmIdx === -2) || id === 'updates'){
+    loadConfigFromServer();
+  }
   if(id === 'logs') loadLogs();
 }
 
@@ -1104,14 +1124,18 @@ async function postAction(url, body){
     if(body !== undefined) opt.body = JSON.stringify(body);
     const r = await fetch(url, opt);
     const j = await r.json();
-    if(j.ok){
+    if(r.ok && j.ok){
       showToast(j.message || '操作成功', false);
+      setTimeout(refreshStatus, 180);
+      return true;
     }else{
       showToast(j.error || '操作失败', true);
+      setTimeout(refreshStatus, 180);
+      return false;
     }
-    setTimeout(refreshStatus, 180);
   }catch(e){
     showToast('请求失败，请确认软件仍在运行', true);
+    return false;
   }
 }
 
@@ -1156,6 +1180,7 @@ function describeAlarmAudio(a){
   if(a.play_chime_before) parts.push('提示音');
   if((a.custom_audio_path||'').trim()) parts.push('自定义音频');
   if(a.tts_enabled) parts.push('文字转语音');
+  if(a.show_alert) parts.push('弹窗');
   return parts.length ? parts.join(' + ') : '仅提示';
 }
 
@@ -1189,7 +1214,10 @@ function renderAlarms(){
 }
 
 function toggleAlarmEnabled(idx, checked){
-  if(draftAlarms[idx]) draftAlarms[idx].enabled = !!checked;
+  if(draftAlarms[idx]){
+    draftAlarms[idx].enabled = !!checked;
+    setAlarmsDirty(true);
+  }
 }
 
 function deleteAlarm(idx){
@@ -1197,10 +1225,12 @@ function deleteAlarm(idx){
   if(editingAlarmIdx === idx) closeAlarmEditor();
   else if(editingAlarmIdx > idx) editingAlarmIdx -= 1;
   renderAlarms();
+  setAlarmsDirty(true);
 }
 
 function nextLocalAlarmId(){
-  return draftAlarms.reduce((m,a)=>Math.max(m, Number(a.id)||0), 0) + 1;
+  maxKnownAlarmId = draftAlarms.reduce((m,a)=>Math.max(m, Number(a.id)||0), maxKnownAlarmId) + 1;
+  return maxKnownAlarmId;
 }
 
 function addPresetAlarm(kind){
@@ -1212,7 +1242,7 @@ function addPresetAlarm(kind){
       repeat_mode:'daily', weekdays:[true,true,true,true,true,true,true],
       interval_days:1, anchor_date:'', once_date:'', repeat_count:1,
       play_chime_before:true, tts_enabled:true, tts_text:'现在时间，{TIME}，请喝一杯水休息一下',
-      custom_audio_path:'', respect_quiet_hours:false
+      custom_audio_path:'', respect_quiet_hours:false, show_alert:false
     };
   }else if(kind === 'stand'){
     item = {
@@ -1220,7 +1250,7 @@ function addPresetAlarm(kind){
       repeat_mode:'workdays', weekdays:[true,true,true,true,true,false,false],
       interval_days:1, anchor_date:'', once_date:'', repeat_count:1,
       play_chime_before:true, tts_enabled:true, tts_text:'现在时间，{TIME}，久坐辛苦了，起来活动几分钟吧',
-      custom_audio_path:'', respect_quiet_hours:false
+      custom_audio_path:'', respect_quiet_hours:false, show_alert:false
     };
   }else{
     item = {
@@ -1228,11 +1258,12 @@ function addPresetAlarm(kind){
       repeat_mode:'workdays', weekdays:[true,true,true,true,true,false,false],
       interval_days:1, anchor_date:'', once_date:'', repeat_count:2,
       play_chime_before:true, tts_enabled:true, tts_text:'现在时间，{TIME}，请记得下班打卡',
-      custom_audio_path:'', respect_quiet_hours:false
+      custom_audio_path:'', respect_quiet_hours:false, show_alert:false
     };
   }
   draftAlarms.push(item);
   renderAlarms();
+  setAlarmsDirty(true);
   openAlarmEditor(draftAlarms.length - 1);
 }
 
@@ -1262,6 +1293,7 @@ function openAlarmEditor(idx){
     tts_text: '现在时间，{TIME}，{LABEL}',
     custom_audio_path: '',
     respect_quiet_hours: false,
+    show_alert: false,
   };
   document.getElementById('alarmEditorTitle').textContent = idx < 0 ? '新建自定义闹钟' : '编辑自定义闹钟';
   document.getElementById('aeLabel').value = a.label || '';
@@ -1277,6 +1309,7 @@ function openAlarmEditor(idx){
   document.getElementById('aeTtsEnabled').checked = !!a.tts_enabled;
   document.getElementById('aeTtsText').value = a.tts_text || '';
   document.getElementById('aeCustomAudio').value = a.custom_audio_path || '';
+  document.getElementById('aeShowAlert').checked = !!a.show_alert;
   document.getElementById('aeRespectQuiet').checked = !!a.respect_quiet_hours;
   onAlarmModeChange();
   document.getElementById('alarmEditorBox').style.display = 'grid';
@@ -1309,6 +1342,7 @@ function readAlarmFromEditor(){
     tts_text: document.getElementById('aeTtsText').value.trim(),
     custom_audio_path: document.getElementById('aeCustomAudio').value.trim(),
     respect_quiet_hours: document.getElementById('aeRespectQuiet').checked,
+    show_alert: document.getElementById('aeShowAlert').checked,
   };
 }
 
@@ -1321,7 +1355,8 @@ function commitAlarmEditor(){
   }
   closeAlarmEditor();
   renderAlarms();
-  showToast('已更新闹钟列表，请点击下方“保存全部配置并立即生效”写入磁盘', false);
+  setAlarmsDirty(true);
+  showToast('已更新闹钟列表，请点击下方「保存配置并生效」写入磁盘', false);
 }
 
 function testEditingAlarm(){
@@ -1357,6 +1392,8 @@ async function loadConfigFromServer(){
     document.getElementById('cfgHolidayAudio').value = c.holiday_custom_audio_path || '';
 
     draftAlarms = Array.isArray(c.alarms) ? JSON.parse(JSON.stringify(c.alarms)) : [];
+    maxKnownAlarmId = draftAlarms.reduce((m,a)=>Math.max(m, Number(a.id)||0), maxKnownAlarmId);
+    setAlarmsDirty(false);
     closeAlarmEditor();
     renderAlarms();
 
@@ -1379,12 +1416,11 @@ function parseTimeStr(val, defH, defM){
 }
 
 async function saveAllConfig(){
+  const alarmsToSave = JSON.parse(JSON.stringify(draftAlarms));
   if(editingAlarmIdx !== -2){
     const item = readAlarmFromEditor();
-    if(editingAlarmIdx >= 0 && draftAlarms[editingAlarmIdx]) draftAlarms[editingAlarmIdx] = item;
-    else draftAlarms.push(item);
-    closeAlarmEditor();
-    renderAlarms();
+    if(editingAlarmIdx >= 0 && alarmsToSave[editingAlarmIdx]) alarmsToSave[editingAlarmIdx] = item;
+    else alarmsToSave.push(item);
   }
   const [qsH, qsM] = parseTimeStr(document.getElementById('cfgQuietStart').value, 0, 0);
   const [qeH, qeM] = parseTimeStr(document.getElementById('cfgQuietEnd').value, 8, 0);
@@ -1407,10 +1443,15 @@ async function saveAllConfig(){
     holiday_enabled: document.getElementById('cfgHolidayEnabled').checked,
     holiday_greeting_template: document.getElementById('cfgHolidayTpl').value,
     holiday_custom_audio_path: document.getElementById('cfgHolidayAudio').value,
-    alarms: draftAlarms,
+    alarms: alarmsToSave,
   };
-  await postAction('/api/config', payload);
-  await loadConfigFromServer();
+  const ok = await postAction('/api/config', payload);
+  if(ok){
+    draftAlarms = alarmsToSave;
+    closeAlarmEditor();
+    setAlarmsDirty(false);
+    await loadConfigFromServer();
+  }
 }
 
 async function saveUpdateSettings(clearToken){

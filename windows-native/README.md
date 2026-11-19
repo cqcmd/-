@@ -1,51 +1,54 @@
 # 半整点提醒（Windows 原生单文件桌面版）
 
-轻量安静的 Windows 桌面半整点报时与定时语音提醒工具（Rust + Slint + Win32 原生接口）。
+轻量安静的 Windows 桌面半整点报时与多周期语音闹钟工具（Rust + Slint + Win32 原生接口）。
 
 ## 核心特性
-- **真单文件、零依赖交付**：静态链接 MSVC CRT 并将两套高清提示音（`chime.wav`、`meal.wav`）及托盘图标直接编入可执行文件，单 `.exe` 体积约 8–12 MB，双击即用。
-- **极低常驻占用**：原生矢量渲染引擎，不内嵌 WebView2/Chromium；后台常驻托盘内存约 15–25 MB，空闲 CPU 占用接近 0%。
-- **三套精致主题（默认「暖金咖啡馆」）**：内置「暗夜曜石」「晨曦云母」「暖金咖啡馆」三套主题，主窗口与设置窗口实时无闪烁切换。
-- **圆角无边框定制标题栏与自动居中**：取消系统标准标题栏，采用定制标题栏（保留「最小化」与「关闭」按钮，支持拖拽移动），通过 DWM/GDI 自动保持 Windows 11/10 原生圆角外观，全部窗体启动或弹出时自动居中显示。
-- **实时时间语音报时与自定义文字转语音**：调用 Windows 原生 SAPI 5（`ISpVoice`）与 Microsoft Edge TTS 双引擎，支持半/整点播报真实中文时间（如「现在时间，十四点三十分」「十二点整」）以及闹钟自定义文字转语音（支持 `{TIME}`、`{TIME12}`、`{PERIOD}`、`{LABEL}`、`{HH}:{MM}` 占位符与 `-5~5` 语速调节），并可与提示音/自定义音频串联播报。
-- **内置公历与农历节假日自动播报**：内置 2010–2040 农历转换与全国法定/传统节日库（除夕、春节、元宵、清明、端午、七夕、中秋、重阳、腊八、元旦、五一、国庆等），无需外部接口，离线即可自动识别当天节日并切换祝福问候语（支持 `{HOLIDAY}`、`{GREETING}`、`{LUNAR}`、`{TIME}`）与可选节日专属音效。
-- **灵活报时勾选与多组自定义闹钟**：将「整点报时 (:00)」「半点报时 (:30)」「节假日自动播报」设为直观复选框（可全取消进入纯闹钟模式，也支持追加额外自定义报时分钟）；支持添加多组自定义闹钟，覆盖**仅一次、每天、工作日、周末、自定义星期（周一至周日）、每隔 N 天**等时间周期，并提供常用快捷预设、独立试听、置顶响铃提醒弹窗（支持**关闭**与**稍后 5 分钟再响**）以及主面板/托盘/网页控制台一键**停止播报**。
-- **完整日常工具能力**：跨日静默免打扰时段（如 `23:00–07:00`，闹钟默认不受静默吞音，可按需勾选遵循）、全链路音频平滑淡入淡出与 WASAPI 背景音量自动压低、0–100 实时音量试听、RFC 4330 SNTP 校时与按需 UAC 系统时钟同步、单实例唤醒、注册表开机自启。
 
-## 版本号与图标规范
-- **版本信息**：`Z.W.&AI`
-- **版本号格式与每次编译自动 +1**：`3段式+日期`（`build_version.txt`，如 `2.0.0+20261114`），**每段满 10 进位**（如 `2.0.9 -> 2.1.0`，`2.9.9 -> 3.0.0`）。每次执行 `cargo build` / `cargo run` 时，`build.rs` 会自动读取并递增 `build_version.txt`（+1 并刷新当年今日日期）注入程序与 Win32 文件属性；亦可手动执行 `python bump-version.py` 同步 `Cargo.toml`。
-- **高清图标资源**：已配置多分辨率 Windows ICO（`assets/app.ico`，覆盖 `16px–256px`）、窗体高清 PNG（`assets/app_icon_512.png`）与系统托盘图标（`assets/tray_icon_32.rgba`）。
+- **单文件零依赖**：静态链接 MSVC CRT 并将提示音与高清图标编译入程序，单 `.exe` 体积约 8–12 MB。
+- **低占用与资源守护**：Slint 原生矢量渲染（无 WebView2），采用 `AudioBufferPool` 复用音频缓冲区；工作集/私有内存超 `85 MiB` 时自动清理池化缓冲并裁剪工作集，并持续监测连续 5 周期单调内存增长。
+- **三套语义主题**：内置「暖金咖啡馆」（默认）、「暗夜曜石」、「晨曦云母」，主窗/设置/关于/Web 控制台实时同步切换，适配 DWM 原生圆角与 PerMonitorV2 高 DPI。
+- **本地优先中文语音报时**：默认使用 **Windows 原生 SAPI5（纯离线）**，可选 Edge 在线语音（网络受限自动熔断并零延迟回退本地），支持 `{TIME}`、`{TIME12}`、`{PERIOD}`、`{LABEL}`、`{HH}:{MM}` 变量与 `-5 ~ +5` 语速调节。
+- **内置离线节假日历法**：完整内置 2010–2040 公历/农历及传统法定节日识别，无需联网即可自动切换祝福问候与节庆音效。
+- **多周期自定义闹钟与静默时段**：支持仅一次、每天、工作日、周末、自定义星期、每隔 N 天；闹钟响铃弹出置顶卡片（关闭 / 稍后 5 分钟），支持跨日静默区间、全链路淡入淡出及 WASAPI 背景音量压低。
+- **国内多源容灾 SNTP 校时**：默认 `ntp.aliyun.com` 并自动容灾国内公共授时节点，支持多地址及内网 NTP，按需 UAC 提权写入系统时间。
 
-## 后台定期更新检查与自动升级清单格式
-程序启动 5 秒后及每隔配置间隔（默认 6 小时）会在后台静默请求配置的更新源地址（默认优先直连 Gitee `djjz/HalfHourChime`，自动兜底 GitHub `cqcmd/HalfHourChime`），支持以下 4 类更新源：
-1. **标准 `version.json` HTTP(S) 直链**（服务端返回如下 JSON）：
+## 版本规范
+
+- **发行出品**：`Z.W.&AI`
+- **版本规则**：`3段式+日期`（`build_version.txt`，如 `2.0.7+20261118`），每段满 10 进位。每次编译时 `build.rs` 自动读取或递增版本号写入程序属性；手动同步可执行 `python bump-version.py`。
+- **图标资源**：多分辨率 `assets/app.ico`（16–256px）、`assets/app_icon_512.png` 与托盘图标 `assets/tray_icon_32.rgba`。
+
+## 自动更新与清单格式
+
+默认启用 **Gitee 国内直连源（`djjz/HalfHourChime`）**，支持以下更新源格式（不自动跨网回退 GitHub，无需代理）：
+
+1. **Gitee / GitHub Releases 地址**：自动解析页面/API 获取最新版本号与 `.exe` 下载地址。
+2. **标准 `version.json` HTTP(S) 直链**：
 ```json
 {
-  "version": "2.0.1+20261120",
+  "version": "2.0.8+20261119",
   "download_url": "https://your-server.example.com/HalfHourChime.exe",
   "package_type": "portable",
-  "notes": "优化高 DPI 显示与静默时段表现"
+  "notes": "稳定性与交互优化"
 }
 ```
-2. **Gitee / GitHub Releases 地址**（自动提取 `tag_name` 与 `.exe` 资产直链）。
-3. **Google Drive 公开分享链接**（自动转换为直链下载）。
-4. **局域网共享或本地路径**（如 `\\192.168.1.250\Updates\version.json` 或 `D:\Updates\version.json`）。
 
-> `package_type` 默认为 `"portable"`（通过纯原生 Win32 改名与提权自更新原地替换当前 `.exe` 并自动重启，全程不弹出控制台黑框）；若发布为独立安装向导包，可设为 `"installer"`。
+> `package_type` 默认 `"portable"`，通过纯原生 Win32 改名与提权自更新原地替换当前 `.exe` 并无缝重启，不弹出控制台黑框。
 
-## 调试日志与故障排查
-- **日志位置优先级**：优先写入 `config.json` 同级 `logs\` 目录（打包目录 `dist\logs\` 已预设创建）；若所在目录只读（如 `Program Files`），依次回退至 `%APPDATA%\HalfHourChime\logs\` 与 `%TEMP%\HalfHourChime\logs\`。
-- **按天归档与清理**：按 `half_hour_chime_YYYY-MM-DD.log` 命名每日自动归档，默认保留最近 `14` 天运行记录（方便按指定日期快速查看导出）；单日超出 `2 MiB` 时额外切分 `.log.1` ～ `.log.3` 防爆盘，采用 Windows `CRLF` 换行可直接用记事本打开。
-- **开启详细调试级别**：Release 版默认记录 `INFO` 及以上（启动环境快照、配置警告、NTP 校时、报时与闹钟触发、自启注册表、更新检查与升级重启）；如需排查细节，可设置环境变量 `HALF_HOUR_CHIME_DEBUG=1` 后启动。
-- **低配性能与内存守护**：内置 Windows 原生 PDH 性能计数器（`\Processor(_Total)\% Processor Time`、`\Process(*)\% Processor Time`、`\Process(*)\Working Set - Private`）与 PSAPI/内核时间片双路兜底监控，当工作集或私有提交内存超过 `50 MiB` 时自动清理空闲音频缓冲、紧缩进程堆（`HeapCompact`）并裁剪工作集（`EmptyWorkingSet`）；高 CPU 负载时自动延后非关键后台网络任务。
+## 日志与环境参数
 
-## 编译环境准备（Windows）
-1. 安装 **Visual Studio 2022 生成工具**（勾选“使用 C++ 的桌面开发”与 Windows 10/11 SDK）。
-2. 安装 **Rust 工具链**（推荐通过 `rustup-init.exe`，默认选择 `x86_64-pc-windows-msvc`）。
-3. 在 `windows-native` 目录下双击或命令行执行 `build-release.bat`，即可在 `dist\HalfHourChime.exe` 获得最终单文件可执行程序。
+- **日志目录**：优先写入 `config.json` 同级 `logs\`；目录只读时依次回退 `%APPDATA%\HalfHourChime\logs\`、`%TEMP%\HalfHourChime\logs\`。
+- **按天归档**：`half_hour_chime_YYYY-MM-DD.log` 默认保留 `14` 天；单日超过 `2 MiB` 自动切分轮转。
+- **调试与渲染变量**：
+  - `HALF_HOUR_CHIME_DEBUG=1`：开启 `DEBUG` 级别详细日志（含运行时对象引用与 5 周期内存监测详情）。
+  - `SLINT_BACKEND=winit-software`：在特定显卡驱动下切换软件光栅渲染。
 
-> 开发调试期间如需启动后直接弹出主窗口，可执行 `cargo run -- --show`。若在部分显卡驱动或高 DPI 缩放（如 125%/150%）下希望切换为像素对齐的纯软件光栅渲染以获得更锐利的暗色字体边缘，可设置环境变量 `SLINT_BACKEND=winit-software` 后启动。
+## 本地编译（Windows）
+
+1. 安装 **Visual Studio 2022 生成工具**（C++ 桌面开发 + Windows 10/11 SDK）与 **Rust 工具链**（`x86_64-pc-windows-msvc`）。
+2. 在 `windows-native` 目录运行 `build-release.bat`，产物输出至 `dist\HalfHourChime.exe`。
+3. 调试启动直接显示主窗体可执行 `cargo run -- --show`。
 
 ## 许可说明
-- 本项目应用代码版权归 **Z.W.&AI** 所有；UI 框架 Slint 提供免版税（Royalty-free）桌面应用商业使用授权（Ambassador License）及 GPLv3 开源协议，实际商业闭源分发时请依据 Slint 官方授权条款确认。
+
+- 应用代码版权归 **Z.W.&AI** 所有；Slint 框架遵循其 Ambassador License / GPLv3 条款。

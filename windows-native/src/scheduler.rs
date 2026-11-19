@@ -284,6 +284,8 @@ pub enum TriggerEvent {
         play_chime_before: bool,
         custom_audio_path: Option<String>,
         spoken_text: Option<String>,
+        /// 响铃时是否弹出桌面提醒窗口
+        show_alert: bool,
         /// 是否为“仅一次”闹钟触发（调用方响铃后自动关闭该闹钟）
         triggered_once: bool,
         /// 是否来自“稍后提醒”
@@ -549,21 +551,28 @@ impl Scheduler {
     }
 
     /// 保存配置后按变更幅度同步防重入槽位：
-    /// 保留本分钟已播报的整/半点报时槽位以及触发时间(hour, minute)未变的闹钟槽位，
-    /// 避免在刚报时/响铃的同一分钟内保存其他设置后再次重复触发；若闹钟调整了新时间则清理旧槽位。
+    /// 仅保留启用状态、触发时刻与周期均未变更的闹钟槽位；新增、改时、改周期或重新启用的闹钟立即允许评估。
     pub fn sync_slots_after_config_save(&mut self, prev_cfg: &AppConfig, next_cfg: &AppConfig) {
         self.last_alarm_slots.retain(|alarm_id, _| {
-            let prev_time = prev_cfg
+            let prev_alarm = prev_cfg
                 .alarms
                 .iter()
-                .find(|a| a.id == *alarm_id)
-                .map(|a| (a.hour, a.minute));
-            let next_time = next_cfg
+                .find(|a| a.id == *alarm_id && a.enabled);
+            let next_alarm = next_cfg
                 .alarms
                 .iter()
-                .find(|a| a.id == *alarm_id)
-                .map(|a| (a.hour, a.minute));
-            matches!((prev_time, next_time), (Some(pt), Some(nt)) if pt == nt)
+                .find(|a| a.id == *alarm_id && a.enabled);
+            matches!(
+                (prev_alarm, next_alarm),
+                (Some(p), Some(n))
+                    if p.hour == n.hour
+                        && p.minute == n.minute
+                        && p.repeat_mode == n.repeat_mode
+                        && p.once_date == n.once_date
+                        && p.anchor_date == n.anchor_date
+                        && p.interval_days == n.interval_days
+                        && p.weekdays == n.weekdays
+            )
         });
     }
 
@@ -764,6 +773,7 @@ impl Scheduler {
                         play_chime_before: alarm.play_chime_before,
                         custom_audio_path,
                         spoken_text,
+                        show_alert: alarm.show_alert,
                         triggered_once: false,
                         is_snooze: true,
                     });
@@ -812,6 +822,7 @@ impl Scheduler {
                 play_chime_before: alarm.play_chime_before,
                 custom_audio_path,
                 spoken_text,
+                show_alert: alarm.show_alert,
                 triggered_once: alarm.repeat_mode == AlarmRepeatMode::Once,
                 is_snooze: false,
             });
@@ -1036,6 +1047,7 @@ mod tests {
                 label,
                 repeat,
                 spoken_text,
+                show_alert,
                 triggered_once,
                 ..
             } => {
@@ -1046,6 +1058,7 @@ mod tests {
                     spoken_text.as_deref(),
                     Some("现在时间，十二点整，喝水休息")
                 );
+                assert!(!show_alert);
                 assert!(!triggered_once);
             }
             _ => panic!("expected alarm event"),

@@ -497,9 +497,9 @@ pub struct TrayController {
 
 fn format_tray_tooltip(muted: bool) -> &'static str {
     if muted {
-        "半整点提醒（静音模式） - 双击打开状态面板"
+        "半整点提醒（静音模式） - 点击打开主窗口"
     } else {
-        "半整点提醒 - 双击打开状态面板"
+        "半整点提醒 - 点击打开主窗口"
     }
 }
 
@@ -1459,6 +1459,52 @@ pub fn bring_window_topmost(hwnd_isize: isize) {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
             );
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = hwnd_isize;
+    }
+}
+
+/// 将指定窗体拉起到前台并激活（不锁定常驻置顶，用于托盘左键点击/单实例唤醒）
+pub fn bring_window_foreground(hwnd_isize: isize) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            IsIconic, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
+        };
+
+        if hwnd_isize == 0 {
+            return;
+        }
+        let hwnd = HWND(hwnd_isize as *mut std::ffi::c_void);
+        unsafe {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            let _ = SetForegroundWindow(hwnd);
         }
     }
 

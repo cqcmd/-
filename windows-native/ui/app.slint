@@ -750,7 +750,7 @@ export component MainWindow inherits Window {
                         spacing: 8px;
                         Text {
                             horizontal-stretch: 1;
-                            text: "发现新版本 " + root.update-version + "，可立即下载更新";
+                            text: "发现新版本 " + root.update-version;
                             color: ThemeStore.palette.accent;
                             font-size: 12px;
                             font-weight: 600;
@@ -861,6 +861,8 @@ export component SettingsWindow inherits Window {
     in-out property <string> alarm-edit-tts-text: "现在时间，{TIME}，{LABEL}";
     in-out property <string> alarm-edit-custom-audio: "";
     in-out property <bool> alarm-edit-respect-quiet: false;
+    in-out property <bool> alarm-edit-show-alert: false;
+    in-out property <bool> alarms-dirty: false;
 
     // Tab 2: 语音、主题与系统
     in-out property <int> tts-engine-index: 1;
@@ -993,14 +995,12 @@ export component SettingsWindow inherits Window {
 
                                 CheckBoxToggle {
                                     checked <=> root.hourly-chime-enabled;
-                                    label: "启用整点报时（每小时 :00）";
-                                    sublabel: "每逢整点自动响铃或语音报时";
+                                    label: "启用整点报时（:00）";
                                 }
 
                                 CheckBoxToggle {
                                     checked <=> root.half-hour-chime-enabled;
-                                    label: "启用半点报时（每小时 :30）";
-                                    sublabel: "每逢半点自动响铃或语音报时（可与整点独立勾选或全部取消仅用闹钟）";
+                                    label: "启用半点报时（:30）";
                                 }
 
                                 Rectangle {
@@ -1020,7 +1020,7 @@ export component SettingsWindow inherits Window {
                                     StyledInput {
                                         horizontal-stretch: 1;
                                         text <=> root.extra-chime-minutes-str;
-                                        placeholder: "可选，如 15, 45（留空则仅按上方勾选）";
+                                        placeholder: "如 15, 45（可选）";
                                     }
                                 }
 
@@ -1028,7 +1028,7 @@ export component SettingsWindow inherits Window {
                                     spacing: 10px;
                                     Text {
                                         width: 104px;
-                                        text: "提示音播放次数";
+                                        text: "提示音次数";
                                         color: ThemeStore.palette.text-secondary;
                                         font-size: 12px;
                                         vertical-alignment: center;
@@ -1041,7 +1041,7 @@ export component SettingsWindow inherits Window {
                                     }
                                     Text {
                                         horizontal-stretch: 1;
-                                        text: "次（1–10）";
+                                        text: "次";
                                         color: ThemeStore.palette.text-muted;
                                         font-size: 12px;
                                         vertical-alignment: center;
@@ -1071,7 +1071,7 @@ export component SettingsWindow inherits Window {
                                     spacing: 8px;
                                     Text {
                                         horizontal-stretch: 1;
-                                        text: "整/半点语音报真实时间（文字转语音）";
+                                        text: "文字转语音报时";
                                         color: ThemeStore.palette.text-secondary;
                                         font-size: 12px;
                                         vertical-alignment: center;
@@ -1095,11 +1095,11 @@ export component SettingsWindow inherits Window {
                                         StyledInput {
                                             horizontal-stretch: 1;
                                             text <=> root.chime-tts-template;
-                                            placeholder: "例如：现在时间，{TIME}";
+                                            placeholder: "现在时间，{TIME}";
                                         }
                                     }
                                     Text {
-                                        text: "可用变量：{TIME} 中文时间、{TIME12} 含时段、{PERIOD} 上/下午、{HH}:{MM}";
+                                        text: "变量：{TIME} / {TIME12} / {PERIOD} / {HH}:{MM}";
                                         color: ThemeStore.palette.text-muted;
                                         font-size: 11px;
                                         wrap: word-wrap;
@@ -1128,22 +1128,14 @@ export component SettingsWindow inherits Window {
 
                                 CheckBoxToggle {
                                     checked <=> root.holiday-enabled;
-                                    label: "启用节假日自动播报（本地离线识别公历与农历节日）";
-                                    sublabel: "命中春节、清明、端午、中秋、国庆等节日时自动切换专属问候";
+                                    label: "启用节假日自动播报";
                                 }
 
                                 if root.holiday-today-preview != "" : Text {
-                                    text: "今日历法：" + root.holiday-today-preview;
+                                    text: "今日：" + root.holiday-today-preview;
                                     color: ThemeStore.palette.accent;
                                     font-size: 12px;
                                     font-weight: 600;
-                                    wrap: word-wrap;
-                                }
-
-                                Text {
-                                    text: "程序完全内置 2010–2040 农历与法定/传统节假日算法（除夕、春节、元宵、清明、五一、端午、七夕、中秋、重阳、国庆、腊八、元旦等），无需联网接口即可自动识别。";
-                                    color: ThemeStore.palette.text-muted;
-                                    font-size: 12px;
                                     wrap: word-wrap;
                                 }
 
@@ -1195,7 +1187,7 @@ export component SettingsWindow inherits Window {
                                 }
 
                                 Text {
-                                    text: "可用变量：{HOLIDAY} 节日名、{GREETING} 节日祝福语、{LUNAR} 农历日期、{TIME} 当前时间";
+                                    text: "变量：{HOLIDAY} / {GREETING} / {LUNAR} / {TIME}";
                                     color: ThemeStore.palette.text-muted;
                                     font-size: 11px;
                                     wrap: word-wrap;
@@ -1217,7 +1209,7 @@ export component SettingsWindow inherits Window {
                                 HorizontalLayout {
                                     Text {
                                         horizontal-stretch: 1;
-                                        text: "静默免打扰时段（此期间暂停整/半点报时）";
+                                        text: "静默免打扰时段";
                                         color: ThemeStore.palette.text-primary;
                                         font-size: 13px;
                                         font-weight: 700;
@@ -1263,13 +1255,6 @@ export component SettingsWindow inherits Window {
                                         vertical-alignment: center;
                                         horizontal-alignment: right;
                                     }
-                                }
-
-                                Text {
-                                    text: "说明：自定义闹钟默认不受静默时段影响（防止早起等关键闹钟漏响），如需跳过可在闹钟编辑页单独勾选。";
-                                    color: ThemeStore.palette.text-muted;
-                                    font-size: 11px;
-                                    wrap: word-wrap;
                                 }
                             }
                         }
@@ -1444,17 +1429,9 @@ export component SettingsWindow inherits Window {
                                         vertical-alignment: center;
                                     }
                                     StyledInput {
-                                        width: 140px;
-                                        text <=> root.alarm-edit-once-date;
-                                        placeholder: "YYYY-MM-DD（留空自动推算）";
-                                    }
-                                    Text {
                                         horizontal-stretch: 1;
-                                        text: "单次响铃触发后自动关闭，避免次日重复响铃";
-                                        color: ThemeStore.palette.text-muted;
-                                        font-size: 11px;
-                                        vertical-alignment: center;
-                                        wrap: word-wrap;
+                                        text <=> root.alarm-edit-once-date;
+                                        placeholder: "YYYY-MM-DD（可留空）";
                                     }
                                 }
 
@@ -1514,7 +1491,7 @@ export component SettingsWindow inherits Window {
 
                                 CheckBoxToggle {
                                     checked <=> root.alarm-edit-tts-enabled;
-                                    label: "启用文字转语音播报（朗读下方自定义内容与当前时间）";
+                                    label: "启用文字转语音播报";
                                 }
 
                                 if root.alarm-edit-tts-enabled : VerticalLayout {
@@ -1531,11 +1508,11 @@ export component SettingsWindow inherits Window {
                                         StyledInput {
                                             horizontal-stretch: 1;
                                             text <=> root.alarm-edit-tts-text;
-                                            placeholder: "例如：现在时间，{TIME}，请记得{LABEL}";
+                                            placeholder: "现在时间，{TIME}，{LABEL}";
                                         }
                                     }
                                     Text {
-                                        text: "支持变量：{TIME} 当前时间、{LABEL} 闹钟名称、{TIME12} 含上下午、{PERIOD} 时段";
+                                        text: "变量：{TIME} / {LABEL} / {TIME12} / {PERIOD}";
                                         color: ThemeStore.palette.text-muted;
                                         font-size: 11px;
                                         wrap: word-wrap;
@@ -1569,8 +1546,13 @@ export component SettingsWindow inherits Window {
                                 }
 
                                 CheckBoxToggle {
+                                    checked <=> root.alarm-edit-show-alert;
+                                    label: "响铃时弹出提醒窗口（默认不弹）";
+                                }
+
+                                CheckBoxToggle {
                                     checked <=> root.alarm-edit-respect-quiet;
-                                    label: "静默时段内跳过此闹钟（默认关闭，确保重要闹钟不漏响）";
+                                    label: "静默时段内跳过此闹钟";
                                 }
 
                                 HorizontalLayout {
@@ -1587,8 +1569,8 @@ export component SettingsWindow inherits Window {
                                         clicked => { root.cancel-alarm-editor(); }
                                     }
                                     PrimaryButton {
-                                        width: 92px;
-                                        label: "应用修改";
+                                        width: 112px;
+                                        label: root.alarm-editing-index < 0 ? "加入待保存列表" : "应用到列表";
                                         clicked => { root.commit-alarm-editor(); }
                                     }
                                 }
@@ -1597,29 +1579,17 @@ export component SettingsWindow inherits Window {
 
                         // 空状态引导
                         if root.alarm-items.length == 0 : Rectangle {
-                            height: 110px;
+                            height: 64px;
                             border-radius: 8px;
                             border-width: 1px;
                             border-color: ThemeStore.palette.border-hairline;
                             background: ThemeStore.palette.surface;
-                            VerticalLayout {
-                                alignment: center;
-                                spacing: 6px;
-                                padding: 16px;
-                                Text {
-                                    text: "尚未添加自定义闹钟";
-                                    color: ThemeStore.palette.text-secondary;
-                                    font-size: 13px;
-                                    font-weight: 600;
-                                    horizontal-alignment: center;
-                                }
-                                Text {
-                                    text: "点击上方“+ 新建闹钟”或快捷预设，即可设置仅一次、每天、工作日、周末、自定义星期或每隔 N 天的语音闹钟。";
-                                    color: ThemeStore.palette.text-muted;
-                                    font-size: 12px;
-                                    horizontal-alignment: center;
-                                    wrap: word-wrap;
-                                }
+                            Text {
+                                text: "暂无自定义闹钟";
+                                color: ThemeStore.palette.text-muted;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
                             }
                         }
 
@@ -1807,7 +1777,7 @@ export component SettingsWindow inherits Window {
                                         font-size: 12px;
                                         vertical-alignment: center;
                                     }
-                                    for eng-opt[idx] in ["本地 Windows 语音（纯离线首选）", "Edge 在线语音（备选）"] : Rectangle {
+                                    for eng-opt[idx] in ["本地 Windows 语音", "Edge 在线语音"] : Rectangle {
                                         horizontal-stretch: 1;
                                         height: 30px;
                                         border-radius: 6px;
@@ -1833,47 +1803,38 @@ export component SettingsWindow inherits Window {
                                     }
                                 }
 
-                                if root.tts-engine-index == 1 : VerticalLayout {
-                                    spacing: 6px;
-                                    HorizontalLayout {
-                                        spacing: 10px;
+                                if root.tts-engine-index == 1 : HorizontalLayout {
+                                    spacing: 10px;
+                                    Text {
+                                        width: 70px;
+                                        text: "在线音色";
+                                        color: ThemeStore.palette.text-secondary;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                    for voice-opt[idx] in ["晓晓（女声）", "云希（男声）", "云扬（播音）", "晓伊（甜美）"] : Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: 28px;
+                                        border-radius: 5px;
+                                        border-width: 1px;
+                                        border-color: root.edge-voice-index == idx ? ThemeStore.palette.accent : ThemeStore.palette.border-hairline;
+                                        background: root.edge-voice-index == idx ? ThemeStore.palette.accent : ThemeStore.palette.input-bg;
+                                        animate background { duration: 150ms; }
                                         Text {
-                                            width: 70px;
-                                            text: "在线音色";
-                                            color: ThemeStore.palette.text-secondary;
+                                            text: voice-opt;
+                                            color: root.edge-voice-index == idx ? ThemeStore.palette.accent-fg : ThemeStore.palette.text-secondary;
                                             font-size: 12px;
+                                            font-weight: 600;
+                                            horizontal-alignment: center;
                                             vertical-alignment: center;
                                         }
-                                        for voice-opt[idx] in ["晓晓（女声）", "云希（男声）", "云扬（播音）", "晓伊（甜美）"] : Rectangle {
-                                            horizontal-stretch: 1;
-                                            height: 28px;
-                                            border-radius: 5px;
-                                            border-width: 1px;
-                                            border-color: root.edge-voice-index == idx ? ThemeStore.palette.accent : ThemeStore.palette.border-hairline;
-                                            background: root.edge-voice-index == idx ? ThemeStore.palette.accent : ThemeStore.palette.input-bg;
-                                            animate background { duration: 150ms; }
-                                            Text {
-                                                text: voice-opt;
-                                                color: root.edge-voice-index == idx ? ThemeStore.palette.accent-fg : ThemeStore.palette.text-secondary;
-                                                font-size: 12px;
-                                                font-weight: 600;
-                                                horizontal-alignment: center;
-                                                vertical-alignment: center;
-                                            }
-                                            TouchArea {
-                                                mouse-cursor: pointer;
-                                                clicked => {
-                                                    root.edge-voice-index = idx;
-                                                    root.voice-option-switched(true);
-                                                }
+                                        TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                root.edge-voice-index = idx;
+                                                root.voice-option-switched(true);
                                             }
                                         }
-                                    }
-                                    Text {
-                                        text: "点击任意音色即可切换并试听；若网络受限或离线，自动无缝回退至本地 SAPI5。";
-                                        color: ThemeStore.palette.text-muted;
-                                        font-size: 11px;
-                                        wrap: word-wrap;
                                     }
                                 }
 
@@ -1894,7 +1855,7 @@ export component SettingsWindow inherits Window {
                                     }
                                     Text {
                                         horizontal-stretch: 1;
-                                        text: "语速（-5 较慢，0 标准，5 较快）";
+                                        text: "-5 慢 · 0 标准 · +5 快";
                                         color: ThemeStore.palette.text-muted;
                                         font-size: 12px;
                                         vertical-alignment: center;
@@ -1925,7 +1886,7 @@ export component SettingsWindow inherits Window {
                                     StyledInput {
                                         horizontal-stretch: 1;
                                         text <=> root.ntp-server;
-                                        placeholder: "默认 ntp.aliyun.com（支持逗号分隔多地址或内网 IP）";
+                                        placeholder: "ntp.aliyun.com";
                                     }
                                     SecondaryButton {
                                         width: 88px;
@@ -1946,20 +1907,13 @@ export component SettingsWindow inherits Window {
 
                             HorizontalLayout {
                                 padding: 14px;
-                                VerticalLayout {
+                                Text {
                                     horizontal-stretch: 1;
-                                    spacing: 2px;
-                                    Text {
-                                        text: "开机自动启动";
-                                        color: ThemeStore.palette.text-primary;
-                                        font-size: 13px;
-                                        font-weight: 700;
-                                    }
-                                    Text {
-                                        text: "随 Windows 登录自动后台启动并驻留右下角托盘";
-                                        color: ThemeStore.palette.text-muted;
-                                        font-size: 12px;
-                                    }
+                                    text: "开机自动启动";
+                                    color: ThemeStore.palette.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
                                 }
                                 SwitchToggle {
                                     checked <=> root.auto-start;
@@ -1979,21 +1933,13 @@ export component SettingsWindow inherits Window {
                                 spacing: 10px;
 
                                 HorizontalLayout {
-                                    VerticalLayout {
+                                    Text {
                                         horizontal-stretch: 1;
-                                        spacing: 2px;
-                                        Text {
-                                            text: "本地 Web 控制台（3000 端口）";
-                                            color: ThemeStore.palette.text-primary;
-                                            font-size: 13px;
-                                            font-weight: 700;
-                                        }
-                                        Text {
-                                            text: "默认关闭；开启后可在浏览器管理报时、自定义闹钟、检查更新与查看实时日志";
-                                            color: ThemeStore.palette.text-muted;
-                                            font-size: 12px;
-                                            wrap: word-wrap;
-                                        }
+                                        text: "本地 Web 控制台（3000 端口）";
+                                        color: ThemeStore.palette.text-primary;
+                                        font-size: 13px;
+                                        font-weight: 700;
+                                        vertical-alignment: center;
                                     }
                                     SwitchToggle {
                                         checked <=> root.web-console-enabled;
@@ -2059,18 +2005,20 @@ export component SettingsWindow inherits Window {
                     }
                 }
 
+                // 未保存闹钟修改提示条
+                if root.alarms-dirty && root.validation-error == "" : Text {
+                    text: "自定义闹钟有未保存修改，请点击右下角「确定保存」写入配置";
+                    color: ThemeStore.palette.accent;
+                    font-size: 12px;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                }
+
                 // 底部保存 / 取消按钮
                 HorizontalLayout {
                     height: 36px;
                     spacing: 10px;
-                    Text {
-                        horizontal-stretch: 1;
-                        text: "音量调节即时生效；其余配置请点击“确定保存”";
-                        color: ThemeStore.palette.text-muted;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
+                    Rectangle { horizontal-stretch: 1; }
                     SecondaryButton {
                         width: 90px;
                         label: "取消";
@@ -2221,7 +2169,7 @@ export component AboutWindow inherits Window {
     in property <string> app-version: "v2.0.0+20261114";
     in property <string> app-vendor: "Z.W.&AI";
     in property <string> config-path: "config.json";
-    in property <string> update-status-text: "已启用 Gitee 国内直连 / 本地与局域网更新检查";
+    in property <string> update-status-text: "待检查更新";
     in property <bool> is-checking-update: false;
     in property <bool> has-update: false;
 
@@ -2282,13 +2230,6 @@ export component AboutWindow inherits Window {
                             font-weight: 600;
                         }
                     }
-                }
-
-                Text {
-                    text: "一款轻量、通用型的 Windows 桌面定时报时与多周期语音闹钟工具。支持整点/半点/节假日开关、自定义周期闹钟、文字转语音、内置音频及网络时间校时。";
-                    color: ThemeStore.palette.text-secondary;
-                    font-size: 12px;
-                    wrap: word-wrap;
                 }
 
                 Rectangle {

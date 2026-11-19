@@ -27,7 +27,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tray_icon::menu::MenuEvent;
-use tray_icon::{MouseButton, TrayIconEvent};
+use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 use web_console::{
     WebAction, WebConfigPatch, WebConfigView, WebConsoleController, WebSnapshot,
     DEFAULT_WEB_CONSOLE_PORT, DEFAULT_WEB_CONSOLE_URL,
@@ -686,26 +686,6 @@ fn build_ureq_agent_direct(connect_secs: u64, read_secs: u64) -> ureq::Agent {
     build_ureq_agent_with_options(connect_secs, read_secs, 5, false)
 }
 
-fn resolve_local_or_unc_path(raw: &str) -> Option<std::path::PathBuf> {
-    let trimmed = raw.trim();
-    if let Some(rest) = trimmed.strip_prefix("file:///") {
-        return Some(std::path::PathBuf::from(rest.replace('/', "\\")));
-    }
-    if let Some(rest) = trimmed.strip_prefix("file://") {
-        return Some(std::path::PathBuf::from(format!("\\\\{}", rest.replace('/', "\\"))));
-    }
-    if trimmed.starts_with("\\\\")
-        || trimmed
-            .as_bytes()
-            .get(1)
-            .map(|&b| b == b':')
-            .unwrap_or(false)
-    {
-        return Some(std::path::PathBuf::from(trimmed));
-    }
-    None
-}
-
 enum HttpTextErr {
     Status(u16, String),
     Other(String),
@@ -901,7 +881,7 @@ fn fetch_primary_manifest_once(
                         return res;
                     }
                     return Err(
-                        "更新源 API 访问受限（403 请求频率限制），请稍后重试或改用国内 Gitee / 本地路径更新。"
+                        "更新源 API 访问受限（403 请求频率限制），请稍后重试或改用国内 Gitee 更新源。"
                             .to_string(),
                     );
                 }
@@ -912,8 +892,7 @@ fn fetch_primary_manifest_once(
     }
 }
 
-/// 轻量级国内 HTTP/本地/局域网更新清单读取：
-/// 默认直连 Gitee Releases；支持自建内网 HTTP `version.json`、本地目录及局域网共享目录（UNC）
+/// 读取远端更新清单：默认直连 Gitee Releases，也兼容标准 HTTP(S) version.json
 fn fetch_remote_manifest(
     url: &str,
     token: &str,
@@ -922,29 +901,9 @@ fn fetch_remote_manifest(
     let trimmed = migrated.trim();
     if trimmed.is_empty() || trimmed.contains("updates.zwai.local") {
         return Err(
-            "尚未配置更新源地址：请在「本地 Web 控制台 → 版本与更新」填入 Gitee Releases 地址、内网 HTTP 或本地共享路径"
+            "尚未配置更新源地址：请在「本地 Web 控制台 → 版本与更新」填入 Gitee Releases 或 version.json 地址"
                 .to_string(),
         );
-    }
-
-    if let Some(raw_local_path) = resolve_local_or_unc_path(trimmed) {
-        let manifest_path = if raw_local_path.is_dir() {
-            raw_local_path.join("version.json")
-        } else {
-            raw_local_path
-        };
-        let meta = std::fs::metadata(&manifest_path)
-            .map_err(|e| format!("读取本地/局域网更新清单失败（{}）：{e}", manifest_path.display()))?;
-        if meta.len() > 256 * 1024 {
-            return Err("更新清单文件过大（超过 256 KB）".to_string());
-        }
-        let body = std::fs::read_to_string(&manifest_path)
-            .map_err(|e| format!("读取本地/局域网更新清单失败：{e}"))?;
-        let mut manifest = version::parse_remote_manifest_body(&body)?;
-        let manifest_src_str = manifest_path.to_string_lossy();
-        manifest.download_url =
-            version::resolve_manifest_download_url(&manifest_src_str, &manifest.download_url);
-        return Ok((manifest, None));
     }
 
     match fetch_primary_manifest_once(trimmed, token) {
@@ -1367,6 +1326,16 @@ fn bring_window_to_front<T: ComponentHandle>(win: &T) {
     }
 }
 
+fn bring_window_to_foreground<T: ComponentHandle>(win: &T) {
+    let w = win.window();
+    let handle_wrapper = w.window_handle();
+    if let Ok(raw_handle) = handle_wrapper.window_handle() {
+        if let RawWindowHandle::Win32(win32_h) = raw_handle.as_raw() {
+            win_sys::bring_window_foreground(win32_h.hwnd.get());
+        }
+    }
+}
+
 fn resolve_chime_playback_params(
     cfg: &AppConfig,
     scheduler: &Scheduler,
@@ -1542,6 +1511,12 @@ fn ensure_alarm_alert_window(
     ret
 }
 
+fn next_unique_alarm_id(cfg: &AppConfig, drafts: &[CustomAlarm]) -> u64 {
+    let cfg_max = cfg.alarms.iter().map(|a| a.id).max().unwrap_or(0);
+    let draft_max = drafts.iter().map(|a| a.id).max().unwrap_or(0);
+    cfg_max.max(draft_max) + 1
+}
+
 fn sync_alarm_list_to_settings(settings_w: &SettingsWindow, alarms: &[CustomAlarm]) {
     let items: Vec<AlarmListItem> = alarms
         .iter()
@@ -1585,6 +1560,7 @@ fn load_alarm_into_editor(settings_w: &SettingsWindow, editing_idx: i32, alarm: 
     settings_w.set_alarm_edit_tts_text(alarm.tts_text.clone().into());
     settings_w.set_alarm_edit_custom_audio(alarm.custom_audio_path.clone().into());
     settings_w.set_alarm_edit_respect_quiet(alarm.respect_quiet_hours);
+    settings_w.set_alarm_edit_show_alert(alarm.show_alert);
     settings_w.set_alarm_editor_open(true);
     settings_w.set_validation_error("".into());
 }
@@ -1620,6 +1596,7 @@ fn read_alarm_from_editor(
         tts_text: settings_w.get_alarm_edit_tts_text().to_string(),
         custom_audio_path: settings_w.get_alarm_edit_custom_audio().to_string(),
         respect_quiet_hours: settings_w.get_alarm_edit_respect_quiet(),
+        show_alert: settings_w.get_alarm_edit_show_alert(),
     };
     alarm.ensure_anchor_and_once_dates(now.date_naive(), now.hour(), now.minute());
     alarm
@@ -1644,6 +1621,7 @@ fn build_preset_alarm(preset_kind: i32, id: u64) -> CustomAlarm {
             tts_text: "现在时间，{TIME}，请喝一杯水休息一下".to_string(),
             custom_audio_path: String::new(),
             respect_quiet_hours: false,
+            show_alert: false,
         },
         1 => CustomAlarm {
             id,
@@ -1662,6 +1640,7 @@ fn build_preset_alarm(preset_kind: i32, id: u64) -> CustomAlarm {
             tts_text: "现在时间，{TIME}，久坐辛苦了，起来活动几分钟吧".to_string(),
             custom_audio_path: String::new(),
             respect_quiet_hours: false,
+            show_alert: false,
         },
         _ => CustomAlarm {
             id,
@@ -1680,6 +1659,7 @@ fn build_preset_alarm(preset_kind: i32, id: u64) -> CustomAlarm {
             tts_text: "现在时间，{TIME}，请记得下班打卡".to_string(),
             custom_audio_path: String::new(),
             respect_quiet_hours: false,
+            show_alert: false,
         },
     }
 }
@@ -1715,6 +1695,7 @@ fn populate_settings_form(
     sync_alarm_list_to_settings(settings_w, &cfg.alarms);
     settings_w.set_alarm_editor_open(false);
     settings_w.set_alarm_editing_index(-1);
+    settings_w.set_alarms_dirty(false);
 
     settings_w.set_tts_engine_index(cfg.tts_engine.to_index());
     settings_w.set_edge_voice_index(edge_voice_to_index(&cfg.edge_tts_voice));
@@ -1921,11 +1902,8 @@ fn download_and_apply_auto_update(
         .lock()
         .map(|g| g.trim().to_string())
         .unwrap_or_default();
-    let local_src = resolve_local_or_unc_path(&raw_url);
     let url = version::normalize_download_url(&raw_url);
-    if local_src.is_none()
-        && (url.is_empty() || (!url.starts_with("https://") && !url.starts_with("http://")))
-    {
+    if url.is_empty() || (!url.starts_with("https://") && !url.starts_with("http://")) {
         update_w.set_download_status_text("下载地址无效，请检查服务端更新清单。".into());
         center_and_show_window(update_w, 480.0, 430.0);
         return;
@@ -2015,26 +1993,10 @@ fn download_and_apply_auto_update(
                 let final_path =
                     std::env::temp_dir().join(format!("HalfHourChime_update_{pid}.exe"));
 
-                if let Some(src_path) = local_src {
-                    let meta = std::fs::metadata(&src_path).map_err(|e| {
-                        format!("读取本地/局域网更新包失败（{}）：{e}", src_path.display())
-                    })?;
-                    if meta.len() > MAX_PACKAGE_BYTES {
-                        return Err("更新包体积超出安全上限（100 MB），已中止更新。".to_string());
-                    }
-                    std::fs::copy(&src_path, &part_path)
-                        .map_err(|e| format!("复制本地/局域网更新包失败：{e}"))?;
-                    let bytes = std::fs::read(&part_path)
-                        .map_err(|e| format!("校验临时安装包失败：{e}"))?;
-                    if bytes.len() < 64 * 1024 || &bytes[..2] != b"MZ" {
-                        let _ = std::fs::remove_file(&part_path);
-                        return Err("目标文件不是有效的 Windows 可执行程序（.exe）。".to_string());
-                    }
-                } else {
-                    let download_via_http = |target_url: &str,
-                                             target_api_url: &str,
-                                             target_token: &str,
-                                             use_proxy: bool|
+                let download_via_http = |target_url: &str,
+                                         target_api_url: &str,
+                                         target_token: &str,
+                                         use_proxy: bool|
                      -> Result<(), String> {
                         let agent = build_ureq_agent_with_options(6, 60, 5, use_proxy);
                         let resp = if !target_token.is_empty() && !target_api_url.is_empty() {
@@ -2212,29 +2174,28 @@ fn download_and_apply_auto_update(
                                 }
                             });
 
-                            if let Err(fb_proxy_err) = download_via_http(
-                                &fallback_dl_url,
-                                &api_asset_url,
-                                &gh_token,
-                                true,
-                            ) {
-                                if fallback_dl_url.contains("gitee.com") {
-                                    win_sys::log_warn(
-                                        "updater",
-                                        &format!(
-                                            "Gitee mirror download with proxy failed ({fb_proxy_err}), retrying direct connection"
-                                        ),
-                                    );
-                                    download_via_http(&fallback_dl_url, "", "", false)?;
-                                } else {
-                                    return Err(fb_proxy_err);
-                                }
-                            }
+                    if let Err(fb_proxy_err) = download_via_http(
+                        &fallback_dl_url,
+                        &api_asset_url,
+                        &gh_token,
+                        true,
+                    ) {
+                        if fallback_dl_url.contains("gitee.com") {
+                            win_sys::log_warn(
+                                "updater",
+                                &format!(
+                                    "Gitee mirror download with proxy failed ({fb_proxy_err}), retrying direct connection"
+                                ),
+                            );
+                            download_via_http(&fallback_dl_url, "", "", false)?;
                         } else {
-                            return Err(primary_dl_err);
+                            return Err(fb_proxy_err);
                         }
                     }
+                } else {
+                    return Err(primary_dl_err);
                 }
+            }
 
                 if std::fs::rename(&part_path, &final_path).is_err() {
                     let _ = std::fs::remove_file(&final_path);
@@ -2559,7 +2520,7 @@ fn main() {
         *tok_guard = initial_update_token.clone();
     }
     if let Ok(mut st_msg) = update_ctx.status_text.lock() {
-        *st_msg = "已启用 Gitee 国内直连 / 本地与局域网自动更新检查".to_string();
+        *st_msg = "已启用 Gitee 国内直连自动更新检查".to_string();
     }
     let update_tx = start_update_check_worker(
         initial_update_enabled,
@@ -2799,10 +2760,17 @@ fn main() {
         let drafts_rc = Rc::clone(&draft_alarms);
         main_win.on_open_settings(move || {
             if let Some(sw) = sw_weak.upgrade() {
-                let st = st_rc.borrow();
-                *drafts_rc.borrow_mut() = st.config.alarms.clone();
-                populate_settings_form(&sw, &st.config, &st.scheduler);
-                center_and_show_window(&sw, 560.0, 660.0);
+                if sw.window().is_visible() {
+                    sw.window().set_minimized(false);
+                    let _ = sw.show();
+                    bring_window_to_foreground(&sw);
+                } else {
+                    let st = st_rc.borrow();
+                    *drafts_rc.borrow_mut() = st.config.alarms.clone();
+                    populate_settings_form(&sw, &st.config, &st.scheduler);
+                    center_and_show_window(&sw, 560.0, 660.0);
+                    bring_window_to_foreground(&sw);
+                }
             }
         });
     }
@@ -3065,17 +3033,12 @@ fn main() {
 
     // 自定义闹钟管理、快捷预设、试听与编辑回调
     {
+        let st_rc = Rc::clone(&state);
         let sw_weak = settings_win.as_weak();
         let drafts_rc = Rc::clone(&draft_alarms);
         settings_win.on_create_alarm(move || {
             if let Some(sw) = sw_weak.upgrade() {
-                let next_id = drafts_rc
-                    .borrow()
-                    .iter()
-                    .map(|a| a.id)
-                    .max()
-                    .unwrap_or(0)
-                    + 1;
+                let next_id = next_unique_alarm_id(&st_rc.borrow().config, &drafts_rc.borrow());
                 let now = Local::now();
                 let mut alarm = CustomAlarm {
                     id: next_id,
@@ -3087,18 +3050,21 @@ fn main() {
         });
     }
     {
+        let st_rc = Rc::clone(&state);
         let sw_weak = settings_win.as_weak();
         let drafts_rc = Rc::clone(&draft_alarms);
         settings_win.on_add_preset_alarm(move |kind| {
             if let Some(sw) = sw_weak.upgrade() {
                 let now = Local::now();
                 let mut drafts = drafts_rc.borrow_mut();
-                let next_id = drafts.iter().map(|a| a.id).max().unwrap_or(0) + 1;
+                let st = st_rc.borrow();
+                let next_id = next_unique_alarm_id(&st.config, &drafts);
                 let mut alarm = build_preset_alarm(kind, next_id);
                 alarm.ensure_anchor_and_once_dates(now.date_naive(), now.hour(), now.minute());
                 let new_idx = drafts.len() as i32;
                 drafts.push(alarm.clone());
                 sync_alarm_list_to_settings(&sw, &drafts);
+                sw.set_alarms_dirty(*drafts != st.config.alarms);
                 load_alarm_into_editor(&sw, new_idx, &alarm);
             }
         });
@@ -3116,6 +3082,7 @@ fn main() {
         });
     }
     {
+        let st_rc = Rc::clone(&state);
         let sw_weak = settings_win.as_weak();
         let drafts_rc = Rc::clone(&draft_alarms);
         settings_win.on_toggle_alarm_enabled(move |idx, next_enabled| {
@@ -3132,6 +3099,7 @@ fn main() {
                         );
                     }
                     sync_alarm_list_to_settings(&sw, &drafts);
+                    sw.set_alarms_dirty(*drafts != st_rc.borrow().config.alarms);
                 }
             }
         });
@@ -3170,6 +3138,7 @@ fn main() {
         });
     }
     {
+        let st_rc = Rc::clone(&state);
         let sw_weak = settings_win.as_weak();
         let drafts_rc = Rc::clone(&draft_alarms);
         settings_win.on_delete_alarm(move |idx| {
@@ -3190,6 +3159,7 @@ fn main() {
                         }
                     }
                     sync_alarm_list_to_settings(&sw, &drafts);
+                    sw.set_alarms_dirty(*drafts != st_rc.borrow().config.alarms);
                     sw.set_validation_error("".into());
                 }
             }
@@ -3201,14 +3171,15 @@ fn main() {
         let drafts_rc = Rc::clone(&draft_alarms);
         let audio_clone = audio.clone();
         settings_win.on_test_editing_alarm(move || {
-            let vol = st_rc.borrow().live_volume;
+            let st = st_rc.borrow();
+            let vol = st.live_volume;
             if let Some(sw) = sw_weak.upgrade() {
                 let drafts = drafts_rc.borrow();
                 let edit_idx = sw.get_alarm_editing_index();
                 let existing = usize::try_from(edit_idx)
                     .ok()
                     .and_then(|u| drafts.get(u));
-                let fallback_id = drafts.iter().map(|a| a.id).max().unwrap_or(0) + 1;
+                let fallback_id = next_unique_alarm_id(&st.config, &drafts);
                 let alarm = read_alarm_from_editor(&sw, existing, fallback_id);
                 let tts_engine = TtsEngine::from_index(sw.get_tts_engine_index());
                 let edge_voice = edge_voice_from_index(sw.get_edge_voice_index()).to_string();
@@ -3233,16 +3204,18 @@ fn main() {
         });
     }
     {
+        let st_rc = Rc::clone(&state);
         let sw_weak = settings_win.as_weak();
         let drafts_rc = Rc::clone(&draft_alarms);
         settings_win.on_commit_alarm_editor(move || {
             if let Some(sw) = sw_weak.upgrade() {
                 let mut drafts = drafts_rc.borrow_mut();
+                let st = st_rc.borrow();
                 let edit_idx = sw.get_alarm_editing_index();
                 let valid_idx = usize::try_from(edit_idx)
                     .ok()
                     .filter(|&u| u < drafts.len());
-                let fallback_id = drafts.iter().map(|a| a.id).max().unwrap_or(0) + 1;
+                let fallback_id = next_unique_alarm_id(&st.config, &drafts);
                 let mut edited = read_alarm_from_editor(
                     &sw,
                     valid_idx.and_then(|u| drafts.get(u)),
@@ -3261,6 +3234,7 @@ fn main() {
                 sw.set_alarm_editing_index(-1);
                 sw.set_validation_error("".into());
                 sync_alarm_list_to_settings(&sw, &drafts);
+                sw.set_alarms_dirty(*drafts != st.config.alarms);
             }
         });
     }
@@ -3414,43 +3388,6 @@ fn main() {
                 return;
             };
 
-            // 若用户打开了闹钟编辑器但未先点“确认闹钟”，点保存时自动完成校验并提交该闹钟
-            if sw.get_alarm_editor_open() {
-                let mut drafts = drafts_rc.borrow_mut();
-                let edit_idx = sw.get_alarm_editing_index();
-                let valid_idx = usize::try_from(edit_idx)
-                    .ok()
-                    .filter(|&u| u < drafts.len());
-                let fallback_id = drafts.iter().map(|a| a.id).max().unwrap_or(0) + 1;
-                let mut edited = read_alarm_from_editor(
-                    &sw,
-                    valid_idx.and_then(|u| drafts.get(u)),
-                    fallback_id,
-                );
-                if let Err(err) = edited.validate() {
-                    sw.set_validation_error(err.into());
-                    return;
-                }
-                if let Some(u) = valid_idx {
-                    drafts[u] = edited;
-                } else {
-                    drafts.push(edited);
-                }
-                sw.set_alarm_editor_open(false);
-                sw.set_alarm_editing_index(-1);
-                sync_alarm_list_to_settings(&sw, &drafts);
-            }
-
-            let raw_extra_minutes = sw.get_extra_chime_minutes_str().to_string();
-            let parsed_extra_minutes =
-                match AppConfig::parse_optional_extra_minutes(&raw_extra_minutes) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        sw.set_validation_error(err.into());
-                        return;
-                    }
-                };
-
             let (
                 prev_cfg,
                 preserved_mute_mode,
@@ -3473,8 +3410,42 @@ fn main() {
                 )
             };
 
-            let now = Local::now();
             let mut alarms = drafts_rc.borrow().clone();
+            let editor_was_open = sw.get_alarm_editor_open();
+            // 若用户打开了闹钟编辑器但未先点“加入待保存列表”，点保存时先在临时列表中完成校验（失败时不丢失编辑状态）
+            if editor_was_open {
+                let edit_idx = sw.get_alarm_editing_index();
+                let valid_idx = usize::try_from(edit_idx)
+                    .ok()
+                    .filter(|&u| u < alarms.len());
+                let fallback_id = next_unique_alarm_id(&prev_cfg, &alarms);
+                let mut edited = read_alarm_from_editor(
+                    &sw,
+                    valid_idx.and_then(|u| alarms.get(u)),
+                    fallback_id,
+                );
+                if let Err(err) = edited.validate() {
+                    sw.set_validation_error(err.into());
+                    return;
+                }
+                if let Some(u) = valid_idx {
+                    alarms[u] = edited;
+                } else {
+                    alarms.push(edited);
+                }
+            }
+
+            let raw_extra_minutes = sw.get_extra_chime_minutes_str().to_string();
+            let parsed_extra_minutes =
+                match AppConfig::parse_optional_extra_minutes(&raw_extra_minutes) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        sw.set_validation_error(err.into());
+                        return;
+                    }
+                };
+
+            let now = Local::now();
             for alarm in &mut alarms {
                 alarm.ensure_anchor_and_once_dates(now.date_naive(), now.hour(), now.minute());
             }
@@ -3538,6 +3509,13 @@ fn main() {
                     sw.set_validation_error(err.into());
                     return;
                 }
+                *drafts_rc.borrow_mut() = candidate.alarms.clone();
+                if editor_was_open {
+                    sw.set_alarm_editor_open(false);
+                    sw.set_alarm_editing_index(-1);
+                }
+                sync_alarm_list_to_settings(&sw, &candidate.alarms);
+                sw.set_alarms_dirty(false);
                 st.config = candidate.clone();
                 st.live_volume = candidate.volume;
                 st.scheduler
@@ -3665,18 +3643,23 @@ fn main() {
         });
     }
 
-    // 12. 绑定系统托盘双击与右键菜单事件（FR-15 / FR-16 / FR-17）
+    // 12. 绑定系统托盘左键点击、双击与右键菜单事件（FR-15 / FR-16 / FR-17）
     let tray_open_pending = Arc::new(AtomicBool::new(false));
     {
         let open_flag = Arc::clone(&tray_open_pending);
-        TrayIconEvent::set_event_handler(Some(move |event| {
-            if let TrayIconEvent::DoubleClick {
+        TrayIconEvent::set_event_handler(Some(move |event| match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
                 button: MouseButton::Left,
                 ..
-            } = event
-            {
+            } => {
                 open_flag.store(true, Ordering::SeqCst);
             }
+            _ => {}
         }));
     }
     {
@@ -3692,7 +3675,7 @@ fn main() {
         let perf_tx = perf_stop_tx.clone();
         let tray_open_flag = Arc::clone(&tray_open_pending);
 
-        // 通过 Slint 事件循环安全调度托盘菜单与双击指令
+        // 通过 Slint 事件循环安全调度托盘菜单与左键点击/双击指令
         let (menu_tx, menu_rx) = std::sync::mpsc::channel::<tray_icon::menu::MenuId>();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let _ = menu_tx.send(event.id);
@@ -3704,6 +3687,7 @@ fn main() {
                 if let Some(mw) = mw_weak.upgrade() {
                     refresh_main_window_ui(&mw, &st_rc_main_thread.borrow(), audio_clone.is_busy());
                     center_and_show_window(&mw, 460.0, 376.0);
+                    bring_window_to_foreground(&mw);
                 }
             }
             while let Ok(id) = menu_rx.try_recv() {
@@ -3751,10 +3735,17 @@ fn main() {
                     }
                 } else if id == tray_clone.ids.open_settings {
                     if let Some(sw) = sw_weak.upgrade() {
-                        let st = st_rc_main_thread.borrow();
-                        *drafts_rc_tray.borrow_mut() = st.config.alarms.clone();
-                        populate_settings_form(&sw, &st.config, &st.scheduler);
-                        center_and_show_window(&sw, 560.0, 660.0);
+                        if sw.window().is_visible() {
+                            sw.window().set_minimized(false);
+                            let _ = sw.show();
+                            bring_window_to_foreground(&sw);
+                        } else {
+                            let st = st_rc_main_thread.borrow();
+                            *drafts_rc_tray.borrow_mut() = st.config.alarms.clone();
+                            populate_settings_form(&sw, &st.config, &st.scheduler);
+                            center_and_show_window(&sw, 560.0, 660.0);
+                            bring_window_to_foreground(&sw);
+                        }
                     }
                 } else if id == tray_clone.ids.auto_start {
                     let mut st = st_rc_main_thread.borrow_mut();
@@ -4160,13 +4151,14 @@ fn main() {
                         play_chime_before,
                         custom_audio_path,
                         spoken_text,
+                        show_alert,
                         triggered_once,
                         is_snooze,
                     } => {
                         win_sys::log_info(
                             "scheduler",
                             &format!(
-                                "trigger alarm id={alarm_id} label={label} snooze={is_snooze} once={triggered_once} repeat={repeat} volume={volume_snapshot} chime_before={play_chime_before} custom={:?} tts={:?}",
+                                "trigger alarm id={alarm_id} label={label} snooze={is_snooze} once={triggered_once} show_alert={show_alert} repeat={repeat} volume={volume_snapshot} chime_before={play_chime_before} custom={:?} tts={:?}",
                                 custom_audio_path, spoken_text
                             ),
                         );
@@ -4186,6 +4178,7 @@ fn main() {
                                     custom_audio_path: custom_audio_path.clone().unwrap_or_default(),
                                     tts_enabled: spoken_text.is_some(),
                                     tts_text: spoken_text.clone().unwrap_or_default(),
+                                    show_alert,
                                     ..CustomAlarm::default()
                                 })
                             });
@@ -4227,31 +4220,33 @@ fn main() {
                             }
                         }
 
-                        if let Some(aaw) = ensure_alarm_alert_window(
-                            &aaw_slot_tick,
-                            &st_rc,
-                            &mw_weak,
-                            &audio_clone,
-                            config_snapshot.theme.to_index(),
-                        ) {
-                            let display_label = if is_snooze {
-                                format!("{label}（稍后提醒）")
-                            } else {
-                                label
-                            };
-                            let spoken_preview = spoken_text.unwrap_or_else(|| {
-                                if custom_audio_path.is_some() {
-                                    "正在播放自定义闹钟音频...".to_string()
+                        if show_alert {
+                            if let Some(aaw) = ensure_alarm_alert_window(
+                                &aaw_slot_tick,
+                                &st_rc,
+                                &mw_weak,
+                                &audio_clone,
+                                config_snapshot.theme.to_index(),
+                            ) {
+                                let display_label = if is_snooze {
+                                    format!("{label}（稍后提醒）")
                                 } else {
-                                    "正在播放闹钟提示音...".to_string()
-                                }
-                            });
-                            aaw.set_alarm_label(display_label.into());
-                            aaw.set_alarm_time(now.format("%H:%M").to_string().into());
-                            aaw.set_cycle_text(cycle_summary.into());
-                            aaw.set_spoken_preview(spoken_preview.into());
-                            center_and_show_window(&aaw, 390.0, 230.0);
-                            bring_window_to_front(&aaw);
+                                    label
+                                };
+                                let spoken_preview = spoken_text.unwrap_or_else(|| {
+                                    if custom_audio_path.is_some() {
+                                        "正在播放自定义闹钟音频...".to_string()
+                                    } else {
+                                        "正在播放闹钟提示音...".to_string()
+                                    }
+                                });
+                                aaw.set_alarm_label(display_label.into());
+                                aaw.set_alarm_time(now.format("%H:%M").to_string().into());
+                                aaw.set_cycle_text(cycle_summary.into());
+                                aaw.set_spoken_preview(spoken_preview.into());
+                                center_and_show_window(&aaw, 390.0, 230.0);
+                                bring_window_to_front(&aaw);
+                            }
                         }
                     }
                 }
@@ -4266,6 +4261,7 @@ fn main() {
                 if wake_now {
                     refresh_main_window_ui(&mw, &st, audio_busy);
                     center_and_show_window(&mw, 460.0, 376.0);
+                    bring_window_to_foreground(&mw);
                 } else if mw.window().is_visible() {
                     // 仅当主状态窗口可见时刷新界面文本，最小化常驻托盘期间跳过字符串分配，保持零堆内存增长
                     refresh_main_window_ui(&mw, &st, audio_busy);

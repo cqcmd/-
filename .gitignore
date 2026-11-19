@@ -6,5 +6,12 @@ windows-native/dist/
 coverage/
 .DS_Store
 *.log
+*.bak
+*.old
+*.part
+*.tmp
+.aistudio/
+public/assets/aistudio/
 .env*
 !.env.example
+

@@ -181,6 +181,8 @@ pub struct CustomAlarm {
     pub custom_audio_path: String,
     /// 是否受静默免打扰时段约束（默认 false，防止早晨/重要闹钟被夜间静默跳过）
     pub respect_quiet_hours: bool,
+    /// 响铃时是否弹出桌面提醒窗口（默认 false，仅播放声音/语音）
+    pub show_alert: bool,
 }
 
 impl Default for CustomAlarm {
@@ -202,6 +204,7 @@ impl Default for CustomAlarm {
             tts_text: "现在时间，{TIME}，{LABEL}".to_string(),
             custom_audio_path: String::new(),
             respect_quiet_hours: false,
+            show_alert: false,
         }
     }
 }
@@ -269,6 +272,9 @@ impl CustomAlarm {
         if self.tts_enabled {
             parts.push("文字转语音");
         }
+        if self.show_alert {
+            parts.push("弹窗");
+        }
         if parts.is_empty() {
             "仅提示".to_string()
         } else {
@@ -285,20 +291,16 @@ impl CustomAlarm {
             }
         }
         if self.repeat_mode == AlarmRepeatMode::Once {
+            let target_mins = u32::from(self.hour) * 60 + u32::from(self.minute);
+            let cur_mins = now_hour * 60 + now_minute;
             let parsed = NaiveDate::parse_from_str(self.once_date.trim(), "%Y-%m-%d").ok();
             let need_recompute = match parsed {
                 None => true,
-                Some(d) => {
-                    d < today
-                        || (d == today
-                            && (u32::from(self.hour) * 60 + u32::from(self.minute))
-                                <= (now_hour * 60 + now_minute))
-                }
+                Some(d) => d < today || (d == today && target_mins < cur_mins),
             };
             if need_recompute {
-                let target_mins = u32::from(self.hour) * 60 + u32::from(self.minute);
-                let cur_mins = now_hour * 60 + now_minute;
-                let target_date = if target_mins > cur_mins {
+                // 若目标分钟恰好等于当前分钟（例如刚踩整点保存测试），仍保留在今天触发而非推迟到明天
+                let target_date = if target_mins >= cur_mins {
                     today
                 } else {
                     today + Duration::days(1)
@@ -454,7 +456,7 @@ pub struct AppConfig {
 
     /// 是否开启后台定期版本检查，默认 true
     pub update_check_enabled: bool,
-    /// 更新清单接口地址（默认 Gitee 国内直连源，支持内网 HTTP 及本地/局域网共享路径）
+    /// 更新清单接口地址（默认 Gitee 国内直连源，支持 Releases 与标准 HTTP/HTTPS version.json）
     pub update_check_url: String,
     /// 更新检查间隔（小时，1..=168），默认 6 小时
     pub update_check_interval_hours: u16,
@@ -684,20 +686,10 @@ impl AppConfig {
         self.ntp_server = ntp_hosts.join(",");
 
         let update_url = crate::version::migrate_legacy_update_url(&self.update_check_url);
-        let is_valid_update_target = update_url.starts_with("https://")
-            || update_url.starts_with("http://")
-            || update_url.starts_with("file://")
-            || update_url.starts_with("\\\\")
-            || update_url
-                .as_bytes()
-                .get(1)
-                .map(|&b| b == b':')
-                .unwrap_or(false);
+        let is_valid_update_target =
+            update_url.starts_with("https://") || update_url.starts_with("http://");
         if !is_valid_update_target {
-            return Err(
-                "更新检查地址须为 Gitee/内网 http(s):// 链接、局域网共享路径 (\\\\server\\...) 或本地目录/文件路径"
-                    .to_string(),
-            );
+            return Err("更新检查地址必须以 http:// 或 https:// 开头".to_string());
         }
         self.update_check_enabled = true;
         self.update_check_url = update_url;
@@ -969,6 +961,7 @@ impl ConfigStore {
                                 tts_text: text,
                                 custom_audio_path: custom_audio,
                                 respect_quiet_hours: false,
+                                show_alert: false,
                             });
                             migrated = true;
                         }
@@ -1013,7 +1006,7 @@ impl ConfigStore {
         let _ = fs::rename(&self.path, bak_path);
     }
 
-    /// 原子全量覆盖保存（临时文件写入 + 重命名）
+    /// 原子全量覆盖保存（临时文件写入 + 重命名，带短重试以规避 Windows 杀软/索引瞬时占用）
     pub fn save(&self, cfg: &AppConfig) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
@@ -1023,13 +1016,33 @@ impl ConfigStore {
             .map_err(|e| format!("序列化配置失败：{e}"))?;
 
         let tmp_path = self.path.with_extension("json.tmp");
-        fs::write(&tmp_path, json.as_bytes())
-            .map_err(|e| format!("写入临时配置文件失败：{e}"))?;
+        {
+            let mut file = fs::File::create(&tmp_path)
+                .map_err(|e| format!("写入临时配置文件失败：{e}"))?;
+            use std::io::Write;
+            file.write_all(json.as_bytes())
+                .map_err(|e| format!("写入临时配置文件失败：{e}"))?;
+            let _ = file.sync_all();
+        }
 
-        if fs::rename(&tmp_path, &self.path).is_err() {
-            let _ = fs::remove_file(&self.path);
-            fs::rename(&tmp_path, &self.path)
-                .map_err(|e| format!("保存配置文件失败：{e}"))?;
+        let mut last_err = None;
+        for attempt in 0..5 {
+            match fs::rename(&tmp_path, &self.path) {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    if attempt >= 1 {
+                        let _ = fs::remove_file(&self.path);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+        if let Some(err) = last_err {
+            return Err(format!("保存配置文件失败：{err}"));
         }
         Ok(())
     }
@@ -1129,5 +1142,17 @@ mod tests {
         assert_eq!(TtsEngine::EdgeTts.to_index(), 1);
         assert_eq!(edge_voice_to_index(edge_voice_from_index(2)), 2);
         assert_eq!(edge_voice_from_index(99), DEFAULT_EDGE_TTS_VOICE);
+    }
+
+    #[test]
+    fn test_custom_alarm_show_alert_defaults_false() {
+        let alarm = CustomAlarm::default();
+        assert!(!alarm.show_alert);
+
+        let parsed: CustomAlarm = serde_json::from_str(
+            r#"{"id": 2, "label": "测试", "hour": 8, "minute": 30}"#,
+        )
+        .unwrap();
+        assert!(!parsed.show_alert);
     }
 }

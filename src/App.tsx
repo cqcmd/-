@@ -108,43 +108,43 @@ const PROJECT_FILES: ProjectFile[] = [
   {
     path: 'windows-native/src/main.rs',
     group: 'Rust 核心逻辑',
-    summary: '单实例、托盘循环、定制无边框标题栏拖拽/居中、250ms 调度、自动更新与超 50MB 内存强制回收',
+    summary: '单实例、托盘左键唤出主窗、圆角无边框居中、250ms 调度、原地自更新与 85 MiB 内存守护',
     content: mainRs,
   },
   {
     path: 'windows-native/src/config.rs',
     group: 'Rust 核心逻辑',
-    summary: '默认暖金咖啡馆主题、SAPI5/Edge TTS 引擎切换、节假日模板与 JSON 持久化校验',
+    summary: '默认暖金咖啡馆主题、本地 SAPI5 默认语音切换、节假日模板与 JSON 持久化校验',
     content: configRs,
   },
   {
     path: 'windows-native/src/scheduler.rs',
     group: 'Rust 核心逻辑',
-    summary: '农历转换/节假日数据接口、跨日静默/静音判定、防重入与真实时间 TTS 文本生成',
+    summary: '2010–2040 农历节假日离线识别、跨日静默判定、多周期闹钟调度与 5 周期泄漏监测',
     content: schedulerRs,
   },
   {
     path: 'windows-native/src/audio.rs',
     group: 'Rust 核心逻辑',
-    summary: '提示音/节庆音/语音平滑淡入淡出、餐饮压低背景音乐及 SAPI5/Edge TTS 双引擎',
+    summary: 'AudioBufferPool 缓冲池、平滑淡入淡出、WASAPI 背景压低及 SAPI5/Edge TTS 双引擎',
     content: audioRs,
   },
   {
     path: 'windows-native/src/ntp.rs',
     group: 'Rust 核心逻辑',
-    summary: 'RFC 4330 SNTP UDP 客户端、SetSystemTime 同步与按需 UAC 提权流程',
+    summary: 'RFC 4330 SNTP 国内多源容灾客户端、SetSystemTime 同步与按需 UAC 提权流程',
     content: ntpRs,
   },
   {
     path: 'windows-native/src/version.rs',
     group: 'Rust 核心逻辑',
-    summary: 'Z.W.&AI 出品信息与多更新源版本清单对比解析',
+    summary: 'Z.W.&AI 出品信息与 Gitee / HTTP 更新清单解析',
     content: versionRs,
   },
   {
     path: 'windows-native/src/win_sys.rs',
     group: 'Rust 核心逻辑',
-    summary: '托盘扩展（检查更新/静音模式/打开日志目录）、DWM 圆角、SAPI 语音、自动更新与按天归档日志',
+    summary: '托盘菜单与前景唤起、DWM 圆角、SAPI5 语音、自启与按天归档日志',
     content: winSysRs,
   },
   {
@@ -156,7 +156,7 @@ const PROJECT_FILES: ProjectFile[] = [
   {
     path: 'windows-native/ui/app.slint',
     group: 'Slint 多主题 UI',
-    summary: 'WindowStyle 圆角无边框标题栏、语音引擎切换、节假日专属报时与餐饮音频设置',
+    summary: 'WindowStyle 圆角无边框标题栏、语音引擎切换、节假日播报与多周期自定义闹钟',
     content: appSlint,
   },
   {
@@ -210,7 +210,7 @@ const PROJECT_FILES: ProjectFile[] = [
   {
     path: 'windows-native/USER_MANUAL.md',
     group: '交付文档',
-    summary: '面向门店/网吧非技术运维人员的快速上手与批量部署手册',
+    summary: '使用说明书与配置迁移指南',
     content: userManualMd,
   },
   {
